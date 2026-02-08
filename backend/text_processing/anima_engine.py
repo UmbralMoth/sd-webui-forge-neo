@@ -34,7 +34,7 @@ class AnimaTextProcessingEngine:
         self.id_end = 1
 
     @property
-    def unet(self) -> " UnetPatcher":
+    def unet(self) -> "UnetPatcher":
         return self._unet()
 
     def tokenize(self, texts):
@@ -136,6 +136,9 @@ class AnimaTextProcessingEngine:
         embeds_out = []
         attention_masks = []
         num_tokens = []
+        embeds_info = []
+        
+        max_len = max(len(tokens) for tokens in batch_tokens) if len(batch_tokens) > 0 else 0
 
         for tokens in batch_tokens:
             attention_mask = []
@@ -154,13 +157,17 @@ class AnimaTextProcessingEngine:
                 except TypeError:
                     other_embeds.append((index, t))
                 index += 1
+            
+            # Padding for variable length
+            if len(tokens_temp) < max_len:
+                pad_n = max_len - len(tokens_temp)
+                tokens_temp += [self.id_pad] * pad_n
+                attention_mask += [0] * pad_n
 
             tokens_embed = torch.tensor([tokens_temp], device=device, dtype=torch.long)
             tokens_embed = self.text_encoder.get_input_embeddings()(tokens_embed)
 
             index = 0
-            embeds_info = []
-
             for o in other_embeds:
                 emb, extra = self.text_encoder.preprocess_embed(o[1], device=device)
                 if emb is None:
@@ -186,5 +193,28 @@ class AnimaTextProcessingEngine:
 
     def process_tokens(self, batch_tokens, batch_multipliers):
         embeds, mask, count, info = self.process_embeds(batch_tokens)
-        z, _ = self.text_encoder(input_ids=None, embeds=embeds, attention_mask=mask, num_tokens=count, embeds_info=info)
+        
+        seq_len = embeds.size(1)
+        padded_multipliers = []
+        for multipliers in batch_multipliers:
+            if len(multipliers) < seq_len:
+                multipliers = multipliers + [1.0] * (seq_len - len(multipliers))
+            else:
+                multipliers = multipliers[:seq_len]
+            padded_multipliers.append(multipliers)
+
+        if len(padded_multipliers) > 0 and embeds.size(1) == len(padded_multipliers[0]):
+            self.emphasis.tokens = batch_tokens
+            self.emphasis.multipliers = torch.as_tensor(padded_multipliers).to(embeds)
+            self.emphasis.z = embeds
+            self.emphasis.after_transformers()
+            embeds = self.emphasis.z
+
+        z, _ = self.text_encoder(
+            input_ids=None,
+            embeds=embeds,
+            attention_mask=mask,
+            num_tokens=count,
+            embeds_info=info
+        )
         return z
