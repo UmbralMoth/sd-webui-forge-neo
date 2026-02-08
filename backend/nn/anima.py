@@ -5,6 +5,32 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # References: https://github.com/nvidia-cosmos/cosmos-predict2
 
+"""
+Copyright and license notice:
+- This file contains code derived from ComfyUI.
+- Upstream project: https://github.com/comfyanonymous/ComfyUI
+- Upstream files:
+  - https://github.com/comfyanonymous/ComfyUI/blob/f350a842611f4d75da7104c2d2965f45989089b9/comfy/ldm/anima/model.py
+  - https://github.com/comfyanonymous/ComfyUI/blob/f350a842611f4d75da7104c2d2965f45989089b9/comfy/ldm/cosmos/predict2.py
+- ComfyUI license: GNU General Public License v3.0.
+- The upstream license text is available at:
+  https://github.com/comfyanonymous/ComfyUI/blob/f350a842611f4d75da7104c2d2965f45989089b9/LICENSE
+
+Porting policy in this file:
+- Keep class/function names close to upstream where possible.
+- Mark intentional local behavior differences with `PORT_NOTE`.
+- Avoid silent behavior changes; if needed, document the reason inline.
+
+Local modifications from upstream:
+- Integrated Anima-specific text conditioning in-model by accepting
+  `t5xxl_ids` / `t5xxl_weights` via kwargs and applying adapter/weights in
+  `IntegratedAnimaTransformer.forward`.
+- Added optional in-model padding of cross-attention sequence length to 512 to
+  match Comfy runtime behavior for Anima conditioning.
+- Added checkpoint key conversion helper (`convert_anima_state_dict`) for
+  single-file weights stored under `net.*` prefix.
+"""
+
 import math
 from typing import Callable, Optional
 
