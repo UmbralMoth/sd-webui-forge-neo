@@ -1,5 +1,5 @@
 import dataclasses
-from math import atan, pi
+from math import atan, pi, log, exp
 from typing import Callable
 
 import k_diffusion
@@ -65,34 +65,64 @@ def sgm_uniform(n, sigma_min, sigma_max, inner_model, device):
     sigs += [0.0]
     return torch.FloatTensor(sigs).to(device)
 
-
-def _loglinear_interp(t_steps, num_steps):
-    """Performs log-linear interpolation of a given array of decreasing numbers"""
-    xs = np.linspace(0, 1, len(t_steps))
-    ys = np.log(t_steps[::-1])
-
-    new_xs = np.linspace(0, 1, num_steps)
-    new_ys = np.interp(new_xs, xs, ys)
-
-    interped_ys = np.exp(new_ys)[::-1].copy()
-    return interped_ys
-
-
 def get_align_your_steps_sigmas(n, sigma_min, sigma_max, device):
-    """https://research.nvidia.com/labs/toronto-ai/AlignYourSteps/howto.html"""
+    """
+    Continuous 'Align Your Steps' (AYS) Schedule.
+    
+    Implements the Log-Logistic distribution found in Nvidia's AYS paper.
+    Includes a 'Smart Cap' to prevent step dilution at high sigma values.
+    """
+    
+    # 1. Environment & Model Context
+    # Gracefully handle missing 'shared' object for non-A1111/Forge environments
+    try:
+        is_sdxl = getattr(shared.sd_model, 'is_sdxl', False)
+    except (ImportError, NameError, AttributeError):
+        is_sdxl = False 
 
-    if shared.sd_model.is_sdxl:
-        sigmas = sigmas = [sigma_max, sigma_max / 2.314, sigma_max / 3.875, sigma_max / 6.701, sigma_max / 10.89, sigma_max / 16.954, sigma_max / 26.333, sigma_max / 38.46, sigma_max / 62.457, sigma_max / 129.336, 0.029]
+    # 2. AYS Parameters (Log-Logistic)
+    # Derived from Nvidia's optimized discrete lists
+    if is_sdxl:
+        optimal_start = 14.61
+        loc = 0.0699
+        scale = 1.4059
     else:
-        # Default to SD 1.5 sigmas.
-        sigmas = [sigma_max, sigma_max / 2.257, sigma_max / 3.785, sigma_max / 5.418, sigma_max / 7.749, sigma_max / 10.469, sigma_max / 15.176, sigma_max / 22.415, sigma_max / 36.629, sigma_max / 96.151, 0.029]
+        optimal_start = 14.61
+        loc = 1.3114
+        scale = 1.6607
 
-    if n != len(sigmas):
-        sigmas = np.append(_loglinear_interp(sigmas, n), [0.0])
-    else:
-        sigmas.append(0.0)
+    # 3. Smart Cap: Prevent Step Dilution
+    # Standard UIs often request huge sigmas (e.g., 120+). AYS is ineffective there.
+    # We cap the start to the optimal AYS range so steps aren't wasted on 
+    # "dead" high-noise zones, ensuring maximum density where it counts.
+    if sigma_max > optimal_start:
+        sigma_max = optimal_start
 
-    return torch.FloatTensor(sigmas).to(device)
+    # 4. Solve for Exact Start Point (t_max)
+    # Map sigma_max to its quantile 't' on the distribution curve
+    def sigma_to_t(sigma, loc, scale):
+        sigma = max(sigma, 1e-5)
+        y = (log(sigma) - loc) / scale
+        return 1 / (1 + exp(-y))
+
+    t_max = sigma_to_t(sigma_max, loc, scale)
+    t_min = 0.0  # Target the asymptote for natural ramp-down
+
+    # 5. Generate Schedule
+    t = torch.linspace(t_max, t_min, n + 1, device=device)
+    
+    # Clamp for numerical stability (avoid log(0))
+    t = t.clamp(min=1e-5, max=1-1e-5) 
+    
+    # Inverse CDF of Log-Logistic Distribution
+    log_sigmas = loc + scale * torch.log(t / (1 - t))
+    sigmas = torch.exp(log_sigmas)
+
+    # 6. Force Exact Boundaries
+    sigmas[0] = sigma_max
+    sigmas[-1] = 0.0 
+    
+    return sigmas
 
 
 def linear_quadratic(n, sigma_min, sigma_max, device, *, threshold_noise=0.025):
@@ -199,6 +229,34 @@ def bong_tangent_scheduler(n, sigma_min, sigma_max, device, *, start=1.0, middle
 
     return tan_sigmas.to(device)
 
+def phi_scheduler(n, sigma_min, sigma_max, device):
+    """
+    The 'Golden Warp' Scheduler. 
+    Warps a log-linear distribution using Phi to balance high-noise exploration 
+    and low-noise refinement naturally.
+    """
+    phi = 1.618033988749895
+    
+    # Standard linear steps 0 -> 1
+    t = torch.linspace(0, 1, n, device=device)
+    
+    # Warp function: 1 - (1 - x)^phi
+    # This creates a convex curve similar to Karras but derived from the Golden Ratio.
+    # It drops from high sigma slightly faster than linear, spending 'Phi' more time
+    # in the structure-forming phase.
+    t = 1 - (1 - t) ** phi
+    
+    # Log-Linear Interpolation
+    log_min = log(sigma_min)
+    log_max = log(sigma_max)
+    
+    log_sigmas = log_max + t * (log_min - log_max)
+    sigmas = torch.exp(log_sigmas)
+    
+    # Append zero for the final step
+    sigmas = torch.cat([sigmas, torch.zeros(1, device=device)])
+    
+    return sigmas
 
 def flow_match_euler_discrete_scheduler(n, sigma_min, sigma_max, inner_model, device):
     from diffusers.schedulers.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
@@ -230,6 +288,7 @@ schedulers = [
     Scheduler("karras", "Karras", k_diffusion.sampling.get_sigmas_karras, default_rho=7.0),
     Scheduler("exponential", "Exponential", k_diffusion.sampling.get_sigmas_exponential),
     Scheduler("polyexponential", "Polyexponential", k_diffusion.sampling.get_sigmas_polyexponential, default_rho=1.0),
+    Scheduler("phi", "Phi", phi_scheduler),
     Scheduler("normal", "Normal", normal_scheduler, need_inner_model=True),
     Scheduler("simple", "Simple", simple_scheduler, need_inner_model=True),
     Scheduler("uniform", "Uniform", uniform, need_inner_model=True),

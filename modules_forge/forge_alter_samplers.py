@@ -15,13 +15,9 @@ class AlterSampler(sd_samplers_kdiffusion.KDiffusionSampler):
         super().__init__(sampler_function, sd_model, None)
 
     def sample(self, p, *args, **kwargs):
-        if p.cfg_scale > 2.0:
-            logging.warning("CFG between 1.0 ~ 2.0 is recommended when using CFG++ samplers")
         return super().sample(p, *args, **kwargs)
 
     def sample_img2img(self, p, *args, **kwargs):
-        if p.cfg_scale > 2.0:
-            logging.warning("CFG between 1.0 ~ 2.0 is recommended when using CFG++ samplers")
         return super().sample_img2img(p, *args, **kwargs)
 
 
@@ -34,6 +30,8 @@ def build_constructor(sampler_key: str) -> Callable:
 
 def create_cfg_pp_sampler(sampler_name: str, sampler_key: str) -> "sd_samplers_common.SamplerData":
     config = {}
+    if sampler_name.endswith(" Ctrl-Z"):
+        base_name = sampler_name.removesuffix(" Ctrl-Z")
     base_name = sampler_name.removesuffix(" CFG++")
     for name, _, _, params in sd_samplers_kdiffusion.samplers_k_diffusion:
         if name == base_name:
@@ -45,6 +43,11 @@ def create_cfg_pp_sampler(sampler_name: str, sampler_key: str) -> "sd_samplers_c
 
 samplers_data_alter = [
     create_cfg_pp_sampler("DPM++ 2M CFG++", "dpmpp_2m_cfg_pp"),
+    create_cfg_pp_sampler("DPM++ SDE CFG++", "dpmpp_sde_cfg_pp"),
+    create_cfg_pp_sampler("DPM++ 2M SDE CFG++", "dpmpp_2m_sde_cfg_pp"),
+    create_cfg_pp_sampler("DPM++ 3M SDE CFG++", "dpmpp_3m_sde_cfg_pp"),
+    create_cfg_pp_sampler("DPM++ 3M SDE CFG++ Ctrl-Z", "dpmpp_3m_sde_cfgpp_ctrlz"),
+    create_cfg_pp_sampler("DPM++ 3M SDE Flow CFG++ Ctrl-Z", "dpmpp_3m_sde_flow_cfgpp_ctrlz"),
     create_cfg_pp_sampler("Euler a CFG++", "euler_ancestral_cfg_pp"),
     create_cfg_pp_sampler("Euler CFG++", "euler_cfg_pp"),
 ]
