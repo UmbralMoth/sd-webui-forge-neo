@@ -139,16 +139,33 @@ def check_run_python(code: str, *, return_error: bool = False) -> bool | tuple[b
         return result.returncode == 0
 
 
-def git_fix_workspace(*args, **kwargs):
-    raise NotImplementedError()
+def git_fix_workspace(dir, name):
+    run_git(f'-C "{dir}" fetch', f"Fetching updates for {name}...", f"Couldn't fetch {name}", live=True)
+    run_git(f'-C "{dir}" reset --hard', f"Resetting {name}...", f"Couldn't reset {name}", live=True)
+    run_git(f'-C "{dir}" clean -fd', f"Cleaning {name}...", f"Couldn't clean {name}", live=True)
 
 
-def run_git(*args, **kwargs):
-    raise NotImplementedError()
+def run_git(command, desc=None, errdesc=None, custom_env=None, live: bool = default_command_live):
+    return run(f'"{git}" {command}', desc=desc, errdesc=errdesc, custom_env=custom_env, live=live)
 
 
-def git_clone(*args, **kwargs):
-    raise NotImplementedError()
+def git_clone(url, dir, name, commithash=None):
+    if os.path.exists(dir):
+        if commithash is None:
+            return
+
+        current_hash = run_git(f'-C "{dir}" rev-parse HEAD', None, "Couldn't retrieve git hash", live=False).strip()
+        if current_hash == commithash:
+            return
+
+        run_git(f'-C "{dir}" fetch', f"Fetching updates for {name}...", f"Couldn't fetch {name}", live=True)
+        run_git(f'-C "{dir}" checkout {commithash}', f"Checking out commit for {name}...", f"Couldn't checkout commit {commithash} for {name}", live=True)
+        return
+
+    run_git(f'clone "{url}" "{dir}"', f"Cloning {name} into {dir}...", f"Couldn't clone {name}", live=True)
+
+    if commithash is not None:
+        run_git(f'-C "{dir}" checkout {commithash}', None, "Couldn't checkout {name}'s hash: {commithash}", live=True)
 
 
 def git_pull_recursive(dir):
