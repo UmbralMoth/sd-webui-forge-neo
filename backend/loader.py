@@ -635,7 +635,7 @@ def split_state_dict(sd, additional_state_dicts: list = None):
     import huggingface_guess
 
     sd, metadata = load_torch_file(sd, return_metadata=True)
-    # sd = preprocess_state_dict(sd)  # TODO
+    sd = preprocess_state_dict(sd)
     guess = huggingface_guess.guess(sd)
 
     if getattr(guess, "nunchaku", False) and ("Z-Image" in guess.huggingface_repo or "Qwen" in guess.huggingface_repo):
