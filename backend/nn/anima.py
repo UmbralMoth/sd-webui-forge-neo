@@ -5,6 +5,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # References: https://github.com/nvidia-cosmos/cosmos-predict2
 
+<<<<<<< HEAD
 """
 Copyright and license notice:
 - This file contains code derived from ComfyUI.
@@ -31,6 +32,8 @@ Local modifications from upstream:
   single-file weights stored under `net.*` prefix.
 """
 
+=======
+>>>>>>> e908d520 (nn)
 import math
 from typing import Callable, Optional
 
