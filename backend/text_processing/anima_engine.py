@@ -4,7 +4,6 @@ if TYPE_CHECKING:
     from backend.patcher.unet import UnetPatcher
 
 import weakref
-
 import torch
 
 from backend import memory_management
