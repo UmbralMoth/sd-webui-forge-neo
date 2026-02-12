@@ -77,16 +77,25 @@ def get_align_your_steps_sigmas(n, sigma_min, sigma_max, device):
     # Gracefully handle missing 'shared' object for non-A1111/Forge environments
     try:
         is_sdxl = getattr(shared.sd_model, 'is_sdxl', False)
+        is_anima = getattr(shared.sd_model, 'is_anima', False)
     except (ImportError, NameError, AttributeError):
-        is_sdxl = False 
+        is_sdxl = False
+        is_anima = False
 
     # 2. AYS Parameters (Log-Logistic)
     # Derived from Nvidia's optimized discrete lists
-    if is_sdxl:
+
+    if is_anima:
+        use_log_logistic = False
+        optimal_start = 80.0
+        shift = 3.0
+    elif is_sdxl:
+        use_log_logistic = True
         optimal_start = 14.61
         loc = 0.0699
         scale = 1.4059
     else:
+        use_log_logistic = True
         optimal_start = 14.61
         loc = 1.3114
         scale = 1.6607
@@ -98,30 +107,42 @@ def get_align_your_steps_sigmas(n, sigma_min, sigma_max, device):
     if sigma_max > optimal_start:
         sigma_max = optimal_start
 
-    # 4. Solve for Exact Start Point (t_max)
-    # Map sigma_max to its quantile 't' on the distribution curve
-    def sigma_to_t(sigma, loc, scale):
-        sigma = max(sigma, 1e-5)
-        y = (log(sigma) - loc) / scale
-        return 1 / (1 + exp(-y))
+    if use_log_logistic:
+        # 4a. Solve for Exact Start Point (t_max)
+        # Map sigma_max to its quantile 't' on the distribution curve
+        def sigma_to_t(sigma, loc, scale):
+            sigma = max(sigma, 1e-5)
+            y = (log(sigma) - loc) / scale
+            return 1 / (1 + exp(-y))
 
-    t_max = sigma_to_t(sigma_max, loc, scale)
-    t_min = 0.0  # Target the asymptote for natural ramp-down
+        t_max = sigma_to_t(sigma_max, loc, scale)
+        t_min = 0.0  # Target the asymptote for natural ramp-down
 
-    # 5. Generate Schedule
-    t = torch.linspace(t_max, t_min, n + 1, device=device)
-    
-    # Clamp for numerical stability (avoid log(0))
-    t = t.clamp(min=1e-5, max=1-1e-5) 
-    
-    # Inverse CDF of Log-Logistic Distribution
-    log_sigmas = loc + scale * torch.log(t / (1 - t))
-    sigmas = torch.exp(log_sigmas)
+        # 5a. Generate Schedule
+        t = torch.linspace(t_max, t_min, n + 1, device=device)
+        
+        # Clamp for numerical stability (avoid log(0))
+        t = t.clamp(min=1e-5, max=1-1e-5)
+        
+        # Inverse CDF of Log-Logistic Distribution
+        log_sigmas = loc + scale * torch.log(t / (1 - t))
+        sigmas = torch.exp(log_sigmas)
 
-    # 6. Force Exact Boundaries
+    else:
+        # 4b. Create Linear Steps (0.0 to 1.0)
+        t = torch.linspace(1.0, 0.0, n + 1, device=device)
+
+        # 5b. Apply Time-Shift (The "AYS" for Flow)
+        t_shifted = (t * shift) / (1 + (shift - 1) * t)
+
+        # 6b. Map to Sigma Range
+        # Flow models usually map t linear to sigma
+        sigmas = t_shifted * (sigma_max - sigma_min) + sigma_min
+
+    # Force Exact Boundaries
     sigmas[0] = sigma_max
-    sigmas[-1] = 0.0 
-    
+    sigmas[-1] = 0.0
+
     return sigmas
 
 

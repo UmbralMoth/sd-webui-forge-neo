@@ -38,6 +38,7 @@ class Anima(ForgeDiffusionEngine):
         self.forge_objects_after_applying_lora = self.forge_objects.shallow_copy()
 
         self.is_wan = True
+        self.is_anima = True
 
     @torch.inference_mode()
     def get_learned_conditioning(self, prompt: list[str]):

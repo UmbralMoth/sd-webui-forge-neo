@@ -99,7 +99,11 @@ class AnimaTextProcessingEngine:
                 for chunk in chunks:
                     tokens = chunk.qwen_tokens
                     multipliers = chunk.qwen_multipliers
-
+                    
+                    if len(tokens) == 0:
+                        tokens = [self.id_pad]
+                        multipliers = [1.0]
+                    
                     z: torch.Tensor = self.process_tokens([tokens], [multipliers])[0]
 
                 cache[line] = z
