@@ -65,16 +65,12 @@ def sgm_uniform(n, sigma_min, sigma_max, inner_model, device):
     sigs += [0.0]
     return torch.FloatTensor(sigs).to(device)
 
-def get_align_your_steps_sigmas(n, sigma_min, sigma_max, device):
+def get_align_your_steps_sigmas(n, sigma_min, sigma_max, device, resolution=1024):
     """
     Continuous 'Align Your Steps' (AYS) Schedule.
-    
-    Implements the Log-Logistic distribution found in Nvidia's AYS paper.
-    Includes a 'Smart Cap' to prevent step dilution at high sigma values.
+    - Dynamic shift (Sug. 2): Scales with resolution and steps (Sug. 1 tuning).
     """
-    
-    # 1. Environment & Model Context
-    # Gracefully handle missing 'shared' object for non-A1111/Forge environments
+    # Environment & Model Context (unchanged)
     try:
         is_sdxl = getattr(shared.sd_model, 'is_sdxl', False)
         is_anima = getattr(shared.sd_model, 'is_anima', False)
@@ -82,13 +78,11 @@ def get_align_your_steps_sigmas(n, sigma_min, sigma_max, device):
         is_sdxl = False
         is_anima = False
 
-    # 2. AYS Parameters (Log-Logistic)
-    # Derived from Nvidia's optimized discrete lists
-
+    # Parameters
     if is_anima:
         use_log_logistic = False
         optimal_start = 80.0
-        shift = 3.0
+        base_shift = 3.0  # Match Forge Neo hardcoded for Anima
     elif is_sdxl:
         use_log_logistic = True
         optimal_start = 14.61
@@ -100,43 +94,38 @@ def get_align_your_steps_sigmas(n, sigma_min, sigma_max, device):
         loc = 1.3114
         scale = 1.6607
 
-    # 3. Smart Cap: Prevent Step Dilution
-    # Standard UIs often request huge sigmas (e.g., 120+). AYS is ineffective there.
-    # We cap the start to the optimal AYS range so steps aren't wasted on 
-    # "dead" high-noise zones, ensuring maximum density where it counts.
+    # Smart Cap (unchanged)
     if sigma_max > optimal_start:
         sigma_max = optimal_start
 
     if use_log_logistic:
-        # 4a. Solve for Exact Start Point (t_max)
-        # Map sigma_max to its quantile 't' on the distribution curve
+        # Log-Logistic branch (unchanged for non-Anima)
         def sigma_to_t(sigma, loc, scale):
             sigma = max(sigma, 1e-5)
-            y = (log(sigma) - loc) / scale
-            return 1 / (1 + exp(-y))
+            y = (torch.log(sigma) - loc) / scale
+            return 1 / (1 + torch.exp(-y))
 
         t_max = sigma_to_t(sigma_max, loc, scale)
-        t_min = 0.0  # Target the asymptote for natural ramp-down
-
-        # 5a. Generate Schedule
+        t_min = 0.0
         t = torch.linspace(t_max, t_min, n + 1, device=device)
-        
-        # Clamp for numerical stability (avoid log(0))
-        t = t.clamp(min=1e-5, max=1-1e-5)
-        
-        # Inverse CDF of Log-Logistic Distribution
+        t = t.clamp(min=1e-5, max=1 - 1e-5)
         log_sigmas = loc + scale * torch.log(t / (1 - t))
         sigmas = torch.exp(log_sigmas)
-
     else:
-        # 4b. Create Linear Steps (0.0 to 1.0)
+        # Anima/Flow branch: Combine all suggestions
+        # Sug. 1+2: Dynamic shift tuning
+        res_factor = max(1.0, resolution / 768)  # Scale up for higher res (Flux.2-style)
+        step_factor = max(1.0, 20 / n)  # Higher shift for fewer steps (empirical)
+        shift = base_shift * res_factor * step_factor  # Tunable: e.g., 3.0 baseline -> 4.5 for 1024px, 10 steps
+        shift = torch.clamp(torch.tensor(shift, device=device), min=2.0, max=5.0)  # Bound for stability
+
+        # Base t: Linear descending
         t = torch.linspace(1.0, 0.0, n + 1, device=device)
 
-        # 5b. Apply Time-Shift (The "AYS" for Flow)
-        t_shifted = (t * shift) / (1 + (shift - 1) * t)
+        # Apply dynamic shift (Sug. 1+2 on top of entropic t)
+        t_shifted = (t * shift) / (1 + (shift - 1) * t.pow(1 / res_factor))  # Soften exponent for res
 
-        # 6b. Map to Sigma Range
-        # Flow models usually map t linear to sigma
+        # Map to sigmas
         sigmas = t_shifted * (sigma_max - sigma_min) + sigma_min
 
     # Force Exact Boundaries
