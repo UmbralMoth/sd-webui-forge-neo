@@ -1,8 +1,3 @@
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from backend.patcher.unet import UnetPatcher
-
 import weakref
 import torch
 
@@ -20,21 +15,15 @@ class PromptChunk:
 
 
 class AnimaTextProcessingEngine:
-    def __init__(self, text_encoder, qwen_tokenizer, t5_tokenizer, unet):
+    def __init__(self, text_encoder, qwen_tokenizer, t5_tokenizer, unet=None):
         super().__init__()
 
         self.text_encoder = text_encoder
         self.qwen_tokenizer = qwen_tokenizer
         self.t5_tokenizer = t5_tokenizer
 
-        self._unet = weakref.ref(unet)
-
         self.id_pad = 151643
         self.id_end = 1
-
-    @property
-    def unet(self) -> "UnetPatcher":
-        return self._unet()
 
     def tokenize(self, texts):
         return (
@@ -84,14 +73,14 @@ class AnimaTextProcessingEngine:
         return chunks
 
     def __call__(self, texts):
-        zs = []
+        zs, ti, tw = [], [], []
         cache = {}
 
         self.emphasis = emphasis.get_current_option(opts.emphasis)()
 
         for line in texts:
             if line in cache:
-                z = cache[line]
+                z, chunk = cache[line]
             else:
                 chunks: list[PromptChunk] = self.tokenize_line(line)
                 assert len(chunks) == 1
@@ -106,32 +95,31 @@ class AnimaTextProcessingEngine:
                     
                     z: torch.Tensor = self.process_tokens([tokens], [multipliers])[0]
 
-                cache[line] = z
+                cache[line] = (z, chunk)
 
-            zs.append(
-                self.anima_preprocess(
-                    z,
-                    torch.tensor(chunk.t5_tokens, dtype=torch.int),
-                    torch.tensor(chunk.t5_multipliers),
-                )
-            )
+            zs.append(z)
+            ti.append(torch.tensor(chunk.t5_tokens, dtype=torch.int))
+            tw.append(torch.tensor(chunk.t5_multipliers))
 
-        return zs
+        def stack_with_padding(tensors, pad_value=0):
+            max_len = max([t.shape[0] for t in tensors])
+            out = []
+            for t in tensors:
+                if t.shape[0] < max_len:
+                    if t.ndim == 1:
+                        t = torch.cat([t, torch.full((max_len - t.shape[0],), pad_value, dtype=t.dtype, device=t.device)])
+                    else:
+                        t = torch.cat([t, torch.full((max_len - t.shape[0], *t.shape[1:]), pad_value, dtype=t.dtype, device=t.device)])
+                out.append(t)
+            return torch.stack(out)
 
-    def anima_preprocess(self, cross_attn: torch.Tensor, t5xxl_ids: torch.Tensor, t5xxl_weights: torch.Tensor) -> torch.Tensor:
-        dtype: torch.dtype = self.unet.model.computation_dtype
+        z = {
+            "qwen_cond": stack_with_padding(zs),
+            "t5_ids": stack_with_padding(ti, pad_value=0),
+            "t5_weights": stack_with_padding(tw, pad_value=1.0),
+        }
 
-        cross_attn = cross_attn.unsqueeze(0).to(dtype=dtype)
-        t5xxl_ids = t5xxl_ids.unsqueeze(0)
-
-        cross_attn = self.unet.model.diffusion_model.preprocess_text_embeds(cross_attn, t5xxl_ids)
-        if t5xxl_weights is not None:
-            cross_attn *= t5xxl_weights.unsqueeze(0).unsqueeze(-1).to(cross_attn)
-
-        if cross_attn.shape[1] < 512:
-            cross_attn = torch.nn.functional.pad(cross_attn, (0, 0, 0, 512 - cross_attn.shape[1]))
-
-        return cross_attn
+        return z
 
     def process_embeds(self, batch_tokens):
         device = memory_management.text_encoder_device()

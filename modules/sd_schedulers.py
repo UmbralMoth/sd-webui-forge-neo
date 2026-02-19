@@ -25,6 +25,7 @@ class Scheduler:
 
     default_rho: float = -1.0
     need_inner_model: bool = False
+    need_width_height: bool = False
     aliases: list[str] = None
 
 
@@ -65,12 +66,18 @@ def sgm_uniform(n, sigma_min, sigma_max, inner_model, device):
     sigs += [0.0]
     return torch.FloatTensor(sigs).to(device)
 
-def get_align_your_steps_sigmas(n, sigma_min, sigma_max, device, resolution=1024):
+def get_align_your_steps_sigmas(n, sigma_min, sigma_max, device, width=1024, height=1024):
     """
-    Continuous 'Align Your Steps' (AYS) Schedule.
-    - Dynamic shift (Sug. 2): Scales with resolution and steps (Sug. 1 tuning).
+    Align Your Steps scheduler, based on "Align Your Steps: Optimal Noise Schedules for Diffusion Models" [arXiv:2406.16157] (Zhao et al., 2024).
+    
+    Key features:
+    - Log-Logistic Distribution: For SDXL and SD1.5, uses a log-logistic distribution in t-space to optimally space noise levels based on model-specific parameters (loc, scale).
+    - Dynamic Shift Tuning: For Anima models, dynamically adjusts the shift based on resolution and step count to tailor the noise schedule.
+    - Smart Cap: Limits maximum sigma to an optimal value (14.61 for SDXL/SD1.5, 80.0 for Anima) to prevent training instability.
+    - Resolution-Aware: Scales parameters based on image resolution for better adaptability across different input sizes.
     """
-    # Environment & Model Context (unchanged)
+    # Use the longer dimension as the primary resolution reference
+    resolution = max(width, height)
     try:
         is_sdxl = getattr(shared.sd_model, 'is_sdxl', False)
         is_anima = getattr(shared.sd_model, 'is_anima', False)
@@ -81,7 +88,7 @@ def get_align_your_steps_sigmas(n, sigma_min, sigma_max, device, resolution=1024
     # Parameters
     if is_anima:
         use_log_logistic = False
-        optimal_start = 80.0
+        optimal_start = 80.0 # Completely theoretical, may be unneeded
         base_shift = 3.0  # Match Forge Neo hardcoded for Anima
     elif is_sdxl:
         use_log_logistic = True
@@ -94,19 +101,20 @@ def get_align_your_steps_sigmas(n, sigma_min, sigma_max, device, resolution=1024
         loc = 1.3114
         scale = 1.6607
 
-    # Smart Cap (unchanged)
-    if sigma_max > optimal_start:
-        sigma_max = optimal_start
+    # Smart Cap
+    if not is_anima:
+        if sigma_max > optimal_start:
+            sigma_max = optimal_start
 
     if use_log_logistic:
-        # Log-Logistic branch (unchanged for non-Anima)
+        # Log-Logistic branch: Map sigmas to t-space, then create a log-logistic distribution in t, and map back to sigmas
         def sigma_to_t(sigma, loc, scale):
             sigma = max(sigma, 1e-5)
-            y = (torch.log(sigma) - loc) / scale
-            return 1 / (1 + torch.exp(-y))
+            y = (log(sigma) - loc) / scale
+            return 1 / (1 + exp(-y))
 
         t_max = sigma_to_t(sigma_max, loc, scale)
-        t_min = 0.0
+        t_min = sigma_to_t(sigma_min, loc, scale)
         t = torch.linspace(t_max, t_min, n + 1, device=device)
         t = t.clamp(min=1e-5, max=1 - 1e-5)
         log_sigmas = loc + scale * torch.log(t / (1 - t))
@@ -114,10 +122,15 @@ def get_align_your_steps_sigmas(n, sigma_min, sigma_max, device, resolution=1024
     else:
         # Anima/Flow branch: Combine all suggestions
         # Sug. 1+2: Dynamic shift tuning
-        res_factor = max(1.0, resolution / 768)  # Scale up for higher res (Flux.2-style)
+        # Make AYS resolution handling configurable via options (defaults kept for compatibility)
+        ays_ref = getattr(shared.opts, 'ays_resolution_reference', 768)
+        res_factor = max(1.0, resolution / max(1, float(ays_ref)))  # Scale up for higher res
         step_factor = max(1.0, 20 / n)  # Higher shift for fewer steps (empirical)
-        shift = base_shift * res_factor * step_factor  # Tunable: e.g., 3.0 baseline -> 4.5 for 1024px, 10 steps
-        shift = torch.clamp(torch.tensor(shift, device=device), min=2.0, max=5.0)  # Bound for stability
+        base_shift = getattr(shared.opts, 'ays_base_shift', float(base_shift))
+        shift = base_shift * res_factor * step_factor  # Tunable
+        shift_min = getattr(shared.opts, 'ays_shift_min', 2.0)
+        shift_max = getattr(shared.opts, 'ays_shift_max', 5.0)
+        shift = torch.clamp(torch.tensor(shift, device=device), min=float(shift_min), max=float(shift_max))  # Bound for stability
 
         # Base t: Linear descending
         t = torch.linspace(1.0, 0.0, n + 1, device=device)
@@ -250,15 +263,15 @@ def phi_scheduler(n, sigma_min, sigma_max, device):
     # Standard linear steps 0 -> 1
     t = torch.linspace(0, 1, n, device=device)
     
-    # Warp function: 1 - (1 - x)^phi
+    # Warp function: t -> t^Phi
     # This creates a convex curve similar to Karras but derived from the Golden Ratio.
     # It drops from high sigma slightly faster than linear, spending 'Phi' more time
     # in the structure-forming phase.
-    t = 1 - (1 - t) ** phi
+    t = t ** phi
     
     # Log-Linear Interpolation
-    log_min = log(sigma_min)
-    log_max = log(sigma_max)
+    log_min = log(max(sigma_min, 1e-5))
+    log_max = log(max(sigma_max, 1e-5))
     
     log_sigmas = log_max + t * (log_min - log_max)
     sigmas = torch.exp(log_sigmas)
@@ -267,6 +280,7 @@ def phi_scheduler(n, sigma_min, sigma_max, device):
     sigmas = torch.cat([sigmas, torch.zeros(1, device=device)])
     
     return sigmas
+
 
 def flow_match_euler_discrete_scheduler(n, sigma_min, sigma_max, inner_model, device):
     from diffusers.schedulers.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
@@ -293,6 +307,63 @@ def flow_match_euler_discrete_scheduler(n, sigma_min, sigma_max, inner_model, de
     return torch.FloatTensor(sigmas).to(device)
 
 
+def get_align_your_steps_with_beta_selection_sigmas(n, sigma_min, sigma_max, device, width=1024, height=1024):
+    """
+    Hybrid Scheduler: Align Your Steps with Beta Distribution Selection
+    
+    Combines the best of both approaches:
+    - Generates a full Align Your Steps trajectory (with resolution-aware shift tuning)
+    - Applies Beta distribution logic to intelligently select which timesteps to use
+    
+    This allows for dynamic emphasis on high-noise structure formation or low-noise refinement
+    based on alpha/beta parameters, while maintaining AYS's mathematically optimized noise spacing.
+    
+    Parameters are controlled via shared.opts.beta_dist_alpha and shared.opts.beta_dist_beta
+    (typically 0.6/0.6 for balanced, 0.4/0.6 for more structure emphasis)
+    """
+    # Generate full AYS schedule with generous oversampling
+    # Use 3x the requested steps to provide rich selection space
+    full_steps = max(50, n * 3)
+    full_sigmas = get_align_your_steps_sigmas(full_steps, sigma_min, sigma_max, device, width, height)
+    
+    # Get beta parameters
+    alpha = shared.opts.beta_dist_alpha
+    beta = shared.opts.beta_dist_beta
+    
+    # Generate beta-distributed indices into the full AYS array
+    # NOTE: Unlike beta_scheduler (which uses `1 - np.linspace` to reverse-index inner_model.sigmas),
+    # we use forward `np.linspace` because get_align_your_steps_sigmas already returns a descending
+    # schedule (High→Low). The underlying arrays have opposite sort orders:
+    #   - inner_model.sigmas: [0.0 ... 14.6] (ascending) → needs reversal with `1 -`
+    #   - full_sigmas (AYS): [14.6 ... 0.0] (descending) → needs NO reversal, already correct
+    # Using `1 -` here would double-reverse and produce invalid Low→High schedules (black images).
+    total_timesteps = len(full_sigmas) - 1  # Exclude the final 0.0
+
+    # Map beta PPF positions to continuous indices over full_sigmas and use linear interpolation
+    # This preserves the beta bias without integer-rounding collisions or ad-hoc filling.
+    full_sigmas_np = full_sigmas.cpu().numpy() if isinstance(full_sigmas, torch.Tensor) else np.array(full_sigmas)
+
+    ts_lin = np.linspace(0, 1, n, endpoint=False)
+    pp = stats.beta.ppf(ts_lin, alpha, beta)
+    idx_f = pp * total_timesteps
+
+    sigs = []
+    for v in idx_f:
+        # Clamp continuous index
+        v = float(np.clip(v, 0.0, float(total_timesteps)))
+        lo = int(np.floor(v))
+        hi = min(lo + 1, total_timesteps)
+        w = v - lo
+        s_lo = float(full_sigmas_np[lo])
+        s_hi = float(full_sigmas_np[hi])
+        sigma_val = (1.0 - w) * s_lo + w * s_hi
+        sigs.append(float(sigma_val))
+
+    # Always append 0.0 at the end (matching original behavior)
+    sigs.append(0.0)
+
+    return torch.FloatTensor(sigs).to(device)
+
 schedulers = [
     Scheduler("automatic", "Automatic", None),
     Scheduler("karras", "Karras", k_diffusion.sampling.get_sigmas_karras, default_rho=7.0),
@@ -306,7 +377,8 @@ schedulers = [
     Scheduler("linear_quadratic", "Linear Quadratic", linear_quadratic),
     Scheduler("kl_optimal", "KL Optimal", kl_optimal),
     Scheduler("ddim", "DDIM", ddim_scheduler, need_inner_model=True),
-    Scheduler("align_your_steps", "Align Your Steps", get_align_your_steps_sigmas),
+    Scheduler("align_your_steps", "Align Your Steps", get_align_your_steps_sigmas, need_width_height=True),
+    Scheduler("align_your_steps_beta", "Align Your Steps Beta", get_align_your_steps_with_beta_selection_sigmas, need_width_height=True),
     Scheduler("beta", "Beta", beta_scheduler, need_inner_model=True),
     Scheduler("turbo", "Turbo", turbo_scheduler, need_inner_model=True),
     Scheduler("bong_tangent", "Bong Tangent", bong_tangent_scheduler),

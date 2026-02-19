@@ -577,8 +577,10 @@ def sample_dpmpp_3m_sde(model, x, sigmas, extra_args=None, callback=None, disabl
         if callback is not None:
             callback({"x": x, "i": i, "sigma": sigmas[i], "sigma_hat": sigmas[i], "denoised": denoised})
         if sigmas[i + 1] == 0:
-            # Denoising step
-            x = denoised
+            # Final step: use proper Euler step instead of just returning denoised
+            d = to_d(x, sigmas[i], denoised)
+            dt = 0 - sigmas[i]  # Full step to sigma=0
+            x = x + d * dt
         else:
             lambda_s, lambda_t = lambda_fn(sigmas[i]), lambda_fn(sigmas[i + 1])
             h = lambda_t - lambda_s
@@ -625,6 +627,10 @@ def sample_dpmpp_3m_sde_flow(model, x, sigmas, extra_args=None, callback=None, d
     noise_sampler = BrownianTreeNoiseSampler(x, sigma_min, sigma_max, seed=seed, cpu=True) if noise_sampler is None else noise_sampler
     s_in = x.new_ones([x.shape[0]])
 
+    # Apply SNR offset for numerical stability with certain schedulers (KL Optimal, Normal, etc.)
+    model_sampling = model.inner_model.predictor
+    sigmas = offset_first_sigma_for_snr(sigmas, model_sampling)
+
     # Force cleaner handling of lambda for Flow
     def robust_sigma_to_log_snr(sigma):
         # Clamp sigma to avoid infs at 0 and 1
@@ -641,7 +647,10 @@ def sample_dpmpp_3m_sde_flow(model, x, sigmas, extra_args=None, callback=None, d
         if callback is not None:
             callback({"x": x, "i": i, "sigma": sigmas[i], "sigma_hat": sigmas[i], "denoised": denoised})
         if sigmas[i + 1] == 0:
-            x = denoised
+            # Final step: use proper Euler step instead of just returning denoised
+            d = to_d(x, sigmas[i], denoised)
+            dt = 0 - sigmas[i]  # Full step to sigma=0
+            x = x + d * dt
         else:
             # DPM-Solver++ Logic
             lambda_s = lambda_fn(sigmas[i])
@@ -906,6 +915,10 @@ def sample_dpmpp_3m_sde_cfg_pp(model, x, sigmas, extra_args=None, callback=None,
     extra_args = {} if extra_args is None else extra_args
     extra_args['cond_scale'] /= 12.5 # Adjust for CFG++
     s_in = x.new_ones([x.shape[0]])
+    
+    # Apply SNR offset for numerical stability with certain schedulers (KL Optimal, Normal, etc.)
+    model_sampling = model.inner_model.predictor
+    sigmas = offset_first_sigma_for_snr(sigmas, model_sampling)
 
     denoised_1, denoised_2 = None, None
     h, h_1, h_2 = None, None, None
@@ -932,7 +945,10 @@ def sample_dpmpp_3m_sde_cfg_pp(model, x, sigmas, extra_args=None, callback=None,
                 }
             )
         if sigmas[i + 1] == 0:
-            x = denoised
+            # Final step: use proper Euler step instead of just returning denoised
+            d = to_d(x, sigmas[i], temp[0])
+            dt = 0 - sigmas[i]  # Full step to sigma=0
+            x = x + d * dt
         else:
             t, s = -sigmas[i].log(), -sigmas[i + 1].log()
             h = s - t
@@ -977,10 +993,14 @@ class ZigZagController:
         self.step_count = 0
         self.last_flat = None # Store flattened directly
         self.moving_avg_rotation = None
+        self.moving_avg_batch_variance = None
         self.ema_decay = 0.6
 
         self.cooldown_steps = 2 
         self.current_cooldown = 0
+        
+        # Diagnostics
+        self.last_cos_sim_stats = None  # (mean, std, min, max) for debugging
 
     def should_trigger(self, current_sigma, next_sigma, current_denoised):
         self.step_count += 1
@@ -1012,16 +1032,34 @@ class ZigZagController:
             # Cosine Similarity on flattened tensors
             cos_sim = torch.nn.functional.cosine_similarity(self.last_flat, curr_flat, dim=1)
             avg_sim = cos_sim.mean().item()
+            batch_std = cos_sim.std().item()
+            batch_min = cos_sim.min().item()
+            batch_max = cos_sim.max().item()
+            
+            # Store diagnostics
+            self.last_cos_sim_stats = (avg_sim, batch_std, batch_min, batch_max)
             
             # Rotation metric
             raw_score = max(0.0, 1.0 - avg_sim)
-            ref_d_sigma = max(d_sigma, 0.1)
+            ref_d_sigma = max(d_sigma, self.start_sigma * 0.05)
             normalized_rotation = raw_score / ref_d_sigma
 
-            if self.moving_avg_rotation is None:
-                self.moving_avg_rotation = normalized_rotation
+            # Initialize or update EMA of batch variance
+            if self.moving_avg_batch_variance is None:
+                self.moving_avg_batch_variance = batch_std
             else:
-                threshold = max(self.moving_avg_rotation * self.spike_sensitivity, 0.005)
+                self.moving_avg_batch_variance = (self.ema_decay * self.moving_avg_batch_variance) + \
+                                                  ((1 - self.ema_decay) * batch_std)
+
+            if self.moving_avg_rotation is None:
+                self.moving_avg_rotation = 0.0
+            else:
+                # Variance-aware threshold: higher variance requires stronger signal
+                # Adjust spike_sensitivity by batch consistency (low variance = tight threshold)
+                variance_ratio = min(batch_std / (self.moving_avg_batch_variance + 1e-6), 2.0)
+                adjusted_spike_sensitivity = self.spike_sensitivity * (0.8 + 0.4 * variance_ratio)  # Range: 0.8x to 1.2x
+                
+                threshold = max(self.moving_avg_rotation * adjusted_spike_sensitivity, 0.005)
 
                 if normalized_rotation > threshold:
                     overshoot = normalized_rotation - threshold
@@ -1029,17 +1067,27 @@ class ZigZagController:
                     should_zag = True
                     self.current_cooldown = self.cooldown_steps
                     # Optional: Print trigger for debug
-                    # print(f"⚡ ZigZag: Rot={normalized_rotation:.4f} > Thr={threshold:.4f}")
+                    # print(f"⚡ ZigZag: Rot={normalized_rotation:.4f} > Thr={threshold:.4f}, BatchVar={batch_std:.4f}")
 
                 # Update EMA
                 self.moving_avg_rotation = (self.ema_decay * self.moving_avg_rotation) + \
                                            ((1 - self.ema_decay) * normalized_rotation)
 
-        self.last_flat = curr_flat.detach().clone()
+        self.last_flat = curr_flat
         return should_zag, severity
     
     def update_history(self, final_denoised):
         self.last_flat = final_denoised.flatten(1).detach().clone()
+    
+    def get_diagnostics(self):
+        """Return current diagnostic stats for logging/debugging"""
+        return {
+            'step_count': self.step_count,
+            'moving_avg_rotation': self.moving_avg_rotation,
+            'moving_avg_batch_variance': self.moving_avg_batch_variance,
+            'last_cos_sim_stats': self.last_cos_sim_stats,
+            'current_cooldown': self.current_cooldown,
+        }
 
 def _dpm_solver_step(x, t, s, denoised, denoised_1, denoised_2, h_1, h_2, eta, noise_sampler, s_noise, 
                      uncond_denoised, sigma_t, sigma_s):
@@ -1155,6 +1203,10 @@ def sample_dpmpp_3m_sde_cfgpp_ctrlz(model, x, sigmas, extra_args=None, callback=
     extra_args['cfgpp'] = True # Indicate CFG++ for cond_scale adaptation
     extra_args['cond_scale'] /= 12.5
     s_in = x.new_ones([x.shape[0]])
+    
+    # Apply SNR offset for numerical stability with certain schedulers (KL Optimal, Normal, etc.)
+    model_sampling = model.inner_model.predictor
+    sigmas = offset_first_sigma_for_snr(sigmas, model_sampling)
 
     # Initialize Controller
     controller = ZigZagController(start_sigma=sigmas.max().item())
@@ -1403,8 +1455,7 @@ def sample_dpmpp_3m_sde_flow_cfgpp_ctrlz(model, x, sigmas, extra_args=None, call
             callback({'x': x, 'i': i, 'sigma': sigma_t, 'sigma_hat': sigma_t, 'denoised': denoised})
 
         if sigma_s == 0:
-            d = to_d(x, sigma_t, uncond_denoised)
-            x = denoised 
+            x = denoised
             break 
         
         alpha_t = sigma_s * s.exp() # alpha for the *next* step (destination)
