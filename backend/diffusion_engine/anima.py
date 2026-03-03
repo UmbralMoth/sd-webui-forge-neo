@@ -36,11 +36,15 @@ class Anima(ForgeDiffusionEngine):
         self.forge_objects_original = self.forge_objects.shallow_copy()
         self.forge_objects_after_applying_lora = self.forge_objects.shallow_copy()
 
+        self.use_shift = True
         self.is_wan = True
+        self.is_anima = True
 
     @torch.inference_mode()
     def get_learned_conditioning(self, prompt: list[str]):
         memory_management.load_model_gpu(self.forge_objects.clip.patcher)
+        shift = getattr(prompt, "distilled_cfg_scale", 3.0)
+        self.forge_objects.unet.model.predictor.set_parameters(shift=shift)
         return self.text_processing_engine_anima(prompt)
 
     @torch.inference_mode()

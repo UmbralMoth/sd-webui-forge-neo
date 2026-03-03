@@ -487,9 +487,18 @@ class StableDiffusionProcessing:
 
         if self.cfg_scale == 1:
             self.uc = None
+            self.empty_c = None
             logger.info("Negative Prompts are Ignored when CFG = 1.0")
         else:
             self.uc = self.get_conds_with_caching(prompt_parser.get_learned_conditioning, negative_prompts, total_steps, [self.cached_uc], self.extra_network_data)
+
+            if getattr(shared.opts, 'use_legacy_cfg', False):
+                self.empty_c = None
+            else:
+                if not hasattr(self, 'cached_empty_c'):
+                    self.cached_empty_c = [None, None]
+                empty_prompts = prompt_parser.SdConditioning([""] * len(self.prompts), width=self.width, height=self.height, is_negative_prompt=True, distilled_cfg_scale=self.distilled_cfg_scale)
+                self.empty_c = self.get_conds_with_caching(prompt_parser.get_learned_conditioning, empty_prompts, total_steps, [self.cached_empty_c], self.extra_network_data)
 
         self.c = self.get_conds_with_caching(prompt_parser.get_multicond_learned_conditioning, prompts, total_steps, [self.cached_c], self.extra_network_data)
 

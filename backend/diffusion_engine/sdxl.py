@@ -5,6 +5,7 @@ from huggingface_guess import model_list
 from backend import memory_management, utils
 from backend.args import dynamic_args
 from backend.diffusion_engine.base import ForgeDiffusionEngine, ForgeObjects
+from backend.modules.k_prediction import PredictionFlow
 from backend.nn.unet import Timestep
 from backend.patcher.clip import CLIP
 from backend.patcher.unet import UnetPatcher
@@ -126,6 +127,72 @@ class StableDiffusionXL(ForgeDiffusionEngine):
         return filename
 
 
+class StableDiffusionXLRF(StableDiffusionXL):
+    """NoobAI Rectified Flow: SDXL UNet + 32-channel Flux2 VAE."""
+
+    matched_guesses = [model_list.SDXLRF]
+
+    def __init__(self, estimated_config, huggingface_components):
+        # We cannot call super().__init__ directly because the UNet creation
+        # there calls k_prediction_from_diffusers_scheduler which only handles
+        # epsilon/v_prediction. We bypass it by passing k_predictor directly.
+        # shift=1.0, multiplier=1000 is the standard for SDXL-based flow models.
+        ForgeDiffusionEngine.__init__(self, estimated_config, huggingface_components)
+
+        clip = CLIP(model_dict={"clip_l": huggingface_components["text_encoder"], "clip_g": huggingface_components["text_encoder_2"]}, tokenizer_dict={"clip_l": huggingface_components["tokenizer"], "clip_g": huggingface_components["tokenizer_2"]})
+
+        vae = VAE(model=huggingface_components["vae"])
+
+        sampling_settings = estimated_config.sampling_settings
+        k_predictor = PredictionFlow(
+            sigma_data=1.0,
+            prediction_type="const",
+            shift=sampling_settings.get("shift", 1.0),
+            multiplier=sampling_settings.get("multiplier", 1000),
+        )
+
+        unet = UnetPatcher.from_model(model=huggingface_components["unet"], diffusers_scheduler=None, k_predictor=k_predictor, config=estimated_config)
+
+        self.text_processing_engine_l = ClassicTextProcessingEngine(
+            text_encoder=clip.cond_stage_model.clip_l,
+            tokenizer=clip.tokenizer.clip_l,
+            embedding_dir=dynamic_args["embedding_dir"],
+            embedding_key="clip_l",
+            embedding_expected_shape=2048,
+            text_projection=False,
+            minimal_clip_skip=2,
+            clip_skip=2,
+            return_pooled=False,
+            final_layer_norm=False,
+        )
+
+        self.text_processing_engine_g = ClassicTextProcessingEngine(
+            text_encoder=clip.cond_stage_model.clip_g,
+            tokenizer=clip.tokenizer.clip_g,
+            embedding_dir=dynamic_args["embedding_dir"],
+            embedding_key="clip_g",
+            embedding_expected_shape=2048,
+            text_projection=True,
+            minimal_clip_skip=2,
+            clip_skip=2,
+            return_pooled=True,
+            final_layer_norm=False,
+        )
+
+        self.embedder = Timestep(256)
+
+        self.forge_objects = ForgeObjects(unet=unet, clip=clip, vae=vae, clipvision=None)
+        self.forge_objects_original = self.forge_objects.shallow_copy()
+        self.forge_objects_after_applying_lora = self.forge_objects.shallow_copy()
+
+        self.is_sdxl = True
+        self.use_shift = True
+        self.is_flow = True
+
+    def inpaint_model(self):
+        return False
+
+
 class StableDiffusionXLRefiner(ForgeDiffusionEngine):
     matched_guesses = [model_list.SDXLRefiner]
 
@@ -185,6 +252,10 @@ class StableDiffusionXLRefiner(ForgeDiffusionEngine):
         out = [self.embedder(torch.Tensor([height])), self.embedder(torch.Tensor([width])), self.embedder(torch.Tensor([crop_h])), self.embedder(torch.Tensor([crop_w])), self.embedder(torch.Tensor([aesthetic]))]
 
         flat = torch.flatten(torch.cat(out)).unsqueeze(dim=0).repeat(clip_pooled.shape[0], 1).to(clip_pooled)
+
+        if self.use_shift:
+            shift = getattr(prompt, "distilled_cfg_scale", 2.5)
+            self.forge_objects.unet.model.predictor.set_parameters(shift=shift)
 
         if opts.sdxl_zero_neg and is_negative_prompt and all(x == "" for x in prompt):
             clip_pooled = torch.zeros_like(clip_pooled)

@@ -93,6 +93,11 @@ class CFGDenoiser(torch.nn.Module):
         self.sampler.sampler_extra_args["cond"] = c
         self.sampler.sampler_extra_args["uncond"] = uc
 
+        if getattr(self.p, 'empty_c', None) is not None:
+             self.sampler.sampler_extra_args["cond_empty"] = self.p.empty_c
+        elif "cond_empty" in self.sampler.sampler_extra_args:
+             del self.sampler.sampler_extra_args["cond_empty"]
+
     def pad_cond_uncond(self, *args, **kwargs):
         raise NotImplementedError
 
@@ -127,7 +132,10 @@ class CFGDenoiser(torch.nn.Module):
             x = x * self.nmask + noisy_initial_latent * self.mask
 
         denoiser_params = CFGDenoiserParams(x, image_cond, sigma, state.sampling_step, state.sampling_steps, cond, uncond, self)
-        cfg_denoiser_callback(denoiser_params)
+
+        is_zigzag = kwargs.get("__zigzag_internal", False)
+        if not is_zigzag:
+            cfg_denoiser_callback(denoiser_params)
 
         # NGMS
         if self.p.is_hr_pass == True:
@@ -143,6 +151,8 @@ class CFGDenoiser(torch.nn.Module):
                 self.p.extra_generation_params["NGMS all steps"] = opts.s_min_uncond_all
 
         extra_model_options = kwargs.get("model_options", {})
+        if "cond_empty" in self.sampler.sampler_extra_args:
+            extra_model_options["cond_empty"] = self.sampler.sampler_extra_args["cond_empty"]
         denoised, cond_pred, uncond_pred = sampling_function(self, denoiser_params=denoiser_params, cond_scale=cond_scale, cond_composition=cond_composition, extra_model_options=extra_model_options)
 
         if self.need_last_noise_uncond:
@@ -163,11 +173,12 @@ class CFGDenoiser(torch.nn.Module):
         preview = self.sampler.last_latent = denoised
         sd_samplers_common.store_latent(preview)
 
-        after_cfg_callback_params = AfterCFGCallbackParams(denoised, state.sampling_step, state.sampling_steps)
-        cfg_after_cfg_callback(after_cfg_callback_params)
-        denoised = after_cfg_callback_params.x
+        if not is_zigzag:
+            after_cfg_callback_params = AfterCFGCallbackParams(denoised, state.sampling_step, state.sampling_steps)
+            cfg_after_cfg_callback(after_cfg_callback_params)
+            denoised = after_cfg_callback_params.x
 
-        self.step += 1
+            self.step += 1
 
         if self.classic_ddim_eps_estimation:
             eps = (x - denoised) / sigma[:, None, None, None]

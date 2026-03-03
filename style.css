@@ -1267,8 +1267,7 @@ footer {
 }
 
 .popup-dialog {
-    width: 60vw;
-    height: auto;
+    width: 56em;
     background: var(--body-background-fill) !important;
     padding: 2em !important;
 }
@@ -1812,22 +1811,43 @@ body.resizing .resize-handle {
     padding: 1em;
 }
 
-div.xyz_entries {
-    margin-bottom: var(--spacing-lg);
+/* Custom UI overrides to enlarge image previews */
+#txt2img_results, #img2img_results {
+    height: auto !important;
+    display: flex !important;
+    flex-direction: column !important;
+    flex-grow: 1 !important;
 }
 
-div.xyz_entries .gradio-textbox span, div.xyz_entries .gradio-dropdown.multiselect span {
-    margin-bottom: var(--spacing-lg);
+#txt2img_gallery, #img2img_gallery {
+    min-height: 80vh !important;
+    height: 100% !important;
+    flex-grow: 1 !important;
 }
 
-div.xyz_entries button.secondary {
-    margin-left: var(--spacing-lg);
+@media screen and (min-height: 1200px) {
+    #txt2img_gallery, #img2img_gallery {
+        min-height: 85vh !important;
+    }
 }
 
-#swap_axes {
-    margin-top: var(--spacing-lg);
+.livePreview {
+    height: 100% !important;
+    width: 100% !important;
+    display: flex !important;
+    overflow: hidden !important;
 }
 
-#swap_axes button {
-    border-radius: 8px;
+.livePreview img {
+    height: 100% !important;
+    width: 100% !important;
+    object-fit: contain !important;
+    position: absolute !important;
+    display: none !important;
 }
+
+/* Only show the latest preview image */
+.livePreview img:last-child {
+    display: block !important;
+}
+

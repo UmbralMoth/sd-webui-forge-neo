@@ -225,6 +225,36 @@ class SDXL(BASE):
         return {"clip_l": "text_encoder", "clip_g": "text_encoder_2"}
 
 
+class SDXLRF(SDXL):
+    """NoobAI Rectified Flow: SDXL UNet with 32-channel Flux2 VAE."""
+
+    huggingface_repo = "Haoming02/sdxl-noobrf"
+
+    unet_config = {
+        "model_channels": 320,
+        "use_linear_in_transformer": True,
+        "transformer_depth": [0, 0, 2, 2, 10, 10],
+        "context_dim": 2048,
+        "adm_in_channels": 2816,
+        "use_temporal_attention": False,
+        "in_channels": 32,
+        "out_channels": 32,
+    }
+
+    latent_format = latent.SDXLRF
+
+    sampling_settings = {
+        "shift": 1.0,
+        "multiplier": 1000,
+    }
+
+    def inpaint_model(self):
+        return False
+
+    def model_type(self, state_dict: dict):
+        return ModelType.FLOW
+
+
 class Flux(BASE):
     huggingface_repo = "black-forest-labs/FLUX.1-dev"
 
@@ -441,13 +471,16 @@ class Anima(BASE):
     }
 
     unet_extra_config = {}
-    latent_format = latent.Wan21
+    latent_format = latent.QwenImage
 
     memory_usage_factor = 1.32
 
     supported_inference_dtypes = [torch.bfloat16, torch.float16, torch.float32]
 
     unet_target = "transformer"
+
+    def model_type(self, state_dict):
+        return ModelType.FLOW
 
     def clip_target(self, state_dict={}):
         return {"qwen3_06b.transformer": "text_encoder"}
@@ -513,7 +546,7 @@ class QwenImage(BASE):
     memory_usage_factor = 1.8
 
     unet_extra_config = {}
-    latent_format = latent.Wan21
+    latent_format = latent.QwenImage
 
     supported_inference_dtypes = [torch.bfloat16, torch.float32]
 
@@ -536,6 +569,7 @@ class QwenImage(BASE):
 
 models = [
     SD15,
+    SDXLRF,
     SDXL,
     SDXLRefiner,
     Flux,

@@ -238,6 +238,60 @@ def sample_euler_ancestral_RF(model, x, sigmas, extra_args=None, callback=None, 
 
 
 @torch.no_grad()
+def sample_euler_a2(model, x, sigmas, extra_args=None, callback=None, disable=None, eta=1.0, s_noise=1.0, extrapolation=0.25, noise_sampler=None):
+    """Euler ancestral RF sampler: averages two noise paths and extrapolates along the mean direction.
+
+    By taking two independent noise samples, averaging, then extrapolating beyond the average,
+    this reduces stochastic variance while amplifying the most-probable denoising direction.
+    Designed for rectified flow models (prediction_type='const') with alpha = 1 - sigma.
+
+    Args:
+        eta: Stochasticity / noise re-injection strength (0 = deterministic Euler).
+        s_noise: Scale applied to the re-noising coefficient.
+        extrapolation: How far to extrapolate past the averaged noise midpoint (0 = no extrapolation).
+    """
+    extra_args = {} if extra_args is None else extra_args
+    noise_sampler = default_noise_sampler(x) if noise_sampler is None else noise_sampler
+    s_in = x.new_ones([x.shape[0]])
+
+    for i in trange(len(sigmas) - 1, disable=disable):
+        denoised = model(x, sigmas[i] * s_in, **extra_args)
+        if callback is not None:
+            callback({"x": x, "i": i, "sigma": sigmas[i], "sigma_hat": sigmas[i], "denoised": denoised})
+
+        if sigmas[i + 1] == 0:
+            x = denoised
+            continue
+
+        downstep_ratio = 1 + (sigmas[i + 1] / sigmas[i] - 1) * eta
+        sigma_down = sigmas[i + 1] * downstep_ratio
+        alpha_ip1 = 1 - sigmas[i + 1]
+        alpha_down = 1 - sigma_down
+
+        # Deterministic flow ODE step toward sigma_down
+        sigma_down_i_ratio = sigma_down / sigmas[i]
+        deterministic_path = sigma_down_i_ratio * x + (1 - sigma_down_i_ratio) * denoised
+
+        if eta > 0 and s_noise != 0:
+            # Rescale to alpha_{i+1} frame, compute re-noising coefficient
+            base = (alpha_ip1 / alpha_down) * deterministic_path
+            renoise_coeff = (sigmas[i + 1] ** 2 - sigma_down ** 2 * alpha_ip1 ** 2 / alpha_down ** 2).clamp_min(0).sqrt()
+            noise_scale = s_noise * renoise_coeff
+
+            # Draw two independent noise samples, average, then extrapolate
+            noise_1 = noise_sampler(sigmas[i], sigmas[i + 1])
+            noise_2 = noise_sampler(sigmas[i], sigmas[i + 1])
+            path_1 = base + noise_1 * noise_scale
+            path_2 = base + noise_2 * noise_scale
+            merged = 0.5 * (path_1 + path_2)
+            x = merged + extrapolation * (merged - base)
+        else:
+            x = deterministic_path
+
+    return x
+
+
+@torch.no_grad()
 def sample_heun(model, x, sigmas, extra_args=None, callback=None, disable=None, s_churn=0.0, s_tmin=0.0, s_tmax=float("inf"), s_noise=1.0):
     """Implements Algorithm 2 (Heun steps) from Karras et al. (2022)"""
     extra_args = {} if extra_args is None else extra_args
@@ -910,4 +964,548 @@ def sample_er_sde(model, x, sigmas, extra_args=None, callback=None, disable=None
                 x = x + alpha_t * noise_sampler(sigmas[i], sigmas[i + 1]) * s_noise * (er_lambda_t**2 - er_lambda_s**2 * r**2).sqrt().nan_to_num(nan=0.0)
         old_denoised = denoised
 
+    return x
+
+
+@torch.no_grad()
+def sample_dpmpp_3m_sde_flow(model, x, sigmas, extra_args=None, callback=None, disable=None, eta=1.0, s_noise=1.0, noise_sampler=None):
+    """DPM-Solver++(3M) SDE adapted for Flow Matching"""
+    if len(sigmas) <= 1:
+        return x
+
+    extra_args = {} if extra_args is None else extra_args
+    seed = extra_args.get("seed", None)
+    sigma_min, sigma_max = sigmas[sigmas > 0].min(), sigmas.max()
+    noise_sampler = BrownianTreeNoiseSampler(x, sigma_min, sigma_max, seed=seed, cpu=True) if noise_sampler is None else noise_sampler
+    s_in = x.new_ones([x.shape[0]])
+
+    # Apply SNR offset for numerical stability with certain schedulers (KL Optimal, Normal, etc.)
+    model_sampling = model.inner_model.predictor
+    sigmas = offset_first_sigma_for_snr(sigmas, model_sampling)
+
+    # Force cleaner handling of lambda for Flow
+    def robust_sigma_to_log_snr(sigma):
+        # Clamp sigma to avoid infs at 0 and 1
+        sigma = sigma.clamp(min=1e-4, max=1.0 - 1e-4)
+        return sigma.logit().neg() # log((1-sigma)/sigma)
+
+    lambda_fn = robust_sigma_to_log_snr
+    
+    denoised_1, denoised_2 = None, None
+    h, h_1, h_2 = None, None, None
+
+    for i in trange(len(sigmas) - 1, disable=disable):
+        denoised = model(x, sigmas[i] * s_in, **extra_args)
+        if callback is not None:
+            callback({"x": x, "i": i, "sigma": sigmas[i], "sigma_hat": sigmas[i], "denoised": denoised})
+        if sigmas[i + 1] == 0:
+            # Final step: use proper Euler step instead of just returning denoised
+            d = to_d(x, sigmas[i], denoised)
+            dt = 0 - sigmas[i]  # Full step to sigma=0
+            x = x + d * dt
+        else:
+            # DPM-Solver++ Logic
+            lambda_s = lambda_fn(sigmas[i])
+            lambda_t = lambda_fn(sigmas[i + 1])
+            h = lambda_t - lambda_s
+            h_eta = h * (eta + 1)
+
+            alpha_t = sigmas[i + 1] * lambda_t.exp()
+            
+            # Core DPM++ Update
+            x = sigmas[i + 1] / sigmas[i] * (-h * eta).exp() * x + alpha_t * (-h_eta).expm1().neg() * denoised
+
+            if h_2 is not None:
+                # 3M
+                r0 = h_1 / h
+                r1 = h_2 / h
+                d1_0 = (denoised - denoised_1) / r0
+                d1_1 = (denoised_1 - denoised_2) / r1
+                d1 = d1_0 + (d1_0 - d1_1) * r0 / (r0 + r1)
+                d2 = (d1_0 - d1_1) / (r0 + r1)
+                phi_2 = h_eta.neg().expm1() / h_eta + 1
+                phi_3 = phi_2 / h_eta - 0.5
+                x = x + (alpha_t * phi_2) * d1 - (alpha_t * phi_3) * d2
+            elif h_1 is not None:
+                # 2M
+                r = h_1 / h
+                d = (denoised - denoised_1) / r
+                phi_2 = h_eta.neg().expm1() / h_eta + 1
+                x = x + (alpha_t * phi_2) * d
+
+            # SDE Noise Injection
+            if eta > 0 and s_noise > 0:
+                 x = x + noise_sampler(sigmas[i], sigmas[i + 1]) * sigmas[i + 1] * (-2 * h * eta).expm1().neg().sqrt() * s_noise
+
+        denoised_1, denoised_2 = denoised, denoised_1
+        h_1, h_2 = h, h_1
+    return x
+
+
+class ZigZagController:
+    """
+    Adaptive controller using 'Trajectory Rotation'.
+    Includes Cooldown to allow DPM++ 3M to rebuild high-order history.
+    """
+    def __init__(self, start_sigma, end_sigma=0.8, spike_sensitivity=1.15, hard_force_every=None):
+        self.start_sigma = start_sigma
+        self.end_sigma = end_sigma
+        self.spike_sensitivity = spike_sensitivity
+        self.hard_force_every = hard_force_every
+        
+        self.step_count = 0
+        self.last_flat = None # Store flattened directly
+        self.moving_avg_rotation = None
+        self.moving_avg_batch_variance = None
+        self.ema_decay = 0.6
+
+        self.cooldown_steps = 2 
+        self.current_cooldown = 0
+        
+        # Diagnostics
+        self.last_cos_sim_stats = None  # (mean, std, min, max) for debugging
+
+    def should_trigger(self, current_sigma, next_sigma, current_denoised):
+        self.step_count += 1
+        
+        # Flatten once here to save compute
+        curr_flat = current_denoised.flatten(1)
+
+        # 1. Cooldown & Bounds Check
+        if self.current_cooldown > 0:
+            self.current_cooldown -= 1
+            self.last_flat = curr_flat.detach().clone()
+            return False, 0.0
+
+        if not (self.end_sigma <= current_sigma <= self.start_sigma):
+            self.last_flat = curr_flat.detach().clone()
+            return False, 0.0
+        
+        # 2. Hard Force
+        if self.hard_force_every and (self.step_count % self.hard_force_every == 0):
+            self.last_flat = curr_flat.detach().clone()
+            self.current_cooldown = self.cooldown_steps
+            return True, 1.0
+
+        should_zag = False
+        severity = 0.0
+        d_sigma = current_sigma - next_sigma
+
+        if self.last_flat is not None:
+            # Cosine Similarity on flattened tensors
+            cos_sim = torch.nn.functional.cosine_similarity(self.last_flat, curr_flat, dim=1)
+            avg_sim = cos_sim.mean().item()
+            batch_std = cos_sim.std().item()
+            batch_min = cos_sim.min().item()
+            batch_max = cos_sim.max().item()
+            
+            # Store diagnostics
+            self.last_cos_sim_stats = (avg_sim, batch_std, batch_min, batch_max)
+            
+            # Rotation metric
+            raw_score = max(0.0, 1.0 - avg_sim)
+            ref_d_sigma = max(d_sigma, self.start_sigma * 0.05)
+            normalized_rotation = raw_score / ref_d_sigma
+
+            # Initialize or update EMA of batch variance
+            if self.moving_avg_batch_variance is None:
+                self.moving_avg_batch_variance = batch_std
+            else:
+                self.moving_avg_batch_variance = (self.ema_decay * self.moving_avg_batch_variance) + \
+                                                  ((1 - self.ema_decay) * batch_std)
+
+            if self.moving_avg_rotation is None:
+                self.moving_avg_rotation = 0.0
+            else:
+                # Variance-aware threshold: higher variance requires stronger signal
+                # Adjust spike_sensitivity by batch consistency (low variance = tight threshold)
+                variance_ratio = min(batch_std / (self.moving_avg_batch_variance + 1e-6), 2.0)
+                adjusted_spike_sensitivity = self.spike_sensitivity * (0.8 + 0.4 * variance_ratio)  # Range: 0.8x to 1.2x
+                
+                threshold = max(self.moving_avg_rotation * adjusted_spike_sensitivity, 0.005)
+
+                if normalized_rotation > threshold:
+                    overshoot = normalized_rotation - threshold
+                    severity = min(max(overshoot / threshold, 0.0), 1.0)
+                    should_zag = True
+                    self.current_cooldown = self.cooldown_steps
+                    # Optional: Print trigger for debug
+                    # print(f"⚡ ZigZag: Rot={normalized_rotation:.4f} > Thr={threshold:.4f}, BatchVar={batch_std:.4f}")
+
+                # Update EMA
+                self.moving_avg_rotation = (self.ema_decay * self.moving_avg_rotation) + \
+                                           ((1 - self.ema_decay) * normalized_rotation)
+
+        self.last_flat = curr_flat
+        return should_zag, severity
+    
+    def update_history(self, final_denoised):
+        self.last_flat = final_denoised.flatten(1).detach().clone()
+    
+    def get_diagnostics(self):
+        """Return current diagnostic stats for logging/debugging"""
+        return {
+            'step_count': self.step_count,
+            'moving_avg_rotation': self.moving_avg_rotation,
+            'moving_avg_batch_variance': self.moving_avg_batch_variance,
+            'last_cos_sim_stats': self.last_cos_sim_stats,
+            'current_cooldown': self.current_cooldown,
+        }
+
+def _dpm_solver_step(x, t, s, denoised, denoised_1, denoised_2, h_1, h_2, eta, noise_sampler, s_noise, 
+                     uncond_denoised, sigma_t, sigma_s):
+    h = s - t
+    h_eta = h * (eta + 1)
+
+    # Standard DPM-Solver++ First Order
+    x = torch.exp(-h_eta) * (x + (denoised - uncond_denoised)) + (-h_eta).expm1().neg() * denoised
+
+    # High-Order Corrections (DPM++ 2M / 3M)
+    if h_2 is not None:
+        # 3rd Order (3M)
+        r0 = h_1 / h
+        r1 = h_2 / h
+        d1_0 = (denoised - denoised_1) / r0
+        d1_1 = (denoised_1 - denoised_2) / r1
+        d1 = d1_0 + (d1_0 - d1_1) * r0 / (r0 + r1)
+        d2 = (d1_0 - d1_1) / (r0 + r1)
+        phi_2 = h_eta.neg().expm1() / h_eta + 1
+        phi_3 = phi_2 / h_eta - 0.5
+        x = x + phi_2 * d1 - phi_3 * d2
+        
+    elif h_1 is not None:
+        # 2nd Order (2M)
+        r = h_1 / h
+        d = (denoised - denoised_1) / r
+        phi_2 = h_eta.neg().expm1() / h_eta + 1
+        x = x + phi_2 * d
+
+    # SDE Noise Injection
+    if eta > 0:
+        x = x + noise_sampler(sigma_t, sigma_s) * sigma_s * (-2 * h * eta).expm1().neg().sqrt() * s_noise
+
+    return x
+
+def _zigzag_handler(model, x, sigma_t, sigma_s, t, s, extra_args, 
+                    denoised_1, denoised_2, h_1, h_2, 
+                    eta, noise_sampler, s_noise, gamma_scale, 
+                    temp_storage,
+                    current_denoised_probe, current_uncond_probe):
+    s_in = x.new_ones([x.shape[0]])
+
+    # Local extra_args copy for isolation
+    local_extra_args = extra_args.copy() if extra_args is not None else {}
+
+    # Define a local hook that writes to the passed temp_storage list
+    def _local_post_cfg(args):
+        temp_storage[0] = args["uncond_denoised"]
+        return args["denoised"]
+
+    model_options = local_extra_args.get("model_options", {}).copy()
+    model_options["sampler_post_cfg_function"] = [_local_post_cfg]
+    local_extra_args["model_options"] = model_options
+
+    # Flag for internal use (optional, depending on model wrapper)
+    local_extra_args["__zigzag_internal"] = True
+
+    # --- 1. PROBE (Zig) - Forward ---
+    # We use the probe values already calculated in the main loop
+    denoised_probe = current_denoised_probe
+    uncond_probe = current_uncond_probe
+
+    # Step forward to the "bad" spot using current history
+    intermediate_x = _dpm_solver_step(
+        x, t, s, 
+        denoised_probe, denoised_1, denoised_2, h_1, h_2, 
+        0, noise_sampler, s_noise, 
+        uncond_denoised=uncond_probe, sigma_t=sigma_t, sigma_s=sigma_s
+    )
+
+    # --- 2. REFLECTION (Zag) - Backward ---
+    # Invert from s -> t (Backtracking)
+    extra_args_low = local_extra_args.copy()
+    if 'cond_scale' in extra_args_low and gamma_scale > 0:
+        extra_args_low['cond_scale'] *= gamma_scale
+
+    denoised_invert = model(intermediate_x, sigma_s * s_in, **extra_args_low)
+    uncond_invert = temp_storage[0] 
+
+    # Note: Invert swaps sigmas (s -> t)
+    refined_x = _dpm_solver_step(
+        intermediate_x, s, t, 
+        denoised_invert, None, None, None, None, # No history for inversion
+        0, noise_sampler, s_noise, 
+        uncond_denoised=uncond_invert, sigma_t=sigma_s, sigma_s=sigma_t
+    )
+
+    # --- 3. COMMIT (Zig) - Forward ---
+    # Step forward again with the corrected trajectory
+    x_for_commit = refined_x 
+    denoised_final = model(x_for_commit, sigma_t * s_in, **local_extra_args)
+    uncond_final = temp_storage[0]
+
+    # Use DPM Solver to move to next step, but WITHOUT history (restart trajectory)
+    # We do NOT use denoised_1/h_1 here because we have "moved" the latent space
+    x_next = _dpm_solver_step(
+        x_for_commit, t, s, 
+        denoised_final, None, None, None, None, 
+        eta, noise_sampler, s_noise, 
+        uncond_denoised=uncond_final, sigma_t=sigma_t, sigma_s=sigma_s
+    )
+
+    return x_next, denoised_final
+
+@torch.no_grad()
+def sample_dpmpp_3m_sde_cfgpp_ctrlz(model, x, sigmas, extra_args=None, callback=None, disable=None, eta=1., s_noise=1., noise_sampler=None, gamma_scale=0.5):
+    """
+    Robust Hybrid DPM-Solver++(3M) SDE with ZigZag Sampling.
+    """
+    sigma_min, sigma_max = sigmas[sigmas > 0].min(), sigmas.max()
+    noise_sampler = BrownianTreeNoiseSampler(x, sigma_min, sigma_max) if noise_sampler is None else noise_sampler
+    extra_args = {} if extra_args is None else extra_args
+    extra_args['cfgpp'] = True # Indicate CFG++ for cond_scale adaptation
+    # Note: extra_args['cond_scale'] doesn't exist by default here, so don't scale it immediately if it's not present.
+    if 'cond_scale' in extra_args:
+        extra_args['cond_scale'] /= 12.5
+    s_in = x.new_ones([x.shape[0]])
+    
+    # Apply SNR offset for numerical stability with certain schedulers (KL Optimal, Normal, etc.)
+    model_sampling = model.inner_model.predictor
+    sigmas = offset_first_sigma_for_snr(sigmas, model_sampling)
+
+    # Initialize Controller
+    controller = ZigZagController(start_sigma=sigmas.max().item())
+    
+    # DPM++ History
+    denoised_1, denoised_2 = None, None
+    h_1, h_2 = None, None
+
+    # --- SETUP POST-CFG HOOK ---
+    # CFG++ / Uncond storage
+    temp_storage = [None] # Use a list to pass by reference
+    def post_cfg_function(args):
+        temp_storage[0] = args["uncond_denoised"]
+        return args["denoised"]
+
+    from backend.patcher.base import set_model_options_post_cfg_function
+    model_options = extra_args.get("model_options", {}).copy()
+    extra_args["model_options"] = set_model_options_post_cfg_function(model_options, post_cfg_function, disable_cfg1_optimization=True)
+
+    for i in trange(len(sigmas) - 1, disable=disable):
+        sigma_t, sigma_s = sigmas[i], sigmas[i + 1]
+        
+        # Calculate t, s for DPM solver
+        # Handle sigma_s=0 (last step)
+        if sigma_s == 0:
+            # For the very last step, we usually just want to denoise one last time or return
+            # But standard DPM loop logic requires t,s.
+            # We'll rely on the sigma_s=0 check later.
+            t, s = -sigma_t.log(), -100.0 # arbitrary low val
+        else:
+            t, s = -sigma_t.log(), -sigma_s.log()
+
+        # 1. Main Model Call
+        denoised = model(x, sigma_t * s_in, **extra_args)
+        uncond_denoised = temp_storage[0] # Retrieved via hook
+
+        if callback is not None:
+            callback({'x': x, 'i': i, 'sigma': sigma_t, 'sigma_hat': sigma_t, 'denoised': denoised})
+
+        # 2. Solver / ZigZag Logic
+        if sigma_s == 0:
+            x = denoised
+            break # Exit loop at end
+        
+        # Check ZigZag Trigger
+        # Pass raw values to controller
+        is_zag, severity = controller.should_trigger(sigma_t.item(), sigma_s.item(), denoised)
+        dynamic_gamma = gamma_scale * (1.0 - (0.5 * severity))
+        
+        if is_zag:
+            # Perform ZigZag
+            x, denoised_final = _zigzag_handler(
+                model, x, sigma_t, sigma_s, t, s, extra_args,
+                denoised_1, denoised_2, h_1, h_2,
+                eta, noise_sampler, s_noise, dynamic_gamma,
+                temp_storage,
+                denoised, uncond_denoised
+            )
+            
+            #Smart History Reset (2nd Order Continuation)
+            h_1 = s - t
+            h_2 = None
+            denoised_1 = denoised_final
+            denoised_2 = None  
+            controller.update_history(denoised_final)
+            
+        else:
+            # Standard DPM++ 3M Step
+            x = _dpm_solver_step(
+                x, t, s, 
+                denoised, denoised_1, denoised_2, h_1, h_2, 
+                eta, noise_sampler, s_noise, 
+                uncond_denoised=uncond_denoised, sigma_t=sigma_t, sigma_s=sigma_s
+            )
+            # Update history
+            h_2, h_1 = h_1, s - t
+            denoised_2, denoised_1 = denoised_1, denoised
+    return x
+
+def _dpm_solver_step_flow(x, t, s, denoised, denoised_1, denoised_2, h_1, h_2, eta, noise_sampler, s_noise, 
+                          sigma_t, sigma_s, alpha_t):
+    h = s - t
+    h_eta = h * (eta + 1)
+
+    # Flow Matching specific update (matches sample_dpmpp_3m_sde_flow)
+    # x scale factor: sigma_s / sigma_t
+    x_scaled = (sigma_s / sigma_t) * (-h * eta).exp() * x
+    
+    phi_1 = (-h_eta).expm1().neg()
+    
+    x = x_scaled + alpha_t * phi_1 * denoised
+
+    # High-Order Corrections
+    if h_2 is not None:
+        r0 = h_1 / h
+        r1 = h_2 / h
+        d1_0 = (denoised - denoised_1) / r0
+        d1_1 = (denoised_1 - denoised_2) / r1
+        d1 = d1_0 + (d1_0 - d1_1) * r0 / (r0 + r1)
+        d2 = (d1_0 - d1_1) / (r0 + r1)
+        phi_2 = h_eta.neg().expm1() / h_eta + 1
+        phi_3 = phi_2 / h_eta - 0.5
+        x = x + (alpha_t * phi_2) * d1 - (alpha_t * phi_3) * d2
+        
+    elif h_1 is not None:
+        r = h_1 / h
+        d = (denoised - denoised_1) / r
+        phi_2 = h_eta.neg().expm1() / h_eta + 1
+        x = x + (alpha_t * phi_2) * d
+
+    # SDE Noise Injection
+    if eta > 0:
+        x = x + noise_sampler(sigma_t, sigma_s) * sigma_s * (-2 * h * eta).expm1().neg().sqrt() * s_noise
+
+    return x
+
+def _zigzag_handler_flow(model, x, sigma_t, sigma_s, t, s, extra_args, 
+                         denoised_1, denoised_2, h_1, h_2, 
+                         eta, noise_sampler, s_noise, gamma_scale, 
+                         current_denoised_probe,
+                         lambda_fn):
+    s_in = x.new_ones([x.shape[0]])
+    local_extra_args = extra_args.copy() if extra_args is not None else {}
+
+    # Flag for internal use (optional, depending on model wrapper)
+    local_extra_args["__zigzag_internal"] = True
+
+    # Pre-calc alphas
+    alpha_t = sigma_t * lambda_fn(sigma_t).exp()
+    alpha_s = sigma_s * lambda_fn(sigma_s).exp()
+
+    # 1. PROBE (Zig)
+    intermediate_x = _dpm_solver_step_flow(
+        x, t, s, 
+        current_denoised_probe, denoised_1, denoised_2, h_1, h_2, 
+        0, noise_sampler, s_noise, 
+        sigma_t=sigma_t, sigma_s=sigma_s, alpha_t=alpha_s
+    )
+
+    # 2. REFLECTION (Zag) - Backward (s -> t)
+    extra_args_low = local_extra_args.copy()
+    if 'cond_scale' in extra_args_low and gamma_scale > 0:
+        extra_args_low['cond_scale'] *= gamma_scale
+
+    denoised_invert = model(intermediate_x, sigma_s * s_in, **extra_args_low)
+
+    refined_x = _dpm_solver_step_flow(
+        intermediate_x, s, t, 
+        denoised_invert, None, None, None, None, 
+        0, noise_sampler, s_noise, 
+        sigma_t=sigma_s, sigma_s=sigma_t, alpha_t=alpha_t
+    )
+
+    # 3. COMMIT (Zig) - Forward
+    x_for_commit = refined_x 
+    denoised_final = model(x_for_commit, sigma_t * s_in, **local_extra_args)
+    
+    x_next = _dpm_solver_step_flow(
+        x_for_commit, t, s, 
+        denoised_final, None, None, None, None, 
+        eta, noise_sampler, s_noise, 
+        sigma_t=sigma_t, sigma_s=sigma_s, alpha_t=alpha_s
+    )
+
+    return x_next, denoised_final
+
+@torch.no_grad()
+def sample_dpmpp_3m_sde_flow_ctrlz(model, x, sigmas, extra_args=None, callback=None, disable=None, eta=1., s_noise=1., noise_sampler=None, gamma_scale=0.5):
+    """
+    Robust Hybrid DPM-Solver++(3M) SDE with ZigZag Sampling, adapted for Flow Matching.
+    """
+    if len(sigmas) <= 1:
+        return x
+
+    sigma_min, sigma_max = sigmas[sigmas > 0].min(), sigmas.max()
+    seed = extra_args.get("seed", None)
+    noise_sampler = BrownianTreeNoiseSampler(x, sigma_min, sigma_max, seed=seed, cpu=True) if noise_sampler is None else noise_sampler
+    extra_args = {} if extra_args is None else extra_args
+    s_in = x.new_ones([x.shape[0]])
+
+    controller = ZigZagController(start_sigma=sigmas.max().item())
+    denoised_1, denoised_2 = None, None
+    h_1, h_2 = None, None
+
+    def robust_sigma_to_log_snr(sigma):
+        sigma = sigma.clamp(min=1e-4, max=1.0 - 1e-4)
+        return sigma.logit().neg() 
+
+    lambda_fn = robust_sigma_to_log_snr
+
+    for i in trange(len(sigmas) - 1, disable=disable):
+        sigma_t, sigma_s = sigmas[i], sigmas[i + 1]
+        
+        if sigma_s == 0:
+            t = lambda_fn(sigma_t)
+            s = -100.0 
+        else:
+            t = lambda_fn(sigma_t)
+            s = lambda_fn(sigma_s)
+
+        denoised = model(x, sigma_t * s_in, **extra_args)
+
+        if callback is not None:
+            callback({'x': x, 'i': i, 'sigma': sigma_t, 'sigma_hat': sigma_t, 'denoised': denoised})
+
+        if sigma_s == 0:
+            x = denoised
+            break 
+        
+        alpha_t = sigma_s * s.exp() # alpha for the *next* step (destination)
+
+        is_zag, severity = controller.should_trigger(sigma_t.item(), sigma_s.item(), denoised)
+        dynamic_gamma = gamma_scale * (1.0 - (0.5 * severity))
+        
+        if is_zag:
+            x, denoised_final = _zigzag_handler_flow(
+                model, x, sigma_t, sigma_s, t, s, extra_args,
+                denoised_1, denoised_2, h_1, h_2,
+                eta, noise_sampler, s_noise, dynamic_gamma,
+                denoised,
+                lambda_fn
+            )
+            h_1 = s - t
+            h_2 = None
+            denoised_1 = denoised_final
+            denoised_2 = None  
+            controller.update_history(denoised_final)
+        else:
+            x = _dpm_solver_step_flow(
+                x, t, s, 
+                denoised, denoised_1, denoised_2, h_1, h_2, 
+                eta, noise_sampler, s_noise, 
+                sigma_t=sigma_t, sigma_s=sigma_s, alpha_t=alpha_t
+            )
+            h_2, h_1 = h_1, s - t
+            denoised_2, denoised_1 = denoised_1, denoised
     return x

@@ -120,7 +120,7 @@ class AnimaTextProcessingEngine:
         if cross_attn.shape[1] < 512:
             cross_attn = torch.nn.functional.pad(cross_attn, (0, 0, 0, 512 - cross_attn.shape[1]))
 
-        return cross_attn
+        return cross_attn.squeeze(0)
 
     def process_embeds(self, batch_tokens):
         device = memory_management.text_encoder_device()

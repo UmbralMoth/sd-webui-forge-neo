@@ -1,6 +1,6 @@
 import dataclasses
-from math import atan, exp, pi
-from typing import Callable
+from math import atan, exp, log, pi
+from typing import Callable, Optional
 
 import k_diffusion
 import numpy as np
@@ -26,6 +26,7 @@ class Scheduler:
 
     default_rho: float = -1.0
     need_inner_model: bool = False
+    need_width_height: bool = False
     aliases: list[str] = None
 
 
@@ -67,33 +68,197 @@ def sgm_uniform(n, sigma_min, sigma_max, inner_model, device):
     return torch.FloatTensor(sigs).to(device)
 
 
-def _loglinear_interp(t_steps, num_steps):
-    """Performs log-linear interpolation of a given array of decreasing numbers"""
-    xs = np.linspace(0, 1, len(t_steps))
-    ys = np.log(t_steps[::-1])
+def _get_ays_diffusion_sigmas(
+    n: int,
+    sigma_min: float,
+    sigma_max: float,
+    device: torch.device,
+    is_sdxl: bool,
+    apply_beta: bool = False,
+) -> torch.Tensor:
+    """SD1.5 / SDXL branch – pure parametric log-logistic (original AYS paper spirit)."""
+    loc = 0.0699 if is_sdxl else 1.3114
+    scale = 1.4059 if is_sdxl else 1.6607
 
-    new_xs = np.linspace(0, 1, num_steps)
-    new_ys = np.interp(new_xs, xs, ys)
+    optimal_start = 14.61
+    if sigma_max > optimal_start:
+        sigma_max = optimal_start
 
-    interped_ys = np.exp(new_ys)[::-1].copy()
-    return interped_ys
+    # Build fine table for beta (or just n)
+    m = n * 3 if apply_beta and n < 50 else n
+
+    t = torch.linspace(1.0, 0.0, m + 1, device=device)
+
+    def sigma_to_t(sigma: float, loc: float, scale: float) -> float:
+        sigma = max(sigma, 1e-5)
+        y = (log(sigma) - loc) / scale
+        return 1.0 / (1.0 + exp(-y))
+
+    t_max = sigma_to_t(sigma_max, loc, scale)
+    t_min = sigma_to_t(sigma_min, loc, scale)
+
+    t = t * (t_max - t_min) + t_min
+    t = t.clamp(min=1e-5, max=1.0 - 1e-5)
+
+    log_sigmas = loc + scale * torch.log(t / (1.0 - t))
+    sigmas = torch.exp(log_sigmas)
+
+    return sigmas, sigma_max  # second return for boundary enforcement
 
 
-def get_align_your_steps_sigmas(n, sigma_min, sigma_max, device):
-    """https://research.nvidia.com/labs/toronto-ai/AlignYourSteps/howto.html"""
+def _get_ays_flow_sigmas(
+    n: int,
+    width: int,
+    height: int,
+    sigma_min: float,
+    sigma_max: float,
+    device: torch.device,
+    inner_model: Optional[object] = None,
+) -> torch.Tensor:
+    """Anima / Rectified-Flow branch.
+    Mathematically correct implementation avoiding the linear scaling cliff."""
 
-    if shared.sd_model.is_sdxl:
-        sigmas = sigmas = [sigma_max, sigma_max / 2.314, sigma_max / 3.875, sigma_max / 6.701, sigma_max / 10.89, sigma_max / 16.954, sigma_max / 26.333, sigma_max / 38.46, sigma_max / 62.457, sigma_max / 129.336, 0.029]
+    # 1. Flow models must terminate exactly at 0.0. 
+    # We ignore the UI's residual SD1.5 sigma_min (e.g., 0.0292) which ruins the terminal trajectory.
+    flow_sigma_min = 0.0
+    flow_sigma_max = min(1.0, float(sigma_max))
+
+    # 2. Extract shift parameter
+    if inner_model is None:
+        base_shift = 3.0
     else:
-        # Default to SD 1.5 sigmas.
-        sigmas = [sigma_max, sigma_max / 2.257, sigma_max / 3.785, sigma_max / 5.418, sigma_max / 7.749, sigma_max / 10.469, sigma_max / 15.176, sigma_max / 22.415, sigma_max / 36.629, sigma_max / 96.151, 0.029]
+        unet = inner_model.inner_model.forge_objects.unet
+        base_shift = getattr(unet.model.predictor, "shift", 3.0)
 
-    if n != len(sigmas):
-        sigmas = np.append(_loglinear_interp(sigmas, n), [0.0])
+    use_dynamic = getattr(shared.opts, "use_dynamic_shifting", False)
+
+    if use_dynamic:
+        seq_len = (width * height) / (16 * 16)
+        # Assuming compute_empirical_mu is in your scope
+        shift = compute_empirical_mu(round(seq_len), n) 
     else:
-        sigmas.append(0.0)
+        ays_ref = getattr(shared.opts, "ays_resolution_reference", 1024.0)
+        resolution = max(width, height)
+        res_factor = (resolution / max(1.0, float(ays_ref))) ** 0.5
+        
+        shift = base_shift * res_factor
+        shift = max(
+            getattr(shared.opts, "ays_shift_min", 1.5),
+            min(getattr(shared.opts, "ays_shift_max", 8.0), float(shift)),
+        )
 
-    return torch.FloatTensor(sigmas).to(device)
+    # 3. Generate pure K-Diffusion aligned linspace 
+    # (Handling partial denoising dynamically BEFORE applying the non-linear shift)
+    timesteps = torch.linspace(flow_sigma_max, flow_sigma_min, n + 1, dtype=torch.float32, device=device)
+
+    # 4. Apply the Flow Matching shift equation perfectly
+    # Equation: t' = (t * shift) / (1 + (shift - 1) * t)
+    sigmas = (timesteps * shift) / (1.0 + (shift - 1.0) * timesteps)
+
+    # 5. Strict boundary enforcement (monotonicity preserved)
+    sigmas[0] = flow_sigma_max
+    sigmas[-1] = 0.0
+
+    return sigmas
+
+
+def get_align_your_steps_sigmas(
+    n: int,
+    width: int,
+    height: int,
+    sigma_min: float,
+    sigma_max: float,
+    device: torch.device,
+    apply_beta: bool = False,
+    inner_model: Optional[object] = None,
+) -> torch.Tensor:
+    """
+    Align Your Steps scheduler (refactored 2026).
+    Dispatcher + cleaned beta layer.
+    """
+    try:
+        is_sdxl = getattr(shared.sd_model, "is_sdxl", False)
+        is_anima = getattr(shared.sd_model, "is_anima", False)
+        is_flow = getattr(shared.sd_model, "is_flow", False)
+    except (ImportError, NameError, AttributeError):
+        is_sdxl = False
+        is_anima = False
+        is_flow = False
+
+    is_flow_model = is_anima or is_flow
+
+    # Decide table size for beta (finer table → better remapping)
+    m = n * 3 if apply_beta and n < 50 else n
+
+    if is_flow_model:
+        # Flow branch always builds exactly m+1 sigmas (beta will remap later)
+        sigmas = _get_ays_flow_sigmas(m, width, height, sigma_min, sigma_max, device, inner_model)
+        capped_sigma_max = sigma_max  # already capped inside
+    else:
+        sigmas, capped_sigma_max = _get_ays_diffusion_sigmas(
+            m, sigma_min, sigma_max, device, is_sdxl, apply_beta=apply_beta
+        )  # beta handled outside
+
+    # ====================== BETA REMAPPING LAYER ======================
+    if apply_beta:
+        alpha = shared.opts.beta_dist_alpha
+        beta_param = shared.opts.beta_dist_beta  # renamed to avoid shadowing
+
+        linear_timesteps = np.linspace(0, 1, n + 1)
+
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            beta_probabilities = stats.beta.ppf(linear_timesteps, alpha, beta_param)
+
+        beta_probabilities = np.nan_to_num(beta_probabilities, nan=0.0, posinf=1.0, neginf=0.0)
+
+        table_indices = np.rint(beta_probabilities * m).astype(int)
+        table_indices = np.clip(table_indices, 0, m)
+
+        # Deduplicate
+        valid_indices = []
+        for idx in table_indices:
+            if not valid_indices or idx != valid_indices[-1]:
+                valid_indices.append(idx)
+
+        valid_indices = np.array(valid_indices, dtype=float)
+        original_timeline = np.linspace(0, 1, len(valid_indices))
+        target_timeline = np.linspace(0, 1, n + 1)
+        interpolated_indices = np.interp(target_timeline, original_timeline, valid_indices)
+
+        # Vectorised lerp (cleaner than old loop)
+        idx_floor = interpolated_indices.astype(int)
+        idx_ceil = np.minimum(idx_floor + 1, m)
+        weight = torch.from_numpy(interpolated_indices - idx_floor).to(device).to(torch.float32)
+
+        sigmas_floor = sigmas[idx_floor]
+        sigmas_ceil = sigmas[idx_ceil]
+
+        sigmas = (sigmas_floor * (1 - weight) + sigmas_ceil * weight).to(device)
+
+    # Final boundary enforcement (works for both branches)
+    sigmas[0] = float(capped_sigma_max)
+    sigmas[-1] = 0.0
+
+    return sigmas
+
+
+def get_align_your_steps_with_beta_selection_sigmas(n, width, height, sigma_min, sigma_max, device, inner_model=None):
+    """
+    Hybrid Scheduler: Align Your Steps with Beta Distribution Selection
+    
+    Combines the best of both approaches by applying the Beta Distribution
+    to the linear time variable *before* mapping it through the AYS curve.
+    
+    This allows for dynamic emphasis on high-noise structure formation or low-noise refinement
+    based on alpha/beta parameters, while maintaining AYS's mathematically optimized noise spacing,
+    without "leapfrogging" or starving the extreme edges.
+    
+    Parameters are controlled via shared.opts.beta_dist_alpha and shared.opts.beta_dist_beta
+    (typically 0.6/0.6 for balanced, 0.4/0.6 for more structure emphasis)
+    """
+    return get_align_your_steps_sigmas(n, width, height, sigma_min, sigma_max, device, apply_beta=True, inner_model=inner_model)
 
 
 def linear_quadratic(n, sigma_min, sigma_max, device, *, threshold_noise=0.025):
@@ -201,28 +366,36 @@ def bong_tangent_scheduler(n, sigma_min, sigma_max, device, *, start=1.0, middle
     return tan_sigmas.to(device)
 
 
-def flow_match_euler_discrete_scheduler(n, sigma_min, sigma_max, inner_model, device):
+def flow_match_euler_discrete_scheduler(n, width, height, sigma_min, sigma_max, inner_model, device, ):
     from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
         FlowMatchEulerDiscreteScheduler,
     )
 
     unet = inner_model.inner_model.forge_objects.unet
 
+    use_dynamic_shifting = getattr(shared.opts, "use_dynamic_shifting", False)
+
     config = {
         "num_train_timesteps": 1000,
         "shift": getattr(unet.model.predictor, "shift", 1.0),
-        "use_dynamic_shifting": shared.opts.use_dynamic_shifting,
-        "invert_sigmas": shared.opts.invert_sigmas,
+        "use_dynamic_shifting": use_dynamic_shifting,
+        "invert_sigmas": getattr(shared.opts, "invert_sigmas", False),
         "shift_terminal": None,
-        "use_karras_sigmas": shared.opts.use_karras_sigmas,
-        "use_exponential_sigmas": shared.opts.use_exponential_sigmas,
-        "use_beta_sigmas": shared.opts.use_beta_sigmas,
+        "use_karras_sigmas": getattr(shared.opts, "use_karras_sigmas", False),
+        "use_exponential_sigmas": getattr(shared.opts, "use_exponential_sigmas", False),
+        "use_beta_sigmas": getattr(shared.opts, "use_beta_sigmas", False),
         "time_shift_type": "exponential",
-        "stochastic_sampling": shared.opts.stochastic_sampling,
+        "stochastic_sampling": getattr(shared.opts, "stochastic_sampling", False),
     }
 
     scheduler = FlowMatchEulerDiscreteScheduler.from_config(config)
-    scheduler.set_timesteps(n, device=device, mu=0.0)
+    
+    mu = 0.0
+    if use_dynamic_shifting:
+        seq_len = width * height / (16 * 16)
+        mu = compute_empirical_mu(round(seq_len), n)
+        
+    scheduler.set_timesteps(n, device=device, mu=mu)
     sigmas = scheduler.sigmas
 
     return torch.FloatTensor(sigmas).to(device)
@@ -276,12 +449,13 @@ schedulers = [
     Scheduler("linear_quadratic", "Linear Quadratic", linear_quadratic),
     Scheduler("kl_optimal", "KL Optimal", kl_optimal),
     Scheduler("ddim", "DDIM", ddim_scheduler, need_inner_model=True),
-    Scheduler("align_your_steps", "Align Your Steps", get_align_your_steps_sigmas),
+    Scheduler("align_your_steps", "Align Your Steps", get_align_your_steps_sigmas, need_width_height=True, need_inner_model=True),
+    Scheduler("align_your_steps_beta", "Align Your Steps Beta", get_align_your_steps_with_beta_selection_sigmas, need_width_height=True, need_inner_model=True),
     Scheduler("beta", "Beta", beta_scheduler, need_inner_model=True),
     Scheduler("turbo", "Turbo", turbo_scheduler, need_inner_model=True),
     Scheduler("bong_tangent", "Bong Tangent", bong_tangent_scheduler),
-    Scheduler("flow_match", "FlowMatchEulerDiscrete", flow_match_euler_discrete_scheduler, need_inner_model=True),
-    Scheduler("flux2", "Flux2", flux2_scheduler),
+    Scheduler("flow_match", "FlowMatchEulerDiscrete", flow_match_euler_discrete_scheduler, need_width_height=True, need_inner_model=True),
+    Scheduler("flux2", "Flux2", flux2_scheduler, need_width_height=True),
 ]
 
 schedulers_map = {**{x.name: x for x in schedulers}, **{x.label: x for x in schedulers}}

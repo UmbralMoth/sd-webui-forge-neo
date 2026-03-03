@@ -73,6 +73,7 @@ SHIFT = {
     PresetArch.lumina: 6.0,
     PresetArch.zit: 9.0,
     PresetArch.wan: 5.0,
+    PresetArch.anima: 3.0,
 }
 
 

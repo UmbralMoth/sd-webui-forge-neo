@@ -333,6 +333,7 @@ options_templates.update(
             "hires_fix_use_firstpass_conds": OptionInfo(False, "For hires fix, calculate conds of second pass using extra networks of first pass."),
             "use_old_scheduling": OptionInfo(False, "Use old prompt editing timelines.", infotext="Old prompt editing timelines").info("For [red:green:N]; old: If N < 1, it's a fraction of steps (and hires fix uses range from 0 to 1), if N >= 1, it's an absolute number of steps; new: If N has a decimal point in it, it's a fraction of steps (and hires fix uses range from 1 to 2), othewrwise it's an absolute number of steps"),
             "use_downcasted_alpha_bar": OptionInfo(False, "Downcast model alphas_cumprod to fp16 before sampling. For reproducing old seeds.", infotext="Downcast alphas_cumprod"),
+            "use_legacy_cfg": OptionInfo(False, "Use Legacy CFG (Less accurate Negative Prompts, but 33% faster)"),
             "sdxl_zero_neg": OptionInfo(False, "For SDXL, zero out the conditioning when negative prompt is empty").info("causes NaN when using SageAttention").needs_reload_ui(),
         },
     )
@@ -534,7 +535,7 @@ options_templates.update(
 
 options_templates.update(
     options_section(
-        ("sampler-params", "Sampler Parameters", "sd") if cmd_opts.adv_samplers else (None, "Sampler Parameters"),
+        ("sampler-params", "Sampler Parameters", "sd"),
         {
             "eta_ddim": OptionInfo(0.0, "Eta for DDIM", gr.Slider, {"minimum": 0.0, "maximum": 1.0, "step": 0.01}, infotext="Eta DDIM"),
             "eta_ancestral": OptionInfo(1.0, "Eta for k-diffusion samplers", gr.Slider, {"minimum": 0.0, "maximum": 1.0, "step": 0.01}, infotext="Eta"),
@@ -552,6 +553,9 @@ options_templates.update(
             "sd_noise_schedule": OptionInfo("Default", "Noise schedule for sampling", gr.Radio, {"choices": ("Default", "Zero Terminal SNR")}, infotext="Noise Schedule"),
             "beta_dist_alpha": OptionInfo(0.6, "Beta scheduler - alpha", gr.Slider, {"minimum": 0.01, "maximum": 2.0, "step": 0.01}, infotext="Beta scheduler alpha"),
             "beta_dist_beta": OptionInfo(0.6, "Beta scheduler - beta", gr.Slider, {"minimum": 0.01, "maximum": 2.0, "step": 0.01}, infotext="Beta scheduler beta"),
+            "ays_resolution_reference": OptionInfo(1024.0, "AYS scheduler - resolution reference", gr.Slider, {"minimum": 64, "maximum": 4096, "step": 64}, infotext="AYS resolution reference"),
+            "ays_shift_min": OptionInfo(1.5, "AYS scheduler - minimum shift restrict", gr.Slider, {"minimum": 0.1, "maximum": 20.0, "step": 0.1}, infotext="AYS shift min"),
+            "ays_shift_max": OptionInfo(8.0, "AYS scheduler - maximum shift restrict", gr.Slider, {"minimum": 0.1, "maximum": 20.0, "step": 0.1}, infotext="AYS shift max"),
             "use_dynamic_shifting": OptionInfo(False, "use_dynamic_shifting"),
             "invert_sigmas": OptionInfo(False, "invert_sigmas"),
             "use_karras_sigmas": OptionInfo(False, "use_karras_sigmas"),

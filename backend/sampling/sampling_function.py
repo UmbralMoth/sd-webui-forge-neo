@@ -165,8 +165,13 @@ def calc_cond_uncond_batch(model, cond, uncond, x_in, timestep, model_options):
     out_uncond = torch.zeros_like(x_in)
     out_uncond_count = torch.ones_like(x_in) * 1e-37
 
+    cond_empty = model_options.get("cond_empty", None)
+    out_empty = torch.zeros_like(x_in) if cond_empty is not None else None
+    out_empty_count = torch.ones_like(x_in) * 1e-37 if cond_empty is not None else None
+
     COND = 0
     UNCOND = 1
+    EMPTY = 2
 
     to_run = []
     for x in cond:
@@ -182,6 +187,14 @@ def calc_cond_uncond_batch(model, cond, uncond, x_in, timestep, model_options):
                 continue
 
             to_run += [(p, UNCOND)]
+
+    if cond_empty is not None:
+        for x in cond_empty:
+            p = get_area_and_mult(x, x_in, timestep)
+            if p is None:
+                continue
+
+            to_run += [(p, EMPTY)]
 
     while len(to_run) > 0:
         first = to_run[0]
@@ -282,15 +295,24 @@ def calc_cond_uncond_batch(model, cond, uncond, x_in, timestep, model_options):
             if cond_or_uncond[o] == COND:
                 out_cond[:, :, area[o][2] : area[o][0] + area[o][2], area[o][3] : area[o][1] + area[o][3]] += output[o] * mult[o]
                 out_count[:, :, area[o][2] : area[o][0] + area[o][2], area[o][3] : area[o][1] + area[o][3]] += mult[o]
-            else:
+            elif cond_or_uncond[o] == UNCOND:
                 out_uncond[:, :, area[o][2] : area[o][0] + area[o][2], area[o][3] : area[o][1] + area[o][3]] += output[o] * mult[o]
                 out_uncond_count[:, :, area[o][2] : area[o][0] + area[o][2], area[o][3] : area[o][1] + area[o][3]] += mult[o]
+            elif cond_or_uncond[o] == EMPTY:
+                out_empty[:, :, area[o][2] : area[o][0] + area[o][2], area[o][3] : area[o][1] + area[o][3]] += output[o] * mult[o]
+                out_empty_count[:, :, area[o][2] : area[o][0] + area[o][2], area[o][3] : area[o][1] + area[o][3]] += mult[o]
         del mult
 
     out_cond /= out_count
     del out_count
     out_uncond /= out_uncond_count
     del out_uncond_count
+
+    if cond_empty is not None:
+        out_empty /= out_empty_count
+        del out_empty_count
+        return out_cond, out_uncond, out_empty
+
     return out_cond, out_uncond
 
 
@@ -305,11 +327,18 @@ def sampling_function_inner(model, x, timestep, uncond, cond, cond_scale, model_
     for fn in model_options.get("sampler_pre_cfg_function", []):
         model, cond, uncond_, x, timestep, model_options = fn(model, cond, uncond_, x, timestep, model_options)
 
-    cond_pred, uncond_pred = calc_cond_uncond_batch(model, cond, uncond_, x, timestep, model_options)
+    calc_res = calc_cond_uncond_batch(model, cond, uncond_, x, timestep, model_options)
+    cond_pred, uncond_pred = calc_res[0], calc_res[1]
+    empty_pred = calc_res[2] if len(calc_res) == 3 else None
 
     if "sampler_cfg_function" in model_options:
         args = {"cond": x - cond_pred, "uncond": x - uncond_pred, "cond_scale": cond_scale, "timestep": timestep, "input": x, "sigma": timestep, "cond_denoised": cond_pred, "uncond_denoised": uncond_pred, "model": model, "model_options": model_options}
         cfg_result = x - model_options["sampler_cfg_function"](args)
+    elif empty_pred is not None:
+        if not math.isclose(edit_strength, 1.0):
+            cfg_result = empty_pred + (cond_pred - uncond_pred) * cond_scale * edit_strength
+        else:
+            cfg_result = empty_pred + (cond_pred - uncond_pred) * cond_scale
     elif not math.isclose(edit_strength, 1.0):
         cfg_result = uncond_pred + (cond_pred - uncond_pred) * cond_scale * edit_strength
     else:

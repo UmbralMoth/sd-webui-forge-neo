@@ -16,7 +16,11 @@ samplers_k_diffusion = [
     ("DPM++ SDE", "sample_dpmpp_sde", ["k_dpmpp_sde"], {"scheduler": "karras", "second_order": True, "brownian_noise": True}),
     ("DPM++ 2M SDE", "sample_dpmpp_2m_sde", ["k_dpmpp_2m_sde_ka"], {"brownian_noise": True}),
     ("DPM++ 3M SDE", "sample_dpmpp_3m_sde", ["k_dpmpp_3m_sde"], {"scheduler": "exponential", "discard_next_to_last_sigma": True, "brownian_noise": True}),
+    ("DPM++ 3M SDE CFG++ Ctrl-Z", "sample_dpmpp_3m_sde_cfgpp_ctrlz", ["k_dpmpp_3m_sde_cfgpp_ctrlz"], {"scheduler": "exponential", "discard_next_to_last_sigma": True, "brownian_noise": True}),
+    ("DPM++ 3M SDE Flow", "sample_dpmpp_3m_sde_flow", ["k_dpmpp_3m_sde_flow"], {"scheduler": "exponential", "discard_next_to_last_sigma": True, "brownian_noise": True}),
+    ("DPM++ 3M SDE Flow Ctrl-Z", "sample_dpmpp_3m_sde_flow_ctrlz", ["k_dpmpp_3m_sde_flow_ctrlz"], {"scheduler": "exponential", "discard_next_to_last_sigma": True, "brownian_noise": True}),
     ("Flux Realistic" if opts.forbidden_knowledge else "DPM++ 2s a RF", "sample_dpmpp_2s_ancestral_RF", ["sample_dpmpp_2s_ancestral_RF"], {}),
+    ("Euler a2 RF", "sample_euler_a2", ["euler_a2_rf"], {}),
     ("Euler a", "sample_euler_ancestral", ["k_euler_a", "k_euler_ancestral"], {"uses_ensd": True}),
     ("Euler", "sample_euler", ["k_euler"], {}),
     ("ER SDE", "sample_er_sde", ["er_side"], {}),
@@ -37,7 +41,11 @@ sampler_extra_params = {
     "sample_dpmpp_sde": ["eta", "s_noise", "r"],
     "sample_dpmpp_2m_sde": ["eta", "s_noise"],
     "sample_dpmpp_3m_sde": ["eta", "s_noise"],
+    "sample_dpmpp_3m_sde_cfgpp_ctrlz": ["eta", "s_noise"],
+    "sample_dpmpp_3m_sde_flow": ["eta", "s_noise"],
+    "sample_dpmpp_3m_sde_flow_ctrlz": ["eta", "s_noise"],
     "sample_euler_ancestral": ["eta", "s_noise"],
+    "sample_euler_a2": ["eta", "s_noise"],
     "sample_euler": ["s_churn", "s_tmin", "s_tmax", "s_noise"],
     "sample_heun": ["s_churn", "s_tmin", "s_tmax", "s_noise"],
     "sample_dpm_2": ["s_churn", "s_tmin", "s_tmax", "s_noise"],
@@ -121,7 +129,7 @@ class KDiffusionSampler(sd_samplers_common.Sampler):
                 p.extra_generation_params["Beta schedule alpha"] = opts.beta_dist_alpha
                 p.extra_generation_params["Beta schedule beta"] = opts.beta_dist_beta
 
-            if scheduler.label == "Flux2":
+            if scheduler.need_width_height:
                 if p.is_hr_pass:
                     sigmas_kwargs["width"] = p.hr_upscale_to_x
                     sigmas_kwargs["height"] = p.hr_upscale_to_y

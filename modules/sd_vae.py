@@ -6,6 +6,10 @@ import torch
 
 from backend import memory_management, utils
 from modules import hashes, paths, sd_models, shared
+try:
+    from ldm_patched.modules import diffusers_convert
+except ImportError:
+    diffusers_convert = None
 
 vae_path = os.path.abspath(os.path.join(paths.models_path, "VAE"))
 vae_ignore_keys: set[str] = {"model_ema.decay", "model_ema.num_updates"}
@@ -19,7 +23,64 @@ checkpoint_info: "sd_models.CheckpointInfo" = None
 @torch.inference_mode()
 def _load_vae_dict(model, vae_sd: dict):
     sd = {k: v for k, v in vae_sd.items() if k[0:4] != "loss" and k not in vae_ignore_keys}
-    model.first_stage_model.load_state_dict(sd)
+    sd = _normalize_vae_state_dict(sd)
+
+    # Strip bn.* keys — these are Flux2-style training artifacts that IntegratedAutoencoderKL
+    # doesn't have a module for; ignore them silently rather than crashing on strict load.
+    sd_to_load = {k: v for k, v in sd.items() if not k.startswith("bn.")}
+
+    # Prefer updating the Forge VAE wrapper so encode/decode during sampling uses the new weights.
+    forge_vae = getattr(getattr(model, "forge_objects", None), "vae", None)
+    target = getattr(forge_vae, "first_stage_model", None) if forge_vae is not None else None
+    if target is None:
+        target = model.first_stage_model
+
+    try:
+        target.load_state_dict(sd_to_load, strict=True)
+    except RuntimeError:
+        # Architecture mismatch (e.g. channel count difference) — fall back to non-strict.
+        missing, unexpected = target.load_state_dict(sd_to_load, strict=False)
+        if unexpected:
+            print(f"VAE load (non-strict): unexpected keys {unexpected[:5]}{'...' if len(unexpected) > 5 else ''}")
+
+    # Keep all Forge references in sync.
+    if forge_vae is not None:
+        forge_vae.first_stage_model = target
+        if hasattr(model, "forge_objects_original") and getattr(model.forge_objects_original, "vae", None) is not None:
+            model.forge_objects_original.vae.first_stage_model = target
+        if hasattr(model, "forge_objects_after_applying_lora") and getattr(model.forge_objects_after_applying_lora, "vae", None) is not None:
+            model.forge_objects_after_applying_lora.vae.first_stage_model = target
+    model.first_stage_model = target
+
+
+def _looks_like_vae_state_dict(sd: dict) -> bool:
+    if not sd:
+        return False
+    return (
+        "decoder.conv_in.weight" in sd
+        or "encoder.conv_in.weight" in sd
+        or "decoder.up_blocks.0.resnets.0.norm1.weight" in sd
+        or any(k.startswith("decoder.") or k.startswith("encoder.") for k in sd)
+    )
+
+
+def _normalize_vae_state_dict(sd: dict) -> dict:
+    """Strip common checkpoint prefixes and convert diffusers format if needed."""
+    if not sd or _looks_like_vae_state_dict(sd):
+        out = sd
+    else:
+        out = sd
+        for prefix in ("first_stage_model.", "vae.", "model.first_stage_model.", "model.vae."):
+            cand = {k[len(prefix):]: v for k, v in sd.items() if k.startswith(prefix)}
+            if _looks_like_vae_state_dict(cand):
+                print(f"VAE load: stripped prefix '{prefix}'")
+                out = cand
+                break
+
+    if diffusers_convert is not None and "decoder.up_blocks.0.resnets.0.norm1.weight" in out:
+        out = diffusers_convert.convert_vae_state_dict(out)
+
+    return out
 
 
 def get_loaded_vae_name() -> str:

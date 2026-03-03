@@ -16,7 +16,7 @@ from backend.diffusion_engine.flux2 import Flux2
 from backend.diffusion_engine.lumina import Lumina2
 from backend.diffusion_engine.qwen import QwenImage
 from backend.diffusion_engine.sd15 import StableDiffusion
-from backend.diffusion_engine.sdxl import StableDiffusionXL, StableDiffusionXLRefiner
+from backend.diffusion_engine.sdxl import StableDiffusionXL, StableDiffusionXLRF, StableDiffusionXLRefiner
 from backend.diffusion_engine.wan import Wan
 from backend.diffusion_engine.zimage import ZImage
 from backend.logging import setup_logger
@@ -32,7 +32,7 @@ from backend.utils import (
     read_arbitrary_config,
 )
 
-possible_models = [StableDiffusion, StableDiffusionXLRefiner, StableDiffusionXL, Chroma, Flux, Flux2, Wan, QwenImage, Lumina2, ZImage, Anima]
+possible_models = [StableDiffusion, StableDiffusionXLRefiner, StableDiffusionXLRF, StableDiffusionXL, Chroma, Flux, Flux2, Wan, QwenImage, Lumina2, ZImage, Anima]
 
 logger = logging.getLogger("loader")
 setup_logger(logger)
@@ -65,7 +65,7 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
                 with using_forge_operations(device=memory_management.cpu, dtype=memory_management.vae_dtype()):
                     model = IntegratedAutoencoderKL.from_config(config)
 
-            load_state_dict(model, state_dict, ignore_start="loss.")
+            load_state_dict(model, {k: v for k, v in state_dict.items() if not k.startswith("bn.")}, ignore_start="loss.")
             return model
         if cls_name == "AutoencoderKLFlux2":
             assert isinstance(state_dict, dict) and len(state_dict) > 16, "You do not have VAE state dict!"
