@@ -1,8 +1,8 @@
 from typing import TYPE_CHECKING
+import weakref
 
 if TYPE_CHECKING:
     from backend.nn.llm.llama import Qwen3_06B
-
 import torch
 
 from backend import memory_management
@@ -19,7 +19,7 @@ class PromptChunk:
 
 
 class AnimaTextProcessingEngine:
-    def __init__(self, text_encoder, qwen_tokenizer, t5_tokenizer):
+    def __init__(self, text_encoder, qwen_tokenizer, t5_tokenizer, unet=None):
         super().__init__()
 
         self.text_encoder: "Qwen3_06B" = text_encoder
@@ -77,14 +77,14 @@ class AnimaTextProcessingEngine:
         return chunks
 
     def __call__(self, texts):
-        zs = []
+        zs, ti, tw = [], [], []
         cache = {}
 
         self.emphasis = emphasis.get_current_option(opts.emphasis)()
 
         for line in texts:
             if line in cache:
-                z = cache[line]
+                z, chunk = cache[line]
             else:
                 chunks: list[PromptChunk] = self.tokenize_line(line)
                 assert len(chunks) == 1
@@ -92,20 +92,38 @@ class AnimaTextProcessingEngine:
                 for chunk in chunks:
                     tokens = chunk.qwen_tokens
                     multipliers = chunk.qwen_multipliers
-
+                    
+                    if len(tokens) == 0:
+                        tokens = [self.id_pad]
+                        multipliers = [1.0]
+                    
                     z: torch.Tensor = self.process_tokens([tokens], [multipliers])[0]
 
-                cache[line] = z
+                cache[line] = (z, chunk)
 
-            zs.append(
-                self.anima_preprocess(
-                    z,
-                    torch.tensor(chunk.t5_tokens, dtype=torch.int),
-                    torch.tensor(chunk.t5_multipliers),
-                )
-            )
+            zs.append(z)
+            ti.append(torch.tensor(chunk.t5_tokens, dtype=torch.int))
+            tw.append(torch.tensor(chunk.t5_multipliers))
 
-        return zs
+        def stack_with_padding(tensors, pad_value=0):
+            max_len = max([t.shape[0] for t in tensors])
+            out = []
+            for t in tensors:
+                if t.shape[0] < max_len:
+                    if t.ndim == 1:
+                        t = torch.cat([t, torch.full((max_len - t.shape[0],), pad_value, dtype=t.dtype, device=t.device)])
+                    else:
+                        t = torch.cat([t, torch.full((max_len - t.shape[0], *t.shape[1:]), pad_value, dtype=t.dtype, device=t.device)])
+                out.append(t)
+            return torch.stack(out)
+
+        z = {
+            "qwen_cond": stack_with_padding(zs),
+            "t5_ids": stack_with_padding(ti, pad_value=0),
+            "t5_weights": stack_with_padding(tw, pad_value=1.0),
+        }
+
+        return z
 
     def anima_preprocess(self, cross_attn: torch.Tensor, t5xxl_ids: torch.Tensor, t5xxl_weights: torch.Tensor) -> torch.Tensor:
         device = memory_management.text_encoder_device()
@@ -128,6 +146,9 @@ class AnimaTextProcessingEngine:
         embeds_out = []
         attention_masks = []
         num_tokens = []
+        embeds_info = []
+        
+        max_len = max(len(tokens) for tokens in batch_tokens) if len(batch_tokens) > 0 else 0
 
         for tokens in batch_tokens:
             attention_mask = []
@@ -146,12 +167,33 @@ class AnimaTextProcessingEngine:
                 except TypeError:
                     other_embeds.append((index, t))
                 index += 1
+            
+            # Padding for variable length
+            if len(tokens_temp) < max_len:
+                pad_n = max_len - len(tokens_temp)
+                tokens_temp += [self.id_pad] * pad_n
+                attention_mask += [0] * pad_n
 
             tokens_embed = torch.tensor([tokens_temp], device=device, dtype=torch.long)
             tokens_embed = self.text_encoder.get_input_embeddings()(tokens_embed)
 
             index = 0
-            embeds_info = []
+            for o in other_embeds:
+                emb, extra = self.text_encoder.preprocess_embed(o[1], device=device)
+                if emb is None:
+                    index += -1
+                    continue
+
+                ind = index + o[0]
+                emb = emb.view(1, -1, emb.shape[-1]).to(device=device, dtype=torch.float32)
+                emb_shape = emb.shape[1]
+
+                assert emb.shape[-1] == tokens_embed.shape[-1]
+                tokens_embed = torch.cat([tokens_embed[:, :ind], emb, tokens_embed[:, ind:]], dim=1)
+                attention_mask = attention_mask[:ind] + [1] * emb_shape + attention_mask[ind:]
+                index += emb_shape - 1
+                emb_type = o[1].get("type", None)
+                embeds_info.append({"type": emb_type, "index": ind, "size": emb_shape, "extra": extra})
 
             embeds_out.append(tokens_embed)
             attention_masks.append(attention_mask)
@@ -161,5 +203,28 @@ class AnimaTextProcessingEngine:
 
     def process_tokens(self, batch_tokens, batch_multipliers):
         embeds, mask, count, info = self.process_embeds(batch_tokens)
-        z, _ = self.text_encoder(input_ids=None, embeds=embeds, attention_mask=mask, num_tokens=count, embeds_info=info)
+        
+        seq_len = embeds.size(1)
+        padded_multipliers = []
+        for multipliers in batch_multipliers:
+            if len(multipliers) < seq_len:
+                multipliers = multipliers + [1.0] * (seq_len - len(multipliers))
+            else:
+                multipliers = multipliers[:seq_len]
+            padded_multipliers.append(multipliers)
+
+        if len(padded_multipliers) > 0 and embeds.size(1) == len(padded_multipliers[0]):
+            self.emphasis.tokens = batch_tokens
+            self.emphasis.multipliers = torch.as_tensor(padded_multipliers).to(embeds)
+            self.emphasis.z = embeds
+            self.emphasis.after_transformers()
+            embeds = self.emphasis.z
+
+        z, _ = self.text_encoder(
+            input_ids=None,
+            embeds=embeds,
+            attention_mask=mask,
+            num_tokens=count,
+            embeds_info=info
+        )
         return z

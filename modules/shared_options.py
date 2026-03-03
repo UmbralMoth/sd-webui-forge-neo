@@ -562,6 +562,10 @@ options_templates.update(
             "use_exponential_sigmas": OptionInfo(False, "use_exponential_sigmas"),
             "use_beta_sigmas": OptionInfo(False, "use_beta_sigmas"),
             "stochastic_sampling": OptionInfo(False, "stochastic_sampling"),
+            "ays_resolution_reference": OptionInfo(768, "AYS resolution reference", gr.Number, infotext="Reference resolution used by Align Your Steps to compute res scaling"),
+            "ays_base_shift": OptionInfo(3.0, "AYS base shift", gr.Slider, {"minimum": 0.5, "maximum": 10.0, "step": 0.1}, infotext="Base shift applied to AYS for Anima models"),
+            "ays_shift_min": OptionInfo(2.0, "AYS shift clamp min", gr.Slider, {"minimum": 0.1, "maximum": 10.0, "step": 0.1}, infotext="Minimum clamp for computed shift"),
+            "ays_shift_max": OptionInfo(5.0, "AYS shift clamp max", gr.Slider, {"minimum": 1.0, "maximum": 20.0, "step": 0.1}, infotext="Maximum clamp for computed shift"),
         },
     )
 )

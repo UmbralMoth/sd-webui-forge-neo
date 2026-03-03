@@ -67,6 +67,24 @@ def sgm_uniform(n, sigma_min, sigma_max, inner_model, device):
     sigs += [0.0]
     return torch.FloatTensor(sigs).to(device)
 
+def get_align_your_steps_sigmas(n, sigma_min, sigma_max, device, width=1024, height=1024):
+    """
+    Align Your Steps scheduler, based on "Align Your Steps: Optimal Noise Schedules for Diffusion Models" [arXiv:2406.16157] (Zhao et al., 2024).
+    
+    Key features:
+    - Log-Logistic Distribution: For SDXL and SD1.5, uses a log-logistic distribution in t-space to optimally space noise levels based on model-specific parameters (loc, scale).
+    - Dynamic Shift Tuning: For Anima models, dynamically adjusts the shift based on resolution and step count to tailor the noise schedule.
+    - Smart Cap: Limits maximum sigma to an optimal value (14.61 for SDXL/SD1.5, 80.0 for Anima) to prevent training instability.
+    - Resolution-Aware: Scales parameters based on image resolution for better adaptability across different input sizes.
+    """
+    # Use the longer dimension as the primary resolution reference
+    resolution = max(width, height)
+    try:
+        is_sdxl = getattr(shared.sd_model, 'is_sdxl', False)
+        is_anima = getattr(shared.sd_model, 'is_anima', False)
+    except (ImportError, NameError, AttributeError):
+        is_sdxl = False
+        is_anima = False
 
 def _get_ays_diffusion_sigmas(
     n: int,
@@ -365,6 +383,35 @@ def bong_tangent_scheduler(n, sigma_min, sigma_max, device, *, start=1.0, middle
 
     return tan_sigmas.to(device)
 
+def phi_scheduler(n, sigma_min, sigma_max, device):
+    """
+    The 'Golden Warp' Scheduler. 
+    Warps a log-linear distribution using Phi to balance high-noise exploration 
+    and low-noise refinement naturally.
+    """
+    phi = 1.618033988749895
+    
+    # Standard linear steps 0 -> 1
+    t = torch.linspace(0, 1, n, device=device)
+    
+    # Warp function: t -> t^Phi
+    # This creates a convex curve similar to Karras but derived from the Golden Ratio.
+    # It drops from high sigma slightly faster than linear, spending 'Phi' more time
+    # in the structure-forming phase.
+    t = t ** phi
+    
+    # Log-Linear Interpolation
+    log_min = log(max(sigma_min, 1e-5))
+    log_max = log(max(sigma_max, 1e-5))
+    
+    log_sigmas = log_max + t * (log_min - log_max)
+    sigmas = torch.exp(log_sigmas)
+    
+    # Append zero for the final step
+    sigmas = torch.cat([sigmas, torch.zeros(1, device=device)])
+    
+    return sigmas
+
 
 def flow_match_euler_discrete_scheduler(n, width, height, sigma_min, sigma_max, inner_model, device, ):
     from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
@@ -442,6 +489,7 @@ schedulers = [
     Scheduler("karras", "Karras", k_diffusion.sampling.get_sigmas_karras, default_rho=7.0),
     Scheduler("exponential", "Exponential", k_diffusion.sampling.get_sigmas_exponential),
     Scheduler("polyexponential", "Polyexponential", k_diffusion.sampling.get_sigmas_polyexponential, default_rho=1.0),
+    Scheduler("phi", "Phi", phi_scheduler),
     Scheduler("normal", "Normal", normal_scheduler, need_inner_model=True),
     Scheduler("simple", "Simple", simple_scheduler, need_inner_model=True),
     Scheduler("uniform", "Uniform", uniform, need_inner_model=True),

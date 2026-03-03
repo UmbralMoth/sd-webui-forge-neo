@@ -579,12 +579,21 @@ class MiniTrainDIT(nn.Module):
         )
         return x_B_C_Tt_Hp_Wp
 
-    def forward(self, x: torch.Tensor, timesteps: torch.Tensor, context: torch.Tensor, fps: Optional[torch.Tensor] = None, padding_mask: Optional[torch.Tensor] = None, **kwargs):
+    def forward(self, x: torch.Tensor, timesteps: torch.Tensor, context: torch.Tensor, text_ids: Optional[torch.Tensor] = None, text_weights: Optional[torch.Tensor] = None, fps: Optional[torch.Tensor] = None, padding_mask: Optional[torch.Tensor] = None, **kwargs):
         orig_shape = list(x.shape)
         x = pad_to_patch_size(x, (self.patch_temporal, self.patch_spatial, self.patch_spatial))
         x_B_C_T_H_W = x
         timesteps_B_T = timesteps
-        crossattn_emb = context
+        
+        if hasattr(self, "preprocess_text_embeds"):
+            import inspect
+            params = inspect.signature(self.preprocess_text_embeds).parameters
+            if "text_weights" in params:
+                crossattn_emb = self.preprocess_text_embeds(context, text_ids, text_weights=text_weights)
+            else:
+                crossattn_emb = self.preprocess_text_embeds(context, text_ids)
+        else:
+            crossattn_emb = context
 
         x_B_T_H_W_D, rope_emb_L_1_1_D, extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D = self.prepare_embedded_sequence(
             x_B_C_T_H_W,
@@ -768,7 +777,7 @@ class LLMAdapter(nn.Module):
         self.out_proj = nn.Linear(model_dim, target_dim)
         self.norm = nn.RMSNorm(target_dim, eps=1e-6)
 
-    def forward(self, source_hidden_states, target_input_ids, target_attention_mask=None, source_attention_mask=None):
+    def forward(self, source_hidden_states, target_input_ids, target_attention_mask=None, source_attention_mask=None, target_weights=None):
         if target_attention_mask is not None:
             target_attention_mask = target_attention_mask.to(torch.bool)
             if target_attention_mask.ndim == 2:
@@ -780,6 +789,9 @@ class LLMAdapter(nn.Module):
                 source_attention_mask = source_attention_mask.unsqueeze(1).unsqueeze(1)
 
         x = self.in_proj(self.embed(target_input_ids))
+        if target_weights is not None:
+            x = x * target_weights.unsqueeze(-1).to(x)
+
         context = source_hidden_states
         position_ids = torch.arange(x.shape[1], device=x.device).unsqueeze(0)
         position_ids_context = torch.arange(context.shape[1], device=x.device).unsqueeze(0)
@@ -791,4 +803,13 @@ class LLMAdapter(nn.Module):
 
 
 class Anima(MiniTrainDIT):
-    pass
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.llm_adapter = LLMAdapter()
+
+    def preprocess_text_embeds(self, text_embeds, text_ids, text_weights=None):
+        if text_ids is not None:
+            device = self.llm_adapter.embed.weight.device
+            return self.llm_adapter(text_embeds.to(device), text_ids.to(device), target_weights=text_weights)
+        else:
+            return text_embeds

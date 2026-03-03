@@ -10,6 +10,7 @@ from einops import rearrange
 
 from backend.attention import attention_function_vae
 from backend.operations import ForgeOperations as ops
+from modules_forge.packages.huggingface_guess import latent
 
 CACHE_T = 2
 
@@ -383,7 +384,7 @@ class WanVAE(nn.Module, ConfigMixin):
     config_name = "config.json"
 
     @register_to_config
-    def __init__(self, base_dim=128, z_dim=4, dim_mult=[1, 2, 4, 4], num_res_blocks=2, attn_scales=[], temporal_downsample=[True, True, False], image_channels=3, dropout=0.0):
+    def __init__(self, base_dim=128, z_dim=4, dim_mult=[1, 2, 4, 4], num_res_blocks=2, attn_scales=[], temporal_downsample=[True, True, False], image_channels=3, dropout=0.0, latents_mean=None, latents_std=None):
         super().__init__()
         self.dim = base_dim
         self.z_dim = z_dim
@@ -399,7 +400,10 @@ class WanVAE(nn.Module, ConfigMixin):
         self.conv2 = CausalConv3d(z_dim, z_dim, 1)
         self.decoder = Decoder3d(base_dim, z_dim, image_channels, dim_mult, num_res_blocks, attn_scales, self.temporal_upsample, dropout)
 
-        self.latent_format = None
+        self.latent_format = latent.Wan21()
+        if latents_mean is not None and latents_std is not None:
+            self.latent_format.latents_mean = torch.tensor(latents_mean).view(1, self.z_dim, 1, 1, 1)
+            self.latent_format.latents_std = torch.tensor(latents_std).view(1, self.z_dim, 1, 1, 1)
 
     def encode(self, x):
         conv_idx = [0]

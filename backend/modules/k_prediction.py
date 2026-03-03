@@ -321,7 +321,8 @@ class PredictionDiscreteFlow(AbstractPrediction):
     """https://github.com/comfyanonymous/ComfyUI/blob/v0.3.64/comfy/model_sampling.py#L243"""
 
     def __init__(self, model_config):
-        super().__init__(sigma_data=None, prediction_type="const")
+        sigma_data = getattr(model_config, "sigma_data", 1.0)
+        super().__init__(sigma_data=sigma_data, prediction_type="const")
         sampling_settings: dict = model_config.sampling_settings
         self.set_parameters(shift=sampling_settings.get("shift", 1.0), multiplier=sampling_settings.get("multiplier", 1000))
 

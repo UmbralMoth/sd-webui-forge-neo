@@ -141,6 +141,9 @@ def check_run_python(code: str, *, return_error: bool = False) -> bool | tuple[b
 
 def git_fix_workspace(dir, name):
     run(f'"{git}" config --global --add safe.directory "{dir}"', errdesc=f"Couldn't set {dir} as safe directory", live=False)
+    run_git(f'-C "{dir}" fetch', f"Fetching updates for {name}...", f"Couldn't fetch {name}", live=True)
+    run_git(f'-C "{dir}" reset --hard', f"Resetting {name}...", f"Couldn't reset {name}", live=True)
+    run_git(f'-C "{dir}" clean -fd', f"Cleaning {name}...", f"Couldn't clean {name}", live=True)
 
 
 def run_git(command, name=None, errdesc=None, custom_env=None, live: bool = default_command_live, **kwargs):

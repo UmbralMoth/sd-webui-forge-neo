@@ -133,13 +133,22 @@ class CFGDenoiser(torch.nn.Module):
 
         denoiser_params = CFGDenoiserParams(x, image_cond, sigma, state.sampling_step, state.sampling_steps, cond, uncond, self)
 
-        is_zigzag = kwargs.get("__zigzag_internal", False)
-        if not is_zigzag:
+        # Internal ZigZag sampling uses several internal model() calls (probe/invert/commit).
+        # Those calls should not count as "real" denoiser steps nor should they trigger
+        # UI-facing callbacks (prompt-edit swaps, preview storage, etc.). The ZigZag
+        # implementation marks internal calls with `__zigzag_internal=True` in
+        # `extra_args` so downstream code can detect and ignore them.
+        zigzag_internal = kwargs.get("__zigzag_internal", False)
+        if not zigzag_internal:
             cfg_denoiser_callback(denoiser_params)
 
         # NGMS
         if self.p.is_hr_pass == True:
-            cond_scale = self.p.hr_cfg
+            # We check if the sampler is using CFG++ or CFG and then adjust accordingly
+            if kwargs.get("cfgpp", False):
+                cond_scale = self.p.hr_cfg / 12.5
+            else:
+                cond_scale = self.p.hr_cfg
 
         if 0 < self.step / self.total_steps <= opts.skip_early_cond:
             cond_scale = 1.0
@@ -170,10 +179,11 @@ class CFGDenoiser(torch.nn.Module):
 
             denoised = blended_latent
 
-        preview = self.sampler.last_latent = denoised
-        sd_samplers_common.store_latent(preview)
+        if not zigzag_internal:
+            preview = self.sampler.last_latent = denoised
+            sd_samplers_common.store_latent(preview)
 
-        if not is_zigzag:
+
             after_cfg_callback_params = AfterCFGCallbackParams(denoised, state.sampling_step, state.sampling_steps)
             cfg_after_cfg_callback(after_cfg_callback_params)
             denoised = after_cfg_callback_params.x
