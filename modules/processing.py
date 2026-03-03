@@ -492,7 +492,7 @@ class StableDiffusionProcessing:
         else:
             self.uc = self.get_conds_with_caching(prompt_parser.get_learned_conditioning, negative_prompts, total_steps, [self.cached_uc], self.extra_network_data)
 
-            if getattr(shared.opts, 'use_legacy_cfg', False):
+            if self.override_settings.get('use_legacy_cfg', getattr(shared.opts, 'use_legacy_cfg', False)):
                 self.empty_c = None
             else:
                 if not hasattr(self, 'cached_empty_c'):
