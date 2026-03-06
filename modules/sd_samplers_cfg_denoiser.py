@@ -93,6 +93,7 @@ class CFGDenoiser(torch.nn.Module):
         self.sampler.sampler_extra_args["cond"] = c
         self.sampler.sampler_extra_args["uncond"] = uc
 
+        # TraSCE: keep cond_empty in sync with cond/uncond during refiner switches.
         if getattr(self.p, 'empty_c', None) is not None:
              self.sampler.sampler_extra_args["cond_empty"] = self.p.empty_c
         elif "cond_empty" in self.sampler.sampler_extra_args:
@@ -153,6 +154,13 @@ class CFGDenoiser(torch.nn.Module):
         if 0 < self.step / self.total_steps <= opts.skip_early_cond:
             cond_scale = 1.0
             self.p.extra_generation_params["Skip Early CFG"] = opts.skip_early_cond
+        elif opts.zero_cfg_init:
+            warmup_threshold = 0.35
+            progress = self.step / max(self.total_steps * warmup_threshold, 1e-5)
+            if progress < 1.0:
+                target_cfg = cond_scale
+                cond_scale = 1.0 + (target_cfg - 1.0) * progress
+                self.p.extra_generation_params["Dynamic Zero-CFG"] = True
         elif (self.step % 2 or opts.s_min_uncond_all) and (0 < sigma[0] < s_min_uncond):
             cond_scale = 1.0
             self.p.extra_generation_params["NGMS"] = s_min_uncond
@@ -160,8 +168,12 @@ class CFGDenoiser(torch.nn.Module):
                 self.p.extra_generation_params["NGMS all steps"] = opts.s_min_uncond_all
 
         extra_model_options = kwargs.get("model_options", {})
+        # TraSCE: reconstruct empty_c for the current step (handles prompt-edit schedules)
+        # and forward it into model_options for sampling_function to compile and apply.
         if "cond_empty" in self.sampler.sampler_extra_args:
-            extra_model_options["cond_empty"] = self.sampler.sampler_extra_args["cond_empty"]
+            if getattr(self, "cached_cond_empty", None) is None:
+                self.cached_cond_empty = prompt_parser.reconstruct_cond_batch(self.sampler.sampler_extra_args["cond_empty"], self.step)
+            extra_model_options["cond_empty"] = self.cached_cond_empty
         denoised, cond_pred, uncond_pred = sampling_function(self, denoiser_params=denoiser_params, cond_scale=cond_scale, cond_composition=cond_composition, extra_model_options=extra_model_options)
 
         if self.need_last_noise_uncond:

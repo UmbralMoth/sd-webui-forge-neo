@@ -11,6 +11,7 @@ if args.uv or args.uv_symlink:
     patch(args.uv_symlink)
 
 git_tag = launch_utils.git_tag
+commit_hash = launch_utils.commit_hash
 
 run = launch_utils.run
 is_installed = launch_utils.is_installed

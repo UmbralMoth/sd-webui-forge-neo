@@ -47,7 +47,6 @@ samplers_data_alter = [
     create_cfg_pp_sampler("DPM++ 2M SDE CFG++", "dpmpp_2m_sde_cfg_pp"),
     create_cfg_pp_sampler("DPM++ 3M SDE CFG++", "dpmpp_3m_sde_cfg_pp"),
     create_cfg_pp_sampler("DPM++ 3M SDE CFG++ Ctrl-Z", "dpmpp_3m_sde_cfgpp_ctrlz"),
-    create_cfg_pp_sampler("DPM++ 3M SDE Flow CFG++ Ctrl-Z", "dpmpp_3m_sde_flow_cfgpp_ctrlz"),
     create_cfg_pp_sampler("Euler a CFG++", "euler_ancestral_cfg_pp"),
     create_cfg_pp_sampler("Euler CFG++", "euler_cfg_pp"),
 ]

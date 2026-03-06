@@ -678,7 +678,7 @@ def create_ui():
 
                             with FormRow():
                                 with gr.Column():
-                                    inpaint_full_res = gr.Radio(label="Inpaint area", choices=["Whole picture", "Only masked"], type="index", value="Only masked", elem_id="img2img_inpaint_full_res")
+                                    inpaint_full_res = gr.Radio(label="Inpaint area", choices=["Whole picture", "Only masked", "Only masked (Auto-Resolution)"], type="index", value="Only masked", elem_id="img2img_inpaint_full_res")
 
                                 with gr.Column(scale=4):
                                     inpaint_full_res_padding = gr.Slider(label="Only masked padding, pixels", minimum=0, maximum=256, step=8, value=32, elem_id="img2img_inpaint_full_res_padding")

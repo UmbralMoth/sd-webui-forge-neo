@@ -123,14 +123,9 @@ class PreprocessorReference(Preprocessor):
                 o_uc_weak = adain(h_uc, r_std, r_mean)
                 o_uc = o_uc_weak + (o_uc_strong - o_uc_weak) * style_fidelity
 
-                recon = []
-                for cx in cond_or_uncond:
-                    if cx == 0:
-                        recon.append(o_c)
-                    else:
-                        recon.append(o_uc)
-
-                o = torch.cat(recon, dim=0)
+                o = torch.empty_like(h)
+                o[cond_indices] = o_c
+                o[uncond_indices] = o_uc
                 return o
 
         def attn1_proc(q, k, v, transformer_options):
@@ -174,14 +169,9 @@ class PreprocessorReference(Preprocessor):
                 o_uc_weak = sdp(q_uc, zero_cat(k_uc, k_r, dim=1), zero_cat(v_uc, v_r, dim=1), transformer_options)
                 o_uc = o_uc_weak + (o_uc_strong - o_uc_weak) * style_fidelity
 
-                recon = []
-                for cx in cond_or_uncond:
-                    if cx == 0:
-                        recon.append(o_c)
-                    else:
-                        recon.append(o_uc)
-
-                o = torch.cat(recon, dim=0)
+                o = torch.empty_like(q)
+                o[cond_indices] = o_c
+                o[uncond_indices] = o_uc
                 return o
 
         unet.add_block_modifier(block_proc)

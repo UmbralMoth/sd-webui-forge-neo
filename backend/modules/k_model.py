@@ -54,12 +54,7 @@ class KModel(torch.nn.Module):
                     extra = extra.to(dtype)
             extra_conds[o] = extra
 
-        if "qwen_cond" in extra_conds:
-            context = extra_conds.pop("qwen_cond")
-        if "t5_ids" in extra_conds:
-            extra_conds["text_ids"] = extra_conds.pop("t5_ids")
-        if "t5_weights" in extra_conds:
-            extra_conds["text_weights"] = extra_conds.pop("t5_weights")
+
 
         context = context.to(dtype)
         model_output = self.diffusion_model(xc, t, context=context, control=control, transformer_options=transformer_options, **extra_conds).float()

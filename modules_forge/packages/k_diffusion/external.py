@@ -28,7 +28,11 @@ class ForgeScheduleLinker(nn.Module):
     def get_sigmas(self, n=None):
         if n is None:
             return sampling.append_zero(self.sigmas.flip(0))
-        t_max = len(self.sigmas) - 1
+        # Use the predictor's own timestep for sigma_max so that flow models
+        # with multiplier != 1000 (e.g. Anima with multiplier=1.0) produce a
+        # correctly-ranged linspace. For standard DDPM predictors this returns
+        # the same integer index (~999) as before.
+        t_max = self.sigma_to_t(self.sigmas[-1])
         t = torch.linspace(t_max, 0, n, device=self.sigmas.device)
         return sampling.append_zero(self.t_to_sigma(t))
 

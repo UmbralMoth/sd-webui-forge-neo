@@ -650,7 +650,8 @@ def load_models_gpu(models: list["ModelPatcher"], memory_required: float = 0, fo
         to_unload = []
         for i in range(len(current_loaded_models)):
             if loaded_model.model.is_clone(current_loaded_models[i].model):
-                to_unload = [i] + to_unload
+                if current_loaded_models[i] not in models_to_load:
+                    to_unload = [i] + to_unload
         for i in to_unload:
             model_to_unload = current_loaded_models.pop(i)
             model_to_unload.model.detach(unpatch_all=False)
@@ -662,13 +663,13 @@ def load_models_gpu(models: list["ModelPatcher"], memory_required: float = 0, fo
 
     for device in total_memory_required:
         if device != torch.device("cpu"):
-            free_memory(total_memory_required[device] * 1.1 + extra_mem, device)
+            free_memory(total_memory_required[device] * 1.1 + extra_mem, device, keep_loaded=models_to_load)
 
     for device in total_memory_required:
         if device != torch.device("cpu"):
             free_mem = get_free_memory(device)
             if free_mem < minimum_memory_required:
-                models_l = free_memory(minimum_memory_required, device)
+                models_l = free_memory(minimum_memory_required, device, keep_loaded=models_to_load)
                 logger.debug("{} models unloaded.".format(len(models_l)))
 
     for loaded_model in models_to_load:

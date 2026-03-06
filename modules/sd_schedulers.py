@@ -121,7 +121,7 @@ def _get_ays_diffusion_sigmas(
     log_sigmas = loc + scale * torch.log(t / (1.0 - t))
     sigmas = torch.exp(log_sigmas)
 
-    return sigmas, sigma_max  # second return for boundary enforcement
+    return sigmas
 
 
 def _get_ays_flow_sigmas(
@@ -134,46 +134,24 @@ def _get_ays_flow_sigmas(
     inner_model: Optional[object] = None,
 ) -> torch.Tensor:
     """Anima / Rectified-Flow branch.
-    Mathematically correct implementation avoiding the linear scaling cliff."""
+    Uses the user's Shift setting directly from the predictor — no resolution
+    scaling, which would silently override the user's explicit choice."""
 
-    # 1. Flow models must terminate exactly at 0.0. 
-    # We ignore the UI's residual SD1.5 sigma_min (e.g., 0.0292) which ruins the terminal trajectory.
-    flow_sigma_min = 0.0
+    # Flow models must terminate exactly at 0.0.
     flow_sigma_max = min(1.0, float(sigma_max))
 
-    # 2. Extract shift parameter
+    # Read shift directly from the predictor (set from the UI 'Shift' / 'Distilled CFG' slider).
     if inner_model is None:
-        base_shift = 3.0
+        shift = 3.0
     else:
         unet = inner_model.inner_model.forge_objects.unet
-        base_shift = getattr(unet.model.predictor, "shift", 3.0)
+        shift = getattr(unet.model.predictor, "shift", 3.0)
 
-    use_dynamic = getattr(shared.opts, "use_dynamic_shifting", False)
-
-    if use_dynamic:
-        seq_len = (width * height) / (16 * 16)
-        # Assuming compute_empirical_mu is in your scope
-        shift = compute_empirical_mu(round(seq_len), n) 
-    else:
-        ays_ref = getattr(shared.opts, "ays_resolution_reference", 1024.0)
-        resolution = max(width, height)
-        res_factor = (resolution / max(1.0, float(ays_ref))) ** 0.5
-        
-        shift = base_shift * res_factor
-        shift = max(
-            getattr(shared.opts, "ays_shift_min", 1.5),
-            min(getattr(shared.opts, "ays_shift_max", 8.0), float(shift)),
-        )
-
-    # 3. Generate pure K-Diffusion aligned linspace 
-    # (Handling partial denoising dynamically BEFORE applying the non-linear shift)
-    timesteps = torch.linspace(flow_sigma_max, flow_sigma_min, n + 1, dtype=torch.float32, device=device)
-
-    # 4. Apply the Flow Matching shift equation perfectly
-    # Equation: t' = (t * shift) / (1 + (shift - 1) * t)
+    # Linear timesteps in [sigma_max, 0], then apply the flow-matching shift warp.
+    timesteps = torch.linspace(flow_sigma_max, 0.0, n + 1, dtype=torch.float32, device=device)
     sigmas = (timesteps * shift) / (1.0 + (shift - 1.0) * timesteps)
 
-    # 5. Strict boundary enforcement (monotonicity preserved)
+    # Enforce exact boundaries.
     sigmas[0] = flow_sigma_max
     sigmas[-1] = 0.0
 
@@ -211,11 +189,8 @@ def get_align_your_steps_sigmas(
     if is_flow_model:
         # Flow branch always builds exactly m+1 sigmas (beta will remap later)
         sigmas = _get_ays_flow_sigmas(m, width, height, sigma_min, sigma_max, device, inner_model)
-        capped_sigma_max = sigma_max  # already capped inside
     else:
-        sigmas, capped_sigma_max = _get_ays_diffusion_sigmas(
-            m, sigma_min, sigma_max, device, is_sdxl, apply_beta=apply_beta
-        )  # beta handled outside
+        sigmas = _get_ays_diffusion_sigmas(m, sigma_min, sigma_max, device, is_sdxl, apply_beta=apply_beta)
 
     # ====================== BETA REMAPPING LAYER ======================
     if apply_beta:
@@ -255,8 +230,7 @@ def get_align_your_steps_sigmas(
 
         sigmas = (sigmas_floor * (1 - weight) + sigmas_ceil * weight).to(device)
 
-    # Final boundary enforcement (works for both branches)
-    sigmas[0] = float(capped_sigma_max)
+    # Final boundary enforcement
     sigmas[-1] = 0.0
 
     return sigmas

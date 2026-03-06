@@ -199,6 +199,10 @@ class KDiffusionSampler(sd_samplers_common.Sampler):
             "cond_scale": p.cfg_scale,
             "s_min_uncond": self.s_min_uncond,
         }
+        if getattr(p, 'empty_c', None) is not None:
+            # TraSCE: pass empty conditioning into extra_args so CFGDenoiser can apply
+            # Direction = Empty + CFG*(Pos - Neg) instead of the legacy Neg + CFG*(Pos - Neg).
+            self.sampler_extra_args["cond_empty"] = p.empty_c
 
         p.sd_model.forge_objects.unet.model_options["transformer_options"]["sampling_sigmas"] = sigmas
 
@@ -254,6 +258,10 @@ class KDiffusionSampler(sd_samplers_common.Sampler):
             "cond_scale": p.cfg_scale,
             "s_min_uncond": self.s_min_uncond,
         }
+        if getattr(p, 'empty_c', None) is not None:
+            # TraSCE: pass empty conditioning into extra_args so CFGDenoiser can apply
+            # Direction = Empty + CFG*(Pos - Neg) instead of the legacy Neg + CFG*(Pos - Neg).
+            self.sampler_extra_args["cond_empty"] = p.empty_c
 
         p.sd_model.forge_objects.unet.model_options["transformer_options"]["sampling_sigmas"] = sigmas
 

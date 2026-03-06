@@ -117,28 +117,22 @@ class AnimaTextProcessingEngine:
                 out.append(t)
             return torch.stack(out)
 
-        z = {
-            "qwen_cond": stack_with_padding(zs),
-            "t5_ids": stack_with_padding(ti, pad_value=0),
-            "t5_weights": stack_with_padding(tw, pad_value=1.0),
-        }
-
-        return z
-
-    def anima_preprocess(self, cross_attn: torch.Tensor, t5xxl_ids: torch.Tensor, t5xxl_weights: torch.Tensor) -> torch.Tensor:
+        qwen_cond = stack_with_padding(zs)
+        t5_ids = stack_with_padding(ti, pad_value=0)
+        t5_weights = stack_with_padding(tw, pad_value=1.0)
+        
         device = memory_management.text_encoder_device()
-
-        cross_attn = cross_attn.unsqueeze(0).to(device=device)
-        t5xxl_ids = t5xxl_ids.unsqueeze(0).to(device=device)
-
-        cross_attn = self.text_encoder.preprocess_text_embeds(cross_attn, t5xxl_ids)
-        if t5xxl_weights is not None:
-            cross_attn *= t5xxl_weights.unsqueeze(0).unsqueeze(-1).to(cross_attn)
+        cross_attn = self.text_encoder.preprocess_text_embeds(
+            qwen_cond.to(device=device), 
+            t5_ids.to(device=device)
+        )
+        if t5_weights is not None:
+            cross_attn *= t5_weights.unsqueeze(-1).to(cross_attn)
 
         if cross_attn.shape[1] < 512:
             cross_attn = torch.nn.functional.pad(cross_attn, (0, 0, 0, 512 - cross_attn.shape[1]))
 
-        return cross_attn.squeeze(0)
+        return cross_attn.to(torch.float32)
 
     def process_embeds(self, batch_tokens):
         device = memory_management.text_encoder_device()

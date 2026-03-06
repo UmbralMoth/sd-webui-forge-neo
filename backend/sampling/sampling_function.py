@@ -138,7 +138,7 @@ def compute_cond_mark(cond_or_uncond, sigmas):
 
     cond_mark = []
     for cx in cond_or_uncond:
-        cond_mark += [cx] * cond_or_uncond_size
+        cond_mark += [1 if cx > 0 else 0] * cond_or_uncond_size
 
     cond_mark = torch.Tensor(cond_mark).to(sigmas)
     return cond_mark
@@ -223,8 +223,8 @@ def calc_cond_uncond_batch(model, cond, uncond, x_in, timestep, model_options):
                 logger.warning('You can add "--reserve-vram 2" to keep a larger headroom')
                 logger.warning('You can also (not recommended) add "--disable-gpu-warning" to remove this warning')
 
-        for i in range(1, len(to_batch_temp) + 1):
-            batch_amount = to_batch_temp[: len(to_batch_temp) // i]
+        for max_batch_size in range(len(to_batch_temp), 0, -1):
+            batch_amount = to_batch_temp[:max_batch_size]
             input_shape = [len(batch_amount) * first_shape[0]] + list(first_shape)[1:]
             if model.memory_required(input_shape) < free_memory:
                 to_batch = batch_amount
@@ -317,9 +317,9 @@ def calc_cond_uncond_batch(model, cond, uncond, x_in, timestep, model_options):
 
 
 def sampling_function_inner(model, x, timestep, uncond, cond, cond_scale, model_options={}, seed=None, return_full=False):
-    edit_strength = sum((item["strength"] if "strength" in item else 1) for item in cond)
+    edit_strength = max((item["strength"] if "strength" in item else 1) for item in cond)
 
-    if math.isclose(cond_scale, 1.0) and model_options.get("disable_cfg1_optimization", False) == False:
+    if math.isclose(cond_scale, 1.0) and model_options.get("disable_cfg1_optimization", False) == False and "cond_empty" not in model_options:
         uncond_ = None
     else:
         uncond_ = uncond
@@ -332,14 +332,44 @@ def sampling_function_inner(model, x, timestep, uncond, cond, cond_scale, model_
     empty_pred = calc_res[2] if len(calc_res) == 3 else None
 
     if "sampler_cfg_function" in model_options:
-        args = {"cond": x - cond_pred, "uncond": x - uncond_pred, "cond_scale": cond_scale, "timestep": timestep, "input": x, "sigma": timestep, "cond_denoised": cond_pred, "uncond_denoised": uncond_pred, "model": model, "model_options": model_options}
+        # TraSCE + CFG++ / custom samplers: substitute empty_pred as the uncond baseline
+        # so the sampler's internal direction is: Empty + CFG*(Pos - Neg) rather than Neg + CFG*(Pos - Neg).
+        # empty_denoised is also exposed so custom samplers can use it explicitly.
+        _uncond_for_cfg = empty_pred if empty_pred is not None else uncond_pred
+        args = {"cond": x - cond_pred, "uncond": x - _uncond_for_cfg, "cond_scale": cond_scale, "timestep": timestep, "input": x, "sigma": timestep, "cond_denoised": cond_pred, "uncond_denoised": _uncond_for_cfg, "empty_denoised": empty_pred, "model": model, "model_options": model_options}
         cfg_result = x - model_options["sampler_cfg_function"](args)
     elif empty_pred is not None:
-        if not math.isclose(edit_strength, 1.0):
-            cfg_result = empty_pred + (cond_pred - uncond_pred) * cond_scale * edit_strength
-        else:
-            cfg_result = empty_pred + (cond_pred - uncond_pred) * cond_scale
+        # TraSCE: Direction = Empty + CFG*(Positive - Perp Negative)
+        # Perpendicular Negative logic (Refined with Magnitude Preservation)
+        # 1. Center vectors around Empty to avoid the magnitude of `x` dominating the projection
+        pos_dir = cond_pred - empty_pred
+        neg_dir = uncond_pred - empty_pred
+        
+        # 2. Calculate original magnitude of Negative for preservation
+        # neg_orig_norm = torch.linalg.vector_norm(neg_dir, ord=2, dim=(1, 2, 3), keepdim=True)
+        
+        # 3. Project neg_dir onto pos_dir
+        dot_np = torch.sum(neg_dir * pos_dir, dim=(1, 2, 3), keepdim=True)
+        dot_pp = torch.sum(pos_dir * pos_dir, dim=(1, 2, 3), keepdim=True)
+        
+        # MATH FIX: Only strip positive overlap
+        dot_np_clamped = torch.clamp(dot_np, min=0.0)
+        proj_neg_on_pos = (dot_np_clamped / torch.clamp(dot_pp, min=1e-6)) * pos_dir
+        
+        # 4. Strip overlap with Positive to keep only what's unique to Negative
+        neg_dir_perp = neg_dir - proj_neg_on_pos
+        
+        # 5. Magnitude Preservation: Rescale perp vector to original negative strength
+        # This ensures that stripping shared concepts doesn't weaken the negative prompt's impact.
+        # neg_perp_norm = torch.linalg.vector_norm(neg_dir_perp, ord=2, dim=(1, 2, 3), keepdim=True)
+        # neg_dir_perp = neg_dir_perp * (neg_orig_norm / torch.clamp(neg_perp_norm, min=1e-6))
+        
+        # 6. Substitute our Negative with Perp Negative
+        uncond_perp = empty_pred + neg_dir_perp
+        
+        cfg_result = empty_pred + (cond_pred - uncond_perp) * cond_scale * edit_strength
     elif not math.isclose(edit_strength, 1.0):
+        # Legacy: Direction = Negative + CFG*(Positive - Negative)
         cfg_result = uncond_pred + (cond_pred - uncond_pred) * cond_scale * edit_strength
     else:
         cfg_result = uncond_pred + (cond_pred - uncond_pred) * cond_scale
@@ -365,6 +395,12 @@ def sampling_function(self, denoiser_params, cond_scale, cond_composition, extra
     cond = compile_weighted_conditions(denoiser_params.text_cond, cond_composition)
     model_options = utils.join_dicts(unet_patcher.model_options, extra_model_options)
     seed = self.p.seeds[0]
+
+    # TraSCE: compile the per-step reconstructed empty conditioning tensor
+    # into the model_conds dict format that calc_cond_uncond_batch expects.
+    if "cond_empty" in model_options:
+        model_options = model_options.copy()
+        model_options["cond_empty"] = compile_conditions(model_options["cond_empty"])
 
     if extra_concat_condition is not None:
         image_cond_in = extra_concat_condition

@@ -579,21 +579,13 @@ class MiniTrainDIT(nn.Module):
         )
         return x_B_C_Tt_Hp_Wp
 
-    def forward(self, x: torch.Tensor, timesteps: torch.Tensor, context: torch.Tensor, text_ids: Optional[torch.Tensor] = None, text_weights: Optional[torch.Tensor] = None, fps: Optional[torch.Tensor] = None, padding_mask: Optional[torch.Tensor] = None, **kwargs):
+    def forward(self, x: torch.Tensor, timesteps: torch.Tensor, context: torch.Tensor, fps: Optional[torch.Tensor] = None, padding_mask: Optional[torch.Tensor] = None, **kwargs):
         orig_shape = list(x.shape)
         x = pad_to_patch_size(x, (self.patch_temporal, self.patch_spatial, self.patch_spatial))
         x_B_C_T_H_W = x
         timesteps_B_T = timesteps
         
-        if hasattr(self, "preprocess_text_embeds"):
-            import inspect
-            params = inspect.signature(self.preprocess_text_embeds).parameters
-            if "text_weights" in params:
-                crossattn_emb = self.preprocess_text_embeds(context, text_ids, text_weights=text_weights)
-            else:
-                crossattn_emb = self.preprocess_text_embeds(context, text_ids)
-        else:
-            crossattn_emb = context
+        crossattn_emb = context
 
         x_B_T_H_W_D, rope_emb_L_1_1_D, extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D = self.prepare_embedded_sequence(
             x_B_C_T_H_W,
@@ -803,13 +795,4 @@ class LLMAdapter(nn.Module):
 
 
 class Anima(MiniTrainDIT):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.llm_adapter = LLMAdapter()
-
-    def preprocess_text_embeds(self, text_embeds, text_ids, text_weights=None):
-        if text_ids is not None:
-            device = self.llm_adapter.embed.weight.device
-            return self.llm_adapter(text_embeds.to(device), text_ids.to(device), target_weights=text_weights)
-        else:
-            return text_embeds
+    pass

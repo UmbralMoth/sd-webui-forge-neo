@@ -170,6 +170,7 @@ class StableDiffusionProcessing:
 
     cached_uc = [None, None, None]
     cached_c = [None, None, None]
+    cached_empty_c = [None, None]
 
     comments: dict = None
     sampler: sd_samplers_common.Sampler | None = field(default=None, init=False)
@@ -214,8 +215,10 @@ class StableDiffusionProcessing:
     def clear_prompt_cache(self):
         self.cached_c = [None, None, None]
         self.cached_uc = [None, None, None]
+        self.cached_empty_c = [None, None]
         StableDiffusionProcessing.cached_c = [None, None, None]
         StableDiffusionProcessing.cached_uc = [None, None, None]
+        StableDiffusionProcessing.cached_empty_c = [None, None]
 
     def __post_init__(self):
         assert self.sampler_index is None
@@ -241,6 +244,7 @@ class StableDiffusionProcessing:
 
         self.cached_uc = StableDiffusionProcessing.cached_uc
         self.cached_c = StableDiffusionProcessing.cached_c
+        self.cached_empty_c = StableDiffusionProcessing.cached_empty_c
 
         self.extra_result_images = []
         self.latents_after_sampling = []
@@ -492,11 +496,12 @@ class StableDiffusionProcessing:
         else:
             self.uc = self.get_conds_with_caching(prompt_parser.get_learned_conditioning, negative_prompts, total_steps, [self.cached_uc], self.extra_network_data)
 
+            # TraSCE: encode empty conditioning once. Used as the CFG base instead of negative,
+            # giving Direction = Empty + CFG*(Positive - Negative) rather than the approximate
+            # Negative + CFG*(Positive - Negative) formula common UIs use.
             if self.override_settings.get('use_legacy_cfg', getattr(shared.opts, 'use_legacy_cfg', False)):
                 self.empty_c = None
             else:
-                if not hasattr(self, 'cached_empty_c'):
-                    self.cached_empty_c = [None, None]
                 empty_prompts = prompt_parser.SdConditioning([""] * len(self.prompts), width=self.width, height=self.height, is_negative_prompt=True, distilled_cfg_scale=self.distilled_cfg_scale)
                 self.empty_c = self.get_conds_with_caching(prompt_parser.get_learned_conditioning, empty_prompts, total_steps, [self.cached_empty_c], self.extra_network_data)
 
@@ -1232,6 +1237,7 @@ class StableDiffusionProcessingTxt2Img(StableDiffusionProcessing):
 
     cached_hr_uc = [None, None, None]
     cached_hr_c = [None, None, None]
+    cached_hr_empty_c = [None, None]
 
     hr_checkpoint_info: dict = field(default=None, init=False)
     hr_upscale_to_x: int = field(default=0, init=False)
@@ -1242,6 +1248,7 @@ class StableDiffusionProcessingTxt2Img(StableDiffusionProcessing):
     latent_scale_mode: dict = field(default=None, init=False)
     hr_c: tuple | None = field(default=None, init=False)
     hr_uc: tuple | None = field(default=None, init=False)
+    hr_empty_c: tuple | None = field(default=None, init=False)
     all_hr_prompts: list = field(default=None, init=False)
     all_hr_negative_prompts: list = field(default=None, init=False)
     hr_prompts: list = field(default=None, init=False)
@@ -1259,6 +1266,7 @@ class StableDiffusionProcessingTxt2Img(StableDiffusionProcessing):
 
         self.cached_hr_uc = StableDiffusionProcessingTxt2Img.cached_hr_uc
         self.cached_hr_c = StableDiffusionProcessingTxt2Img.cached_hr_c
+        self.cached_hr_empty_c = StableDiffusionProcessingTxt2Img.cached_hr_empty_c
 
     def calculate_target_resolution(self):
         if opts.use_old_hires_fix_width_height and self.applied_old_hires_behavior_to != (self.width, self.height):
@@ -1576,9 +1584,11 @@ class StableDiffusionProcessingTxt2Img(StableDiffusionProcessing):
         super().close()
         self.hr_c = None
         self.hr_uc = None
+        self.hr_empty_c = None
         if not opts.persistent_cond_cache:
             StableDiffusionProcessingTxt2Img.cached_hr_uc = [None, None]
             StableDiffusionProcessingTxt2Img.cached_hr_c = [None, None]
+            StableDiffusionProcessingTxt2Img.cached_hr_empty_c = [None, None]
 
     def setup_prompts(self):
         super().setup_prompts()
@@ -1618,9 +1628,16 @@ class StableDiffusionProcessingTxt2Img(StableDiffusionProcessing):
 
         if self.hr_cfg == 1:
             self.hr_uc = None
+            self.hr_empty_c = None
             logger.info("Negative Prompts are Ignored when CFG = 1.0")
         else:
             self.hr_uc = self.get_conds_with_caching(prompt_parser.get_learned_conditioning, hr_negative_prompts, self.firstpass_steps, [self.cached_hr_uc, self.cached_uc], self.hr_extra_network_data, total_steps)
+
+            if not self.override_settings.get('use_legacy_cfg', getattr(shared.opts, 'use_legacy_cfg', False)):
+                hr_empty_prompts = prompt_parser.SdConditioning([""] * len(self.hr_prompts), width=self.hr_upscale_to_x, height=self.hr_upscale_to_y, is_negative_prompt=True, distilled_cfg_scale=self.hr_distilled_cfg)
+                self.hr_empty_c = self.get_conds_with_caching(prompt_parser.get_learned_conditioning, hr_empty_prompts, self.firstpass_steps, [self.cached_hr_empty_c, self.cached_empty_c], self.hr_extra_network_data, total_steps)
+            else:
+                self.hr_empty_c = None
 
         self.hr_c = self.get_conds_with_caching(prompt_parser.get_multicond_learned_conditioning, hr_prompts, self.firstpass_steps, [self.cached_hr_c, self.cached_c], self.hr_extra_network_data, total_steps)
 
@@ -1629,6 +1646,8 @@ class StableDiffusionProcessingTxt2Img(StableDiffusionProcessing):
             # if we are in hr pass right now, the call is being made from the refiner, and we don't need to setup firstpass cons or switch model
             self.hr_c = None
             self.calculate_hr_conds()
+            # swap empty_c to the HR version so update_inner_model picks it up correctly
+            self.empty_c = getattr(self, 'hr_empty_c', self.empty_c)
             return
 
         super().setup_conds()
@@ -1743,12 +1762,37 @@ class StableDiffusionProcessingImg2Img(StableDiffusionProcessing):
                 mask = image_mask.convert("L")
                 crop_region = masking.get_crop_region_v2(mask, self.inpaint_full_res_padding)
                 if crop_region:
+                    # Auto-Calculate Resolution overriding
+                    if getattr(self, "inpaint_full_res", 0) == 2:
+                        x1, y1, x2, y2 = crop_region
+                        crop_width = x2 - x1
+                        crop_height = y2 - y1
+                        crop_ar = crop_width / max(crop_height, 1)
+                        
+                        # Standard SDXL 1MP Resolution Buckets
+                        sdxl_res = [(1024, 1024), (1152, 896), (896, 1152), (1216, 832), (832, 1216), 
+                                    (1344, 768), (768, 1344), (1536, 640), (640, 1536)]
+                        
+                        best_res = (1024, 1024)
+                        best_diff = float("inf")
+                        for rw, rh in sdxl_res:
+                            res_ar = rw / rh
+                            diff = abs(crop_ar - res_ar)
+                            if diff < best_diff:
+                                best_diff = diff
+                                best_res = (rw, rh)
+                                
+                        self.width, self.height = best_res
+
                     crop_region = masking.expand_crop_region(crop_region, self.width, self.height, mask.width, mask.height)
                     x1, y1, x2, y2 = crop_region
                     mask = mask.crop(crop_region)
                     image_mask = images.resize_image(2, mask, self.width, self.height)
                     self.paste_to = (x1, y1, x2 - x1, y2 - y1)
-                    self.extra_generation_params["Inpaint area"] = "Only masked"
+                    if getattr(self, "inpaint_full_res", 0) == 2:
+                        self.extra_generation_params["Inpaint area"] = f"Only masked (Auto: {self.width}x{self.height})"
+                    else:
+                        self.extra_generation_params["Inpaint area"] = "Only masked"
                     self.extra_generation_params["Masked area padding"] = self.inpaint_full_res_padding
                 else:
                     crop_region = None

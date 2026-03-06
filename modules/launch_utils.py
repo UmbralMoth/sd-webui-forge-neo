@@ -56,6 +56,19 @@ def git_tag():
     return forge_version.version
 
 
+def commit_hash():
+    try:
+        result = subprocess.run(
+            [git, "-C", script_path, "rev-parse", "HEAD"],
+            capture_output=True, text=True, shell=False
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except Exception:
+        pass
+    return "<unknown>"
+
+
 def run(command, desc=None, errdesc=None, custom_env=None, live: bool = default_command_live) -> str:
     if desc is not None:
         print(desc)
