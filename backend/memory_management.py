@@ -500,7 +500,8 @@ class LoadedModel:
                 if freed >= memory_to_free:
                     return False
         self.model.detach(unpatch_weights)
-        self.model_finalizer.detach()
+        if self.model_finalizer is not None:
+            self.model_finalizer.detach()
         self.model_finalizer = None
         self.real_model = None
         return True
@@ -516,7 +517,7 @@ class LoadedModel:
             self._patcher_finalizer.detach()
 
     def is_dead(self):
-        return self.real_model() is not None and self.model is None
+        return self.real_model is not None and self.real_model() is not None and self.model is None
 
 
 def use_more_memory(extra_memory, loaded_models, device):
@@ -651,11 +652,15 @@ def load_models_gpu(models: list["ModelPatcher"], memory_required: float = 0, fo
         for i in range(len(current_loaded_models)):
             if loaded_model.model.is_clone(current_loaded_models[i].model):
                 if current_loaded_models[i] not in models_to_load:
-                    to_unload = [i] + to_unload
+                    if loaded_model.model.clone_has_same_weights(current_loaded_models[i].model):
+                        models_to_load.append(current_loaded_models[i])
+                    else:
+                        to_unload = [i] + to_unload
         for i in to_unload:
             model_to_unload = current_loaded_models.pop(i)
             model_to_unload.model.detach(unpatch_all=False)
-            model_to_unload.model_finalizer.detach()
+            if model_to_unload.model_finalizer is not None:
+                model_to_unload.model_finalizer.detach()
 
     total_memory_required = {}
     for loaded_model in models_to_load:

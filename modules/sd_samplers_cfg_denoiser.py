@@ -155,17 +155,36 @@ class CFGDenoiser(torch.nn.Module):
             cond_scale = 1.0
             self.p.extra_generation_params["Skip Early CFG"] = opts.skip_early_cond
         elif opts.zero_cfg_init:
-            warmup_threshold = 0.35
-            progress = self.step / max(self.total_steps * warmup_threshold, 1e-5)
-            if progress < 1.0:
+            hold_steps = int(getattr(opts, "zero_cfg_hold_steps", 1))
+            warmup_end = float(getattr(opts, "zero_cfg_warmup_end", 0.35))
+            ramp_start = hold_steps
+            ramp_end = 1 if warmup_end == 0 else max(int(self.total_steps * warmup_end), ramp_start + 1)
+            if self.step < ramp_start:
+                # Hold phase: strictly CFG 1.0
+                cond_scale = 1.0
+                self.p.extra_generation_params["Dynamic Zero-CFG"] = True
+            elif self.step < ramp_end:
+                # Ramp phase: linear interpolation from 1.0 to target
                 target_cfg = cond_scale
-                cond_scale = 1.0 + (target_cfg - 1.0) * progress
+                ramp_progress = (self.step - ramp_start) / max(ramp_end - ramp_start, 1)
+                cond_scale = 1.0 + (target_cfg - 1.0) * ramp_progress
                 self.p.extra_generation_params["Dynamic Zero-CFG"] = True
         elif (self.step % 2 or opts.s_min_uncond_all) and (0 < sigma[0] < s_min_uncond):
             cond_scale = 1.0
             self.p.extra_generation_params["NGMS"] = s_min_uncond
             if opts.s_min_uncond_all:
                 self.p.extra_generation_params["NGMS all steps"] = opts.s_min_uncond_all
+
+        # CFG Anneal: independent of Zero-CFG Init, runs as a post-process on cond_scale
+        if getattr(opts, "cfg_anneal", False):
+            anneal_start = float(getattr(opts, "cfg_anneal_start", 0.65))
+            anneal_floor = float(getattr(opts, "cfg_anneal_floor", 2.0))
+            anneal_start_step = int(self.total_steps * anneal_start)
+            if self.step >= anneal_start_step:
+                anneal_progress = (self.step - anneal_start_step) / max(self.total_steps - anneal_start_step - 1, 1)
+                peak_cfg = cond_scale
+                cond_scale = max(peak_cfg - (peak_cfg - anneal_floor) * anneal_progress, anneal_floor)
+                self.p.extra_generation_params["CFG Anneal"] = True
 
         extra_model_options = kwargs.get("model_options", {})
         # TraSCE: reconstruct empty_c for the current step (handles prompt-edit schedules)

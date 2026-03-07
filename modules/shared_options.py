@@ -300,9 +300,14 @@ options_templates.update(
             "cross_attention_optimization": OptionInfo("Automatic", "Cross Attention Optimization", gr.Dropdown, {"choices": ("Automatic",), "interactive": False}),
             "persistent_cond_cache": OptionInfo(True, "Persistent Cond Cache").info("do not re-encode prompts if only the Seed changes ; <b>Note:</b> may cause certain Infotext to be missing"),
             "skip_early_cond": OptionInfo(0.0, "Ignore Negative Prompt during Early Steps", gr.Slider, {"minimum": 0.0, "maximum": 1.0, "step": 0.05}, infotext="Skip Early CFG").info("in percentage of total steps; 0 = disable; higher = faster"),
-            "zero_cfg_init": OptionInfo(False, "Enable Dynamic Zero-CFG Init").info("Warm up CFG from 1.0 to Target CFG over the first 35% of the generation to improve initial layout without velocity discontinuities."),
             "s_min_uncond": OptionInfo(0.0, "Skip Negative Prompt during Later Steps", gr.Slider, {"minimum": 0.0, "maximum": 8.0, "step": 0.05}).info('in "sigma"; 0 = disable; higher = faster'),
             "s_min_uncond_all": OptionInfo(False, "For the above option, skip every step", infotext="NGMS all steps").info("otherwise, only skip every other step"),
+            "zero_cfg_init": OptionInfo(False, "Enable Dynamic Zero-CFG Init").info("Starts at CFG 1.0, holds for N steps, then ramps to target CFG."),
+            "zero_cfg_hold_steps": OptionInfo(1, "Zero-CFG Hold Steps", gr.Slider, {"minimum": 0, "maximum": 10, "step": 1}).info("Number of steps to hold CFG strictly at 1.0 before beginning the ramp-up."),
+            "zero_cfg_warmup_end": OptionInfo(0.35, "Zero-CFG Warmup End", gr.Slider, {"minimum": 0.0, "maximum": 0.9, "step": 0.01}).info("Percentage of total steps at which CFG must reach its target value (e.g. 0.35 = 35%)."),
+            "cfg_anneal": OptionInfo(False, "Enable CFG Anneal").info("Gradually reduce CFG in the final steps to soften micro-details. Composes with Dynamic Zero-CFG Init to form a CFG bell curve."),
+            "cfg_anneal_start": OptionInfo(0.65, "CFG Anneal Start", gr.Slider, {"minimum": 0.1, "maximum": 0.95, "step": 0.01}).info("Percentage of total steps at which CFG begins decaying downward."),
+            "cfg_anneal_floor": OptionInfo(2.0, "CFG Anneal Floor", gr.Slider, {"minimum": 1.0, "maximum": 24.0, "step": 0.5}).info("The minimum CFG scale to reach by the final step."),
             "div_tome": OptionDiv(),
             "token_merging_explanation": OptionHTML(
                 """

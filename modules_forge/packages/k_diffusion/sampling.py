@@ -669,6 +669,150 @@ def sample_dpmpp_3m_sde(model, x, sigmas, extra_args=None, callback=None, disabl
         h_1, h_2 = h, h_1
     return x
 
+def _dpm_solver_step_standard(x, t, s, denoised, denoised_1, denoised_2, h_1, h_2, eta, noise_sampler, s_noise, 
+                              sigma_t, sigma_s, lambda_fn):
+    h = s - t
+    h_eta = h * (eta + 1)
+    
+    alpha_t = sigma_s * lambda_fn(sigma_s).exp()
+
+    # Core DPM++ Update
+    x = sigma_s / sigma_t * (-h * eta).exp() * x + alpha_t * (-h_eta).expm1().neg() * denoised
+
+    # High-Order Corrections (DPM++ 2M / 3M)
+    if h_2 is not None:
+        # 3M
+        r0 = h_1 / h
+        r1 = h_2 / h
+        d1_0 = (denoised - denoised_1) / r0
+        d1_1 = (denoised_1 - denoised_2) / r1
+        d1 = d1_0 + (d1_0 - d1_1) * r0 / (r0 + r1)
+        d2 = (d1_0 - d1_1) / (r0 + r1)
+        phi_2 = h_eta.neg().expm1() / h_eta + 1
+        phi_3 = phi_2 / h_eta - 0.5
+        x = x + (alpha_t * phi_2) * d1 - (alpha_t * phi_3) * d2
+    elif h_1 is not None:
+        # 2M
+        r = h_1 / h
+        d = (denoised - denoised_1) / r
+        phi_2 = h_eta.neg().expm1() / h_eta + 1
+        x = x + (alpha_t * phi_2) * d
+
+    # SDE Noise Injection
+    if eta > 0 and s_noise > 0:
+        x = x + noise_sampler(sigma_t, sigma_s) * sigma_s * (-2 * h * eta).expm1().neg().sqrt() * s_noise
+
+    return x
+
+def _zigzag_handler_standard(model, x, sigma_t, sigma_s, t, s, extra_args, 
+                             denoised_1, denoised_2, h_1, h_2, 
+                             eta, noise_sampler, s_noise, gamma_scale, 
+                             current_denoised_probe, lambda_fn):
+    s_in = x.new_ones([x.shape[0]])
+    local_extra_args = extra_args.copy() if extra_args is not None else {}
+    local_extra_args["__zigzag_internal"] = True
+
+    # 1. PROBE (Zig)
+    intermediate_x = _dpm_solver_step_standard(
+        x, t, s, 
+        current_denoised_probe, denoised_1, denoised_2, h_1, h_2, 
+        0, noise_sampler, s_noise, 
+        sigma_t=sigma_t, sigma_s=sigma_s, lambda_fn=lambda_fn
+    )
+
+    # 2. REFLECTION (Zag) - Backward (s -> t)
+    extra_args_low = local_extra_args.copy()
+    if 'cond_scale' in extra_args_low and gamma_scale > 0:
+        extra_args_low['cond_scale'] *= gamma_scale
+
+    denoised_invert = model(intermediate_x, sigma_s * s_in, **extra_args_low)
+
+    refined_x = _dpm_solver_step_standard(
+        intermediate_x, s, t, 
+        denoised_invert, None, None, None, None, 
+        0, noise_sampler, s_noise, 
+        sigma_t=sigma_s, sigma_s=sigma_t, lambda_fn=lambda_fn
+    )
+
+    # 3. COMMIT (Zig) - Forward
+    x_for_commit = refined_x 
+    denoised_final = model(x_for_commit, sigma_t * s_in, **local_extra_args)
+    
+    x_next = _dpm_solver_step_standard(
+        x_for_commit, t, s, 
+        denoised_final, None, None, None, None, 
+        eta, noise_sampler, s_noise, 
+        sigma_t=sigma_t, sigma_s=sigma_s, lambda_fn=lambda_fn
+    )
+
+    return x_next, denoised_final
+
+@torch.no_grad()
+def sample_dpmpp_3m_sde_ctrlz(model, x, sigmas, extra_args=None, callback=None, disable=None, eta=1., s_noise=1., noise_sampler=None, gamma_scale=0.5):
+    """
+    Robust Hybrid DPM-Solver++(3M) SDE with ZigZag Sampling.
+    """
+    if len(sigmas) <= 1:
+        return x
+
+    sigma_min, sigma_max = sigmas[sigmas > 0].min(), sigmas.max()
+    seed = (extra_args or {}).get("seed", None)
+    noise_sampler = BrownianTreeNoiseSampler(x, sigma_min, sigma_max, seed=seed, cpu=True) if noise_sampler is None else noise_sampler
+    extra_args = {} if extra_args is None else extra_args
+    s_in = x.new_ones([x.shape[0]])
+
+    model_sampling = model.inner_model.predictor
+    lambda_fn = partial(sigma_to_half_log_snr, model_sampling=model_sampling)
+    sigmas = offset_first_sigma_for_snr(sigmas, model_sampling)
+
+    controller = ZigZagController(start_sigma=sigmas.max().item())
+    denoised_1, denoised_2 = None, None
+    h_1, h_2 = None, None
+
+    for i in trange(len(sigmas) - 1, disable=disable):
+        sigma_t, sigma_s = sigmas[i], sigmas[i + 1]
+        
+        denoised = model(x, sigma_t * s_in, **extra_args)
+
+        if callback is not None:
+            callback({'x': x, 'i': i, 'sigma': sigma_t, 'sigma_hat': sigma_t, 'denoised': denoised})
+
+        if sigma_s == 0:
+            d = to_d(x, sigma_t, denoised)
+            dt = 0 - sigma_t
+            x = x + d * dt
+            break 
+
+        lambda_s, lambda_t = lambda_fn(sigma_t), lambda_fn(sigma_s)
+        t, s = lambda_s, lambda_t
+
+        is_zag, severity = controller.should_trigger(sigma_t.item(), sigma_s.item(), denoised)
+        dynamic_gamma = gamma_scale * (1.0 - (0.5 * severity))
+        
+        if is_zag:
+            x, denoised_final = _zigzag_handler_standard(
+                model, x, sigma_t, sigma_s, t, s, extra_args,
+                denoised_1, denoised_2, h_1, h_2,
+                eta, noise_sampler, s_noise, dynamic_gamma,
+                denoised,
+                lambda_fn
+            )
+            h_1 = s - t
+            h_2 = None
+            denoised_1 = denoised_final
+            denoised_2 = None  
+            controller.update_history(denoised_final)
+        else:
+            x = _dpm_solver_step_standard(
+                x, t, s, 
+                denoised, denoised_1, denoised_2, h_1, h_2, 
+                eta, noise_sampler, s_noise, 
+                sigma_t=sigma_t, sigma_s=sigma_s, lambda_fn=lambda_fn
+            )
+            h_2, h_1 = h_1, s - t
+            denoised_2, denoised_1 = denoised_1, denoised
+    return x
+
 @torch.no_grad()
 def sample_dpmpp_3m_sde_flow(model, x, sigmas, extra_args=None, callback=None, disable=None, eta=1.0, s_noise=1.0, noise_sampler=None):
     """DPM-Solver++(3M) SDE adapted for Flow Matching"""
