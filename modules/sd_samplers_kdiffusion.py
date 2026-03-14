@@ -202,8 +202,7 @@ class KDiffusionSampler(sd_samplers_common.Sampler):
             "s_min_uncond": self.s_min_uncond,
         }
         if getattr(p, 'empty_c', None) is not None:
-            # TraSCE: pass empty conditioning into extra_args so CFGDenoiser can apply
-            # Direction = Empty + CFG*(Pos - Neg) instead of the legacy Neg + CFG*(Pos - Neg).
+            # TraSCE: pass empty conditioning for the Direction = Empty + CFG*(Pos - Neg) formula.
             self.sampler_extra_args["cond_empty"] = p.empty_c
 
         p.sd_model.forge_objects.unet.model_options["transformer_options"]["sampling_sigmas"] = sigmas

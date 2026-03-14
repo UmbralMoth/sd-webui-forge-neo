@@ -257,14 +257,14 @@ class ModelPatcher:
         if not self.is_clone(clone):
             return False
 
-        if len(self.patches) == 0 and len(clone.patches) == 0:
-            return True
-
         if self.patches_uuid == clone.patches_uuid:
             if len(self.patches) != len(clone.patches):
                 logger.warning("something went wrong, same patch uuid but different length of patches...")
             else:
-                return True
+                if self.lora_patches.keys() == clone.lora_patches.keys():
+                    return True
+        
+        return False
 
     def memory_required(self, input_shape):
         return self.model.memory_required(input_shape=input_shape)
@@ -443,6 +443,8 @@ class ModelPatcher:
 
         if lora:
             self.lora_patches[lora_identifier] = lora_patches
+            if not online_mode:
+                self.patches_uuid = uuid.uuid4()
         else:
             self.patches_uuid = uuid.uuid4()
 
@@ -703,6 +705,9 @@ class ModelPatcher:
 
             self.model.current_weight_patches_uuid = None
             self.backup.clear()
+            
+            if hasattr(self.model, "lora_loader"):
+                self.model.lora_loader.loaded_hash = str([])
 
             if device_to is not None:
                 self.model.to(device_to)

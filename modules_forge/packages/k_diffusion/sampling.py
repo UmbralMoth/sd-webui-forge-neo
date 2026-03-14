@@ -710,7 +710,7 @@ def _zigzag_handler_standard(model, x, sigma_t, sigma_s, t, s, extra_args,
                              current_denoised_probe, lambda_fn):
     s_in = x.new_ones([x.shape[0]])
     local_extra_args = extra_args.copy() if extra_args is not None else {}
-    local_extra_args["__zigzag_internal"] = True
+    local_extra_args["__internal_step"] = True
 
     # 1. PROBE (Zig)
     intermediate_x = _dpm_solver_step_standard(
@@ -1341,7 +1341,7 @@ def _zigzag_handler(model, x, sigma_t, sigma_s, t, s, extra_args,
     local_extra_args["model_options"] = model_options
 
     # Flag for internal use (optional, depending on model wrapper)
-    local_extra_args["__zigzag_internal"] = True
+    local_extra_args["__internal_step"] = True
 
     # --- 1. PROBE (Zig) - Forward ---
     # We use the probe values already calculated in the main loop
@@ -1560,7 +1560,7 @@ def _zigzag_handler_flow(model, x, sigma_t, sigma_s, t, s, extra_args,
     model_options = local_extra_args.get("model_options", {}).copy()
     model_options["sampler_post_cfg_function"] = [_local_post_cfg]
     local_extra_args["model_options"] = model_options
-    local_extra_args["__zigzag_internal"] = True
+    local_extra_args["__internal_step"] = True
 
     # Pre-calc alphas
     alpha_t = sigma_t * lambda_fn(sigma_t).exp()
@@ -2098,7 +2098,7 @@ def _zigzag_handler(model, x, sigma_t, sigma_s, t, s, extra_args,
     local_extra_args["model_options"] = model_options
 
     # Flag for internal use (optional, depending on model wrapper)
-    local_extra_args["__zigzag_internal"] = True
+    local_extra_args["__internal_step"] = True
 
     # --- 1. PROBE (Zig) - Forward ---
     # We use the probe values already calculated in the main loop
@@ -2289,7 +2289,7 @@ def _zigzag_handler_flow(model, x, sigma_t, sigma_s, t, s, extra_args,
     local_extra_args = extra_args.copy() if extra_args is not None else {}
 
     # Flag for internal use (optional, depending on model wrapper)
-    local_extra_args["__zigzag_internal"] = True
+    local_extra_args["__internal_step"] = True
 
     # Pre-calc alphas
     alpha_t = sigma_t * lambda_fn(sigma_t).exp()

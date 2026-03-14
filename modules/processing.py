@@ -345,8 +345,13 @@ class StableDiffusionProcessing:
         conditioning_image = self.sd_model.get_first_stage_encoding(self.sd_model.encode_first_stage(conditioning_image))
 
         # Create the concatenated conditioning tensor to be fed to `c_concat`
-        conditioning_mask = torch.nn.functional.interpolate(conditioning_mask, size=latent_image.shape[-2:])
-        conditioning_mask = conditioning_mask.expand(conditioning_image.shape[0], -1, -1, -1)
+        if len(latent_image.shape) == 5:
+            conditioning_mask = torch.nn.functional.interpolate(conditioning_mask, size=latent_image.shape[3:])
+            conditioning_mask = conditioning_mask.expand(conditioning_image.shape[0], -1, latent_image.shape[2], -1, -1)
+        else:
+            conditioning_mask = torch.nn.functional.interpolate(conditioning_mask, size=latent_image.shape[-2:])
+            conditioning_mask = conditioning_mask.expand(conditioning_image.shape[0], -1, -1, -1)
+
         image_conditioning = torch.cat([conditioning_mask, conditioning_image], dim=1)
         # image_conditioning = image_conditioning.to(shared.device).type(self.sd_model.dtype)
 
@@ -1883,7 +1888,13 @@ class StableDiffusionProcessingImg2Img(StableDiffusionProcessing):
         devices.torch_gc()
 
         if self.resize_mode == 3:
+            if _5d := (len(self.init_latent.shape) == 5):
+                self.init_latent = self.init_latent.squeeze(2)
+
             self.init_latent = torch.nn.functional.interpolate(self.init_latent, size=(self.height // opt_f, self.width // opt_f), mode="bilinear")
+
+            if _5d:
+                self.init_latent = self.init_latent.unsqueeze(2)
 
         if image_mask is not None:
             init_mask = latent_mask
@@ -1908,7 +1919,7 @@ class StableDiffusionProcessingImg2Img(StableDiffusionProcessing):
 
             # this needs to be fixed to be done in sample() using actual seeds for batches
             if self.inpainting_fill == 2:
-                _dim = (self.init_latent.shape[1], self.init_latent.shape[-2], self.init_latent.shape[-1])
+                _dim = self.init_latent.shape[1:]
                 self.init_latent = self.init_latent * self.mask + create_random_tensors(_dim, all_seeds[0 : self.init_latent.shape[0]]) * self.nmask
                 self.extra_generation_params["Masked content"] = "latent noise"
 

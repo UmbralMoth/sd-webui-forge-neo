@@ -134,22 +134,19 @@ class CFGDenoiser(torch.nn.Module):
 
         denoiser_params = CFGDenoiserParams(x, image_cond, sigma, state.sampling_step, state.sampling_steps, cond, uncond, self)
 
-        # Internal ZigZag sampling uses several internal model() calls (probe/invert/commit).
-        # Those calls should not count as "real" denoiser steps nor should they trigger
-        # UI-facing callbacks (prompt-edit swaps, preview storage, etc.). The ZigZag
-        # implementation marks internal calls with `__zigzag_internal=True` in
-        # `extra_args` so downstream code can detect and ignore them.
-        zigzag_internal = kwargs.get("__zigzag_internal", False)
-        if not zigzag_internal:
+        # Internal sampling steps (like FlowEdit predictor/corrector) should not count 
+        # as "real" denoiser steps nor should they trigger UI-facing callbacks 
+        # or previews. Mark with `__internal_step=True` to detect them.
+        internal_step = kwargs.get("__internal_step", False)
+        
+        if not internal_step:
             cfg_denoiser_callback(denoiser_params)
 
         # NGMS
         if self.p.is_hr_pass == True:
             # We check if the sampler is using CFG++ or CFG and then adjust accordingly
-            if kwargs.get("cfgpp", False):
-                cond_scale = self.p.hr_cfg / 12.5
-            else:
-                cond_scale = self.p.hr_cfg
+            hr_scale = self.p.hr_cfg / 12.5 if kwargs.get("cfgpp", False) else self.p.hr_cfg
+            cond_scale = hr_scale
 
         if 0 < self.step / self.total_steps <= opts.skip_early_cond:
             cond_scale = 1.0
@@ -210,10 +207,9 @@ class CFGDenoiser(torch.nn.Module):
 
             denoised = blended_latent
 
-        if not zigzag_internal:
-            preview = self.sampler.last_latent = denoised
-            sd_samplers_common.store_latent(preview)
-
+        if not internal_step:
+            self.sampler.last_latent = denoised
+            sd_samplers_common.store_latent(denoised)
 
             after_cfg_callback_params = AfterCFGCallbackParams(denoised, state.sampling_step, state.sampling_steps)
             cfg_after_cfg_callback(after_cfg_callback_params)

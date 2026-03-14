@@ -336,7 +336,7 @@ def sampling_function_inner(model, x, timestep, uncond, cond, cond_scale, model_
         # so the sampler's internal direction is: Empty + CFG*(Pos - Neg) rather than Neg + CFG*(Pos - Neg).
         # empty_denoised is also exposed so custom samplers can use it explicitly.
         _uncond_for_cfg = empty_pred if empty_pred is not None else uncond_pred
-        args = {"cond": x - cond_pred, "uncond": x - _uncond_for_cfg, "cond_scale": cond_scale, "timestep": timestep, "input": x, "sigma": timestep, "cond_denoised": cond_pred, "uncond_denoised": _uncond_for_cfg, "empty_denoised": empty_pred, "model": model, "model_options": model_options}
+        args = {"cond": x - cond_pred, "uncond": x - _uncond_for_cfg, "cond_scale": cond_scale, "timestep": timestep, "input": x, "sigma": timestep, "cond_denoised": cond_pred, "uncond_denoised": _uncond_for_cfg, "empty_denoised": empty_pred, "uncond_raw": uncond_pred, "model": model, "model_options": model_options}
         cfg_result = x - model_options["sampler_cfg_function"](args)
     elif empty_pred is not None:
         # TraSCE: Direction = Empty + CFG*(Positive - Perp Negative)
@@ -352,7 +352,7 @@ def sampling_function_inner(model, x, timestep, uncond, cond, cond_scale, model_
         dot_np = torch.sum(neg_dir * pos_dir, dim=(1, 2, 3), keepdim=True)
         dot_pp = torch.sum(pos_dir * pos_dir, dim=(1, 2, 3), keepdim=True)
         
-        # MATH FIX: Only strip positive overlap
+        # Only strip positive overlap
         dot_np_clamped = torch.clamp(dot_np, min=0.0)
         proj_neg_on_pos = (dot_np_clamped / torch.clamp(dot_pp, min=1e-6)) * pos_dir
         

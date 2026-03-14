@@ -67,7 +67,7 @@ def sgm_uniform(n, sigma_min, sigma_max, inner_model, device):
     sigs += [0.0]
     return torch.FloatTensor(sigs).to(device)
 
-def get_align_your_steps_sigmas(n, sigma_min, sigma_max, device, width=1024, height=1024):
+def get_align_your_steps_sigmas(n, sigma_min, sigma_max, device):
     """
     Align Your Steps scheduler, based on "Align Your Steps: Optimal Noise Schedules for Diffusion Models" [arXiv:2406.16157] (Zhao et al., 2024).
     
@@ -77,8 +77,6 @@ def get_align_your_steps_sigmas(n, sigma_min, sigma_max, device, width=1024, hei
     - Smart Cap: Limits maximum sigma to an optimal value (14.61 for SDXL/SD1.5, 80.0 for Anima) to prevent training instability.
     - Resolution-Aware: Scales parameters based on image resolution for better adaptability across different input sizes.
     """
-    # Use the longer dimension as the primary resolution reference
-    resolution = max(width, height)
     try:
         is_sdxl = getattr(shared.sd_model, 'is_sdxl', False)
         is_anima = getattr(shared.sd_model, 'is_anima', False)
@@ -126,8 +124,6 @@ def _get_ays_diffusion_sigmas(
 
 def _get_ays_flow_sigmas(
     n: int,
-    width: int,
-    height: int,
     sigma_min: float,
     sigma_max: float,
     device: torch.device,
@@ -160,8 +156,6 @@ def _get_ays_flow_sigmas(
 
 def get_align_your_steps_sigmas(
     n: int,
-    width: int,
-    height: int,
     sigma_min: float,
     sigma_max: float,
     device: torch.device,
@@ -188,7 +182,7 @@ def get_align_your_steps_sigmas(
 
     if is_flow_model:
         # Flow branch always builds exactly m+1 sigmas (beta will remap later)
-        sigmas = _get_ays_flow_sigmas(m, width, height, sigma_min, sigma_max, device, inner_model)
+        sigmas = _get_ays_flow_sigmas(m, sigma_min, sigma_max, device, inner_model)
     else:
         sigmas = _get_ays_diffusion_sigmas(m, sigma_min, sigma_max, device, is_sdxl, apply_beta=apply_beta)
 
@@ -236,7 +230,7 @@ def get_align_your_steps_sigmas(
     return sigmas
 
 
-def get_align_your_steps_with_beta_selection_sigmas(n, width, height, sigma_min, sigma_max, device, inner_model=None):
+def get_align_your_steps_with_beta_selection_sigmas(n, sigma_min, sigma_max, device, inner_model=None):
     """
     Hybrid Scheduler: Align Your Steps with Beta Distribution Selection
     
@@ -250,7 +244,7 @@ def get_align_your_steps_with_beta_selection_sigmas(n, width, height, sigma_min,
     Parameters are controlled via shared.opts.beta_dist_alpha and shared.opts.beta_dist_beta
     (typically 0.6/0.6 for balanced, 0.4/0.6 for more structure emphasis)
     """
-    return get_align_your_steps_sigmas(n, width, height, sigma_min, sigma_max, device, apply_beta=True, inner_model=inner_model)
+    return get_align_your_steps_sigmas(n, sigma_min, sigma_max, device, apply_beta=True, inner_model=inner_model)
 
 
 def linear_quadratic(n, sigma_min, sigma_max, device, *, threshold_noise=0.025):
@@ -471,8 +465,8 @@ schedulers = [
     Scheduler("linear_quadratic", "Linear Quadratic", linear_quadratic),
     Scheduler("kl_optimal", "KL Optimal", kl_optimal),
     Scheduler("ddim", "DDIM", ddim_scheduler, need_inner_model=True),
-    Scheduler("align_your_steps", "Align Your Steps", get_align_your_steps_sigmas, need_width_height=True, need_inner_model=True),
-    Scheduler("align_your_steps_beta", "Align Your Steps Beta", get_align_your_steps_with_beta_selection_sigmas, need_width_height=True, need_inner_model=True),
+    Scheduler("align_your_steps", "Align Your Steps", get_align_your_steps_sigmas, need_inner_model=True),
+    Scheduler("align_your_steps_beta", "Align Your Steps Beta", get_align_your_steps_with_beta_selection_sigmas, need_inner_model=True),
     Scheduler("beta", "Beta", beta_scheduler, need_inner_model=True),
     Scheduler("turbo", "Turbo", turbo_scheduler, need_inner_model=True),
     Scheduler("bong_tangent", "Bong Tangent", bong_tangent_scheduler),
