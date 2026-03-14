@@ -14,7 +14,7 @@ from modules.shared import opts
 samplers_k_diffusion = [
     ("DPM++ 2M", "sample_dpmpp_2m", ["k_dpmpp_2m"], {"scheduler": "karras"}),
     ("DPM++ SDE", "sample_dpmpp_sde", ["k_dpmpp_sde"], {"scheduler": "karras", "second_order": True, "brownian_noise": True}),
-    ("DPM++ 2M SDE", "sample_dpmpp_2m_sde", ["k_dpmpp_2m_sde_ka"], {"brownian_noise": True}),
+    ("DPM++ 2M SDE", "sample_dpmpp_2m_sde", ["k_dpmpp_2m_sde"], {"scheduler": "exponential", "brownian_noise": True}),
     ("DPM++ 3M SDE", "sample_dpmpp_3m_sde", ["k_dpmpp_3m_sde"], {"scheduler": "exponential", "discard_next_to_last_sigma": True, "brownian_noise": True}),
     ("DPM++ 3M SDE Ctrl-Z", "sample_dpmpp_3m_sde_ctrlz", ["k_dpmpp_3m_sde_ctrlz"], {"scheduler": "exponential", "discard_next_to_last_sigma": True, "brownian_noise": True}),
     ("DPM++ 3M SDE CFG++ Ctrl-Z", "sample_dpmpp_3m_sde_cfgpp_ctrlz", ["k_dpmpp_3m_sde_cfgpp_ctrlz"], {"scheduler": "exponential", "discard_next_to_last_sigma": True, "brownian_noise": True}),
@@ -91,7 +91,7 @@ class KDiffusionSampler(sd_samplers_common.Sampler):
         if scheduler_name == "Automatic":
             from backend.args import dynamic_args
 
-            if dynamic_args["klein"]:
+            if dynamic_args.klein:
                 scheduler_name = "Flux2"
             else:
                 scheduler_name = self.config.options.get("scheduler", None)

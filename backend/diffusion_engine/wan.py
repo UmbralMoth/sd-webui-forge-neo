@@ -46,6 +46,7 @@ class Wan(ForgeDiffusionEngine):
         global refiner_shift
         if refiner_shift is not None:
             self.forge_objects.unet.model.predictor.set_parameters(shift=refiner_shift)
+            memory_management.logger.debug(f"Shift: {refiner_shift}")
             refiner_shift = None
 
     @torch.inference_mode()
@@ -54,6 +55,7 @@ class Wan(ForgeDiffusionEngine):
         global refiner_shift
         shift = getattr(prompt, "distilled_cfg_scale", 8.0)
         self.forge_objects.unet.model.predictor.set_parameters(shift=shift)
+        memory_management.logger.debug(f"Shift: {shift}")
         refiner_shift = shift
         return self.text_processing_engine_t5(prompt)
 
@@ -100,7 +102,7 @@ class Wan(ForgeDiffusionEngine):
         else:
             z = torch.cat((mask, image), dim=1)
 
-        args.dynamic_args["concat_latent"] = z
+        args.dynamic_args.concat_latent = z
 
     @torch.inference_mode()
     def encode_first_stage(self, x: torch.Tensor):

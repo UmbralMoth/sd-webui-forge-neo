@@ -54,15 +54,26 @@ class Anima(ForgeDiffusionEngine):
 
     @torch.inference_mode()
     def encode_first_stage(self, x: torch.Tensor):
-        if x.size(0) > 1:
-            x = x[0].unsqueeze(0)  # enforce batch_size of 1
+        samples: list[torch.Tensor] = []
+        batch: int = x.size(0)
 
-        sample = self.forge_objects.vae.encode(x.movedim(1, -1) * 0.5 + 0.5)
-        sample = self.forge_objects.vae.first_stage_model.process_in(sample)
-        return sample.to(x)
+        for b in range(batch):
+            y = x[b].unsqueeze(0)
+            sample = self.forge_objects.vae.encode(y.movedim(1, -1) * 0.5 + 0.5)
+            sample = self.forge_objects.vae.first_stage_model.process_in(sample)
+            samples.append(sample)
+
+        return torch.cat(samples).to(x)
 
     @torch.inference_mode()
-    def decode_first_stage(self, x):
-        sample = self.forge_objects.vae.first_stage_model.process_out(x)
-        sample = self.forge_objects.vae.decode(sample).movedim(-1, 2) * 2.0 - 1.0
-        return sample.to(x)
+    def decode_first_stage(self, x: torch.Tensor):
+        samples: list[torch.Tensor] = []
+        batch: int = x.size(0)
+
+        for b in range(batch):
+            y = x[b].unsqueeze(0)
+            sample = self.forge_objects.vae.first_stage_model.process_out(y)
+            sample = self.forge_objects.vae.decode(sample).movedim(-1, 2) * 2.0 - 1.0
+            samples.append(sample)
+
+        return torch.cat(samples).to(x)
