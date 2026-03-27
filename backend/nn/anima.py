@@ -68,11 +68,17 @@ class VideoRopePosition3DEmb(nn.Module):
 
         B, T, H, W, _ = B_T_H_W_C
         seq = torch.arange(max(H, W, T), dtype=torch.float, device=device)
-        assert fps is None
+        
+        if self.enable_fps_modulation and fps is not None:
+            fps_val = fps.flatten()[0].float()
+            seq_t = seq[:T] / (fps_val / 24.0)
+        else:
+            seq_t = seq[:T]
+            
         half_emb_h = torch.outer(seq[:H].to(device=device), h_spatial_freqs)
         half_emb_w = torch.outer(seq[:W].to(device=device), w_spatial_freqs)
 
-        half_emb_t = torch.outer(seq[:T].to(device=device), temporal_freqs)
+        half_emb_t = torch.outer(seq_t.to(device=device), temporal_freqs)
 
         half_emb_h = torch.stack([torch.cos(half_emb_h), -torch.sin(half_emb_h), torch.sin(half_emb_h), torch.cos(half_emb_h)], dim=-1)
         half_emb_w = torch.stack([torch.cos(half_emb_w), -torch.sin(half_emb_w), torch.sin(half_emb_w), torch.cos(half_emb_w)], dim=-1)
@@ -104,13 +110,13 @@ class GPT2FeedForward(nn.Module):
         return x
 
 
-def torch_attention_op(q_B_S_H_D: torch.Tensor, k_B_S_H_D: torch.Tensor, v_B_S_H_D: torch.Tensor, transformer_options: Optional[dict] = {}) -> torch.Tensor:
+def torch_attention_op(q_B_S_H_D: torch.Tensor, k_B_S_H_D: torch.Tensor, v_B_S_H_D: torch.Tensor, mask: Optional[torch.Tensor] = None, transformer_options: Optional[dict] = {}) -> torch.Tensor:
     in_q_shape = q_B_S_H_D.shape
     in_k_shape = k_B_S_H_D.shape
     q_B_H_S_D = rearrange(q_B_S_H_D, "b ... h k -> b h ... k").view(in_q_shape[0], in_q_shape[-2], -1, in_q_shape[-1])
     k_B_H_S_D = rearrange(k_B_S_H_D, "b ... h v -> b h ... v").view(in_k_shape[0], in_k_shape[-2], -1, in_k_shape[-1])
     v_B_H_S_D = rearrange(v_B_S_H_D, "b ... h v -> b h ... v").view(in_k_shape[0], in_k_shape[-2], -1, in_k_shape[-1])
-    return attention_function(q_B_H_S_D, k_B_H_S_D, v_B_H_S_D, in_q_shape[-2], skip_reshape=True, transformer_options=transformer_options)
+    return attention_function(q_B_H_S_D, k_B_H_S_D, v_B_H_S_D, in_q_shape[-2], mask=mask, skip_reshape=True, transformer_options=transformer_options)
 
 
 class SelfCrossAttention(nn.Module):
@@ -175,13 +181,13 @@ class SelfCrossAttention(nn.Module):
 
         return q, k, v
 
-    def compute_attention(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, transformer_options: Optional[dict] = {}) -> torch.Tensor:
-        result = self.attn_op(q, k, v, transformer_options=transformer_options)
+    def compute_attention(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: Optional[torch.Tensor] = None, transformer_options: Optional[dict] = {}) -> torch.Tensor:
+        result = self.attn_op(q, k, v, mask=mask, transformer_options=transformer_options)
         return self.output_dropout(self.output_proj(result))
 
-    def forward(self, x: torch.Tensor, context: Optional[torch.Tensor] = None, rope_emb: Optional[torch.Tensor] = None, transformer_options: Optional[dict] = {}) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, context: Optional[torch.Tensor] = None, rope_emb: Optional[torch.Tensor] = None, mask: Optional[torch.Tensor] = None, transformer_options: Optional[dict] = {}) -> torch.Tensor:
         q, k, v = self.compute_qkv(x, context, rope_emb=rope_emb)
-        return self.compute_attention(q, k, v, transformer_options=transformer_options)
+        return self.compute_attention(q, k, v, mask=mask, transformer_options=transformer_options)
 
 
 class Timesteps(nn.Module):
@@ -340,6 +346,7 @@ class Block(nn.Module):
         rope_emb_L_1_1_D: Optional[torch.Tensor] = None,
         adaln_lora_B_T_3D: Optional[torch.Tensor] = None,
         extra_per_block_pos_emb: Optional[torch.Tensor] = None,
+        mask: Optional[torch.Tensor] = None,
         transformer_options: Optional[dict] = {},
     ) -> torch.Tensor:
         residual_dtype = x_B_T_H_W_D.dtype
@@ -393,13 +400,14 @@ class Block(nn.Module):
         )
         x_B_T_H_W_D = x_B_T_H_W_D + gate_self_attn_B_T_1_1_D.to(residual_dtype) * result_B_T_H_W_D.to(residual_dtype)
 
-        def _x_fn(_x_B_T_H_W_D: torch.Tensor, layer_norm_cross_attn: Callable, _scale_cross_attn_B_T_1_1_D: torch.Tensor, _shift_cross_attn_B_T_1_1_D: torch.Tensor, transformer_options: Optional[dict] = {}) -> torch.Tensor:
+        def _x_fn(_x_B_T_H_W_D: torch.Tensor, layer_norm_cross_attn: Callable, _scale_cross_attn_B_T_1_1_D: torch.Tensor, _shift_cross_attn_B_T_1_1_D: torch.Tensor, mask: Optional[torch.Tensor] = None, transformer_options: Optional[dict] = {}) -> torch.Tensor:
             _normalized_x_B_T_H_W_D = _fn(_x_B_T_H_W_D, layer_norm_cross_attn, _scale_cross_attn_B_T_1_1_D, _shift_cross_attn_B_T_1_1_D)
             _result_B_T_H_W_D = rearrange(
                 self.cross_attn(
                     rearrange(_normalized_x_B_T_H_W_D.to(compute_dtype), "b t h w d -> b (t h w) d"),
                     crossattn_emb,
                     rope_emb=rope_emb_L_1_1_D,
+                    mask=mask,
                     transformer_options=transformer_options,
                 ),
                 "b (t h w) d -> b t h w d",
@@ -414,6 +422,7 @@ class Block(nn.Module):
             self.layer_norm_cross_attn,
             scale_cross_attn_B_T_1_1_D,
             shift_cross_attn_B_T_1_1_D,
+            mask=mask,
             transformer_options=transformer_options,
         )
         x_B_T_H_W_D = result_B_T_H_W_D.to(residual_dtype) * gate_cross_attn_B_T_1_1_D.to(residual_dtype) + x_B_T_H_W_D
@@ -608,6 +617,7 @@ class MiniTrainDIT(nn.Module):
             "rope_emb_L_1_1_D": rope_emb_L_1_1_D.unsqueeze(1).unsqueeze(0),
             "adaln_lora_B_T_3D": adaln_lora_B_T_3D,
             "extra_per_block_pos_emb": extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D,
+            "mask": kwargs.get("y_mask", kwargs.get("crossattn_mask", None)),
             "transformer_options": kwargs.get("transformer_options", {}),
         }
 
@@ -770,6 +780,7 @@ class LLMAdapter(nn.Module):
         self.norm = nn.RMSNorm(target_dim, eps=1e-6)
 
     def forward(self, source_hidden_states, target_input_ids, target_attention_mask=None, source_attention_mask=None, target_weights=None):
+        out_dtype = source_hidden_states.dtype
         if target_attention_mask is not None:
             target_attention_mask = target_attention_mask.to(torch.bool)
             if target_attention_mask.ndim == 2:
@@ -780,7 +791,7 @@ class LLMAdapter(nn.Module):
             if source_attention_mask.ndim == 2:
                 source_attention_mask = source_attention_mask.unsqueeze(1).unsqueeze(1)
 
-        x = self.in_proj(self.embed(target_input_ids))
+        x = self.in_proj(self.embed(target_input_ids)).to(out_dtype)
         if target_weights is not None:
             x = x * target_weights.unsqueeze(-1).to(x)
 
@@ -791,7 +802,7 @@ class LLMAdapter(nn.Module):
         position_embeddings_context = self.rotary_emb(x, position_ids_context)
         for block in self.blocks:
             x = block(x, context, target_attention_mask=target_attention_mask, source_attention_mask=source_attention_mask, position_embeddings=position_embeddings, position_embeddings_context=position_embeddings_context)
-        return self.norm(self.out_proj(x))
+        return self.norm(self.out_proj(x)).to(out_dtype)
 
 
 class Anima(MiniTrainDIT):

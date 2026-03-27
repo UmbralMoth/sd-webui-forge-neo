@@ -516,9 +516,9 @@ class Qwen3_06B(BaseLlama, nn.Module):
 
         self.llm_adapter = LLMAdapter()
 
-    def preprocess_text_embeds(self, text_embeds, text_ids):
+    def preprocess_text_embeds(self, text_embeds, text_ids, target_attention_mask=None, source_attention_mask=None):
         if text_ids is not None:
-            return self.llm_adapter(text_embeds, text_ids)
+            return self.llm_adapter(text_embeds, text_ids, target_attention_mask=target_attention_mask, source_attention_mask=source_attention_mask)
         else:
             return text_embeds
 

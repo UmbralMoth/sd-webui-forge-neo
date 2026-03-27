@@ -77,14 +77,14 @@ class AnimaTextProcessingEngine:
         return chunks
 
     def __call__(self, texts):
-        zs, ti, tw = [], [], []
+        zs, zm, ti, tw = [], [], [], []
         cache = {}
 
         self.emphasis = emphasis.get_current_option(opts.emphasis)()
 
         for line in texts:
             if line in cache:
-                z, chunk = cache[line]
+                z, qwen_mask, chunk = cache[line]
             else:
                 chunks: list[PromptChunk] = self.tokenize_line(line)
                 assert len(chunks) == 1
@@ -96,12 +96,15 @@ class AnimaTextProcessingEngine:
                     if len(tokens) == 0:
                         tokens = [self.id_pad]
                         multipliers = [1.0]
-                    
-                    z: torch.Tensor = self.process_tokens([tokens], [multipliers])[0]
 
-                cache[line] = (z, chunk)
+                    z_batch, qwen_mask_batch = self.process_tokens([tokens], [multipliers])
+                    z = z_batch[0]
+                    qwen_mask = qwen_mask_batch[0]
+
+                cache[line] = (z, qwen_mask, chunk)
 
             zs.append(z)
+            zm.append(qwen_mask)
             ti.append(torch.tensor(chunk.t5_tokens, dtype=torch.int))
             tw.append(torch.tensor(chunk.t5_multipliers))
 
@@ -118,13 +121,17 @@ class AnimaTextProcessingEngine:
             return torch.stack(out)
 
         qwen_cond = stack_with_padding(zs)
+        qwen_masks = stack_with_padding(zm, pad_value=0)
         t5_ids = stack_with_padding(ti, pad_value=0)
         t5_weights = stack_with_padding(tw, pad_value=1.0)
+        t5_masks = (t5_ids != 0).long()
         
         device = memory_management.text_encoder_device()
         cross_attn = self.text_encoder.preprocess_text_embeds(
             qwen_cond.to(device=device), 
-            t5_ids.to(device=device)
+            t5_ids.to(device=device),
+            target_attention_mask=t5_masks.to(device=device),
+            source_attention_mask=qwen_masks.to(device=device),
         )
         if t5_weights is not None:
             cross_attn *= t5_weights.unsqueeze(-1).to(cross_attn)
@@ -221,4 +228,4 @@ class AnimaTextProcessingEngine:
             num_tokens=count,
             embeds_info=info
         )
-        return z
+        return z, mask
