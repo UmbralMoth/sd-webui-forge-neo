@@ -347,8 +347,11 @@ def sampling_function_inner(model, x, timestep, uncond, cond, cond_scale, model_
         dot_np = torch.sum(neg_dir * pos_dir, dim=(1, 2, 3), keepdim=True)
         dot_pp = torch.sum(pos_dir * pos_dir, dim=(1, 2, 3), keepdim=True)
         
-        # Only strip positive overlap
-        dot_np_clamped = torch.clamp(dot_np, min=0.0)
+        # Only strip positive overlap (optional clamping aligned with ComfyUI's standard behavior)
+        if model_options.get("perp_neg_clamp", False):
+            dot_np_clamped = torch.clamp(dot_np, min=0.0)
+        else:
+            dot_np_clamped = dot_np
         proj_neg_on_pos = (dot_np_clamped / torch.clamp(dot_pp, min=1e-6)) * pos_dir
         
         # 4. Strip overlap with Positive to keep only what's unique to Negative
