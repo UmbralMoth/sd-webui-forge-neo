@@ -5,7 +5,7 @@ from huggingface_guess import model_list
 from backend import memory_management, utils
 from backend.args import dynamic_args
 from backend.diffusion_engine.base import ForgeDiffusionEngine, ForgeObjects
-from backend.modules.k_prediction import PredictionFlow
+from backend.modules.k_prediction import PredictionDiscreteFlow
 from backend.nn.unet import Timestep
 from backend.patcher.clip import CLIP
 from backend.patcher.unet import UnetPatcher
@@ -78,7 +78,7 @@ class StableDiffusionXL(ForgeDiffusionEngine):
     def get_learned_conditioning(self, prompt: list[str]):
         memory_management.load_model_gpu(self.forge_objects.clip.patcher)
 
-        if self._RF:
+        if getattr(self, "_RF", False) or getattr(self, "use_shift", False):
             shift = getattr(prompt, "distilled_cfg_scale", 3.0)
             self.forge_objects.unet.model.predictor.set_parameters(shift=shift)
             memory_management.logger.debug(f"Shift: {shift}")
@@ -157,13 +157,7 @@ class StableDiffusionXLRF(StableDiffusionXL):
 
         vae = VAE(model=huggingface_components["vae"])
 
-        sampling_settings = estimated_config.sampling_settings
-        k_predictor = PredictionFlow(
-            sigma_data=1.0,
-            prediction_type="const",
-            shift=sampling_settings.get("shift", 1.0),
-            multiplier=sampling_settings.get("multiplier", 1000),
-        )
+        k_predictor = PredictionDiscreteFlow(estimated_config)
 
         unet = UnetPatcher.from_model(model=huggingface_components["unet"], diffusers_scheduler=None, k_predictor=k_predictor, config=estimated_config)
 
