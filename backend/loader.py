@@ -668,6 +668,14 @@ def split_state_dict(sd, additional_state_dicts: list = None):
 
     guess.clip_target = guess.clip_target(sd)
     guess.model_type = guess.model_type(sd)
+
+    if metadata:
+        predict_key = metadata.get("modelspec.predict_key", "").lower()
+        if predict_key in ["flow", "rectified"]:
+            guess.model_type = huggingface_guess.model_list.ModelType.FLOW
+            if "xl" in guess.huggingface_repo.lower():
+                guess.sampling_settings["RF"] = True
+
     guess.ztsnr = "ztsnr" in sd
 
     sd = guess.process_vae_state_dict(sd)
@@ -703,7 +711,7 @@ def forge_loader(sd: os.PathLike, additional_state_dicts: list[os.PathLike] = No
         raise ValueError("Failed to recognize model type!")
 
     repo_name = estimated_config.huggingface_repo
-    if "xl" in repo_name and "rectified" in str(sd).lower():
+    if "xl" in repo_name and ("rectified" in str(sd).lower() or "flow" in str(sd).lower()):
         estimated_config.sampling_settings["RF"] = True
 
     backend.args.dynamic_args.kontext = "kontext" in str(sd).lower()
