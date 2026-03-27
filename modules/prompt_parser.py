@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import re
+import math
 from collections import namedtuple
 
 import lark
 import torch
+
+from modules import shared
 
 # a prompt like this: "fantasy landscape with a [mountain:lake:0.25] and [an oak:a christmas tree:0.75] [in foreground::0.6] [:in background:0.25] [shoddy:masterful:0.5]"
 # will be represented with prompt_schedule like this (assuming steps=100):
@@ -139,7 +142,60 @@ def get_learned_conditioning_prompt_schedules(prompts, base_steps, hires_steps=N
 
                 traceback.print_exc()
             return [[steps, prompt]]
-        return [[t, at_step(t, tree)] for t in collect_steps(steps, tree)]
+
+        use_legacy_alternation = getattr(shared.opts, "use_legacy_alternation_behavior", False)
+        if use_legacy_alternation:
+            return [[t, at_step(t, tree)] for t in collect_steps(steps, tree)]
+
+        def eval_topdown(node, step, state):
+            if isinstance(node, lark.Token):
+                return str(node.value)
+                
+            if not isinstance(node, lark.Tree):
+                return str(node)
+                
+            if getattr(node, 'data', None) == 'alternate':
+                node_id = id(node)
+                if node_id not in state:
+                    state[node_id] = 0
+                else:
+                    state[node_id] += 1
+                
+                idx = state[node_id] % len(node.children)
+                child = node.children[idx]
+                if child is None:
+                    return ""
+                res = eval_topdown(child, step, state)
+                return res if res else ""
+                
+            elif getattr(node, 'data', None) == 'scheduled':
+                before, after, _colon, when, _ws = node.children
+                if step <= int(when):
+                    return eval_topdown(before, step, state) if before else ""
+                else:
+                    return eval_topdown(after, step, state) if after else ""
+                    
+            elif getattr(node, 'data', None) == 'plain':
+                return str(node.children[0].value)
+                
+            else:
+                def flatten(x):
+                    if isinstance(x, str):
+                        yield x
+                    elif isinstance(x, tuple) and len(x) == 0:
+                        pass
+                    else:
+                        for gen in x:
+                            yield from flatten(gen)
+                res = [eval_topdown(c, step, state) for c in node.children if c is not None]
+                return "".join(flatten(res))
+
+        ts = collect_steps(steps, tree)
+        state_dict = {}
+        schedule = []
+        for t in ts:
+            schedule.append([t, eval_topdown(tree, t, state_dict)])
+        return schedule
 
     promptdict = {prompt: get_schedule(prompt) for prompt in set(prompts)}
     return [promptdict[prompt] for prompt in prompts]
@@ -303,7 +359,63 @@ class DictWithShape(dict):
         return DictWithShape(result)
 
 
-def reconstruct_cond_batch(c: list[list[ScheduledPromptConditioning]], current_step):
+def blend_conds(cond1, cond2, weight):
+    if weight <= 0.001:
+        return cond1
+    if weight >= 0.999:
+        return cond2
+    if isinstance(cond1, dict):
+        res = {}
+        for k in cond1.keys():
+            if isinstance(cond1[k], torch.Tensor) and isinstance(cond2[k], torch.Tensor):
+                res[k] = cond1[k] * (1.0 - weight) + cond2[k] * weight
+            else:
+                res[k] = cond1[k]
+        if hasattr(cond1, "shape"):
+            return type(cond1)(res, shape=getattr(cond1, 'shape', None))
+        return type(cond1)(res)
+    else:
+        return cond1 * (1.0 - weight) + cond2 * weight
+
+
+def get_continuous_cond(schedules, step_float):
+    if len(schedules) == 1:
+        return schedules[0].cond
+    
+    # Are we in an alternating schedule? (all step diffs == 1)
+    is_alternating = True
+    for i in range(1, len(schedules)):
+        if schedules[i].end_at_step - schedules[i-1].end_at_step != 1:
+            is_alternating = False
+            break
+            
+    if is_alternating:
+        # wave function indexing
+        idx = int(step_float)
+        idx = min(idx, len(schedules) - 1)
+        next_idx = min(idx + 1, len(schedules) - 1)
+        
+        cond1 = schedules[idx].cond
+        cond2 = schedules[next_idx].cond
+        
+        w = math.sin(math.pi / 2.0 * (step_float - idx)) ** 2
+        return blend_conds(cond1, cond2, w)
+    else:
+        # Sigmoid Hand-off Edit sequence
+        current_cond = schedules[0].cond
+        for i in range(1, len(schedules)):
+            cond_next = schedules[i].cond
+            swap_step = schedules[i-1].end_at_step
+            # c = 2.0 creates a ~4 step blend window
+            w = torch.sigmoid(torch.tensor(2.0 * (step_float - swap_step))).item()
+            current_cond = blend_conds(current_cond, cond_next, w)
+        return current_cond
+
+
+def reconstruct_cond_batch(c: list[list[ScheduledPromptConditioning]], current_step, step_float=None):
+    if step_float is None:
+        step_float = float(current_step)
+
     param = c[0][0].cond
     is_dict = isinstance(param, dict)
 
@@ -315,17 +427,13 @@ def reconstruct_cond_batch(c: list[list[ScheduledPromptConditioning]], current_s
         res = torch.zeros((len(c),) + param.shape, device=param.device, dtype=param.dtype)
 
     for i, cond_schedule in enumerate(c):
-        target_index = 0
-        for current, entry in enumerate(cond_schedule):
-            if current_step <= entry.end_at_step:
-                target_index = current
-                break
+        cond_val = get_continuous_cond(cond_schedule, step_float)
 
         if is_dict:
-            for k, param in cond_schedule[target_index].cond.items():
-                res[k][i] = param
+            for k, param_val in cond_val.items():
+                res[k][i] = param_val
         else:
-            res[i] = cond_schedule[target_index].cond
+            res[i] = cond_val
 
     return res
 
@@ -346,7 +454,10 @@ def stack_conds(tensors):
     return result
 
 
-def reconstruct_multicond_batch(c: MulticondLearnedConditioning, current_step):
+def reconstruct_multicond_batch(c: MulticondLearnedConditioning, current_step, step_float=None):
+    if step_float is None:
+        step_float = float(current_step)
+
     param = c.batch[0][0].schedules[0].cond
 
     tensors = []
@@ -356,14 +467,8 @@ def reconstruct_multicond_batch(c: MulticondLearnedConditioning, current_step):
         conds_for_batch = []
 
         for composable_prompt in composable_prompts:
-            target_index = 0
-            for current, entry in enumerate(composable_prompt.schedules):
-                if current_step <= entry.end_at_step:
-                    target_index = current
-                    break
-
             conds_for_batch.append((len(tensors), composable_prompt.weight))
-            tensors.append(composable_prompt.schedules[target_index].cond)
+            tensors.append(get_continuous_cond(composable_prompt.schedules, step_float))
 
         conds_list.append(conds_for_batch)
 

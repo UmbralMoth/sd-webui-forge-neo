@@ -124,8 +124,11 @@ class CFGDenoiser(torch.nn.Module):
             cond = self.sampler.sampler_extra_args["cond"]
             uncond = self.sampler.sampler_extra_args["uncond"]
 
-        cond_composition, cond = prompt_parser.reconstruct_multicond_batch(cond, self.step)
-        uncond = prompt_parser.reconstruct_cond_batch(uncond, self.step) if uncond is not None else None
+        internal_step = kwargs.get("__internal_step", False)
+        step_float = float(self.step) + (0.5 if internal_step else 0.0)
+
+        cond_composition, cond = prompt_parser.reconstruct_multicond_batch(cond, self.step, step_float=step_float)
+        uncond = prompt_parser.reconstruct_cond_batch(uncond, self.step, step_float=step_float) if uncond is not None else None
 
         if self.mask is not None:
             predictor = self.inner_model.inner_model.forge_objects.unet.model.predictor
@@ -193,9 +196,7 @@ class CFGDenoiser(torch.nn.Module):
         # TraSCE: reconstruct empty_c for the current step (handles prompt-edit schedules)
         # and forward it into model_options for sampling_function to compile and apply.
         if "cond_empty" in self.sampler.sampler_extra_args:
-            if getattr(self, "cached_cond_empty", None) is None:
-                self.cached_cond_empty = prompt_parser.reconstruct_cond_batch(self.sampler.sampler_extra_args["cond_empty"], self.step)
-            extra_model_options["cond_empty"] = self.cached_cond_empty
+            extra_model_options["cond_empty"] = prompt_parser.reconstruct_cond_batch(self.sampler.sampler_extra_args["cond_empty"], self.step, step_float=step_float)
         denoised, cond_pred, uncond_pred = sampling_function(self, denoiser_params=denoiser_params, cond_scale=cond_scale, cond_composition=cond_composition, extra_model_options=extra_model_options)
 
         if self.need_last_noise_uncond:
