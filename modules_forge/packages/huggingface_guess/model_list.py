@@ -497,16 +497,21 @@ class Anima(BASE):
     latent_format = latent.QwenImage
 
     memory_usage_factor = 1.32
-
     supported_inference_dtypes = [torch.bfloat16, torch.float16, torch.float32]
+
+    vae_key_prefix = ["vae."]
+    text_encoder_key_prefix = ["text_encoders."]
 
     unet_target = "transformer"
 
     def model_type(self, state_dict):
         return ModelType.FLOW
 
-    def clip_target(self, state_dict={}):
-        return {"qwen3_06b.transformer": "text_encoder"}
+    def clip_target(self, state_dict: dict):
+        pref = self.text_encoder_key_prefix[0]
+        if "{}qwen3_06b.transformer.model.embed_tokens.weight".format(pref) in state_dict:
+            return {"qwen3_06b.transformer": "text_encoder"}
+        return {"qwen3_06b": "text_encoder"}
 
 
 class WAN21_T2V(BASE):
