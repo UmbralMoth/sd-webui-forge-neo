@@ -141,11 +141,6 @@ def refresh_model_loading_parameters(*, refresh: bool = True):
         logger.warning("GGUF requires fp16 LoRA ; overriding option")
         lora_fp16 = True
 
-    for mdl in [ckpt, *modules]:
-        for dtype in ("fp4_mixed", "fp4mixed", "fp8mixed", "nvfp4"):
-            if dtype in mdl:
-                logger.error(f'"{dtype}" is currently not supported...')
-
     dynamic_args.online_lora = lora_fp16
     logger.info(f"Patch LoRAs on-the-fly: {lora_fp16}")
 
@@ -284,7 +279,7 @@ def on_preset_change(preset: str):
     shared.opts.save(shared.config_filename)
 
     if use_shift(preset):
-        d_args = {"visible": True, "label": "Shift"}
+        d_args = {"visible": getattr(shared.opts, "xl_show_shift", False) if preset == "xl" else True, "label": "Shift"}
     elif use_distill(preset):
         d_args = {"visible": True, "label": "Distilled CFG Scale"}
     else:

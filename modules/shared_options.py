@@ -4,7 +4,7 @@ import gradio as gr
 
 from backend.text_processing import emphasis as sd_emphasis
 from modules import localization, shared, shared_gradio_themes, shared_items, ui_components, util
-from modules.options import OptionDiv, OptionHTML, OptionInfo, categories, options_section
+from modules.options import OptionDiv, OptionHTML, OptionInfo, OptionRow, categories, options_section
 from modules.paths_internal import data_path, default_output_dir
 from modules.shared_cmd_options import cmd_opts
 from modules_forge import presets as forge_presets
@@ -175,6 +175,7 @@ options_templates.update(
             "enable_upscale_progressbar": OptionInfo(True, "Show a progress bar in the console for tiled upscaling"),
             "list_hidden_files": OptionInfo(True, "List the models/files under hidden directories").info('directory is hidden if its name starts with "."'),
             "dump_stacks_on_signal": OptionInfo(False, "Print the stack trace before terminating the webui via Ctrl + C"),
+            "no_spellcheck": OptionInfo(False, "Disable auto-correct / spellcheck for prompt fields").needs_reload_ui(),
         },
     )
 )
@@ -226,10 +227,14 @@ options_templates.update(
             "tiling": OptionInfo(False, "Tiling", infotext="Tiling").info("produce a tileable image"),
             "randn_source": OptionInfo("CPU", "Random Number Generator", gr.Radio, {"choices": ("CPU", "GPU", "NV")}, infotext="RNG").info("use <b>CPU</b> for the maximum recreatability across different systems"),
             "divxl": OptionDiv(),
+            "sdxl_01": OptionRow(),
             "sdxl_crop_top": OptionInfo(0, "[SDXL] Crop-Top Coordinate"),
             "sdxl_crop_left": OptionInfo(0, "[SDXL] Crop-Left Coordinate"),
+            "sdxl_00": OptionRow(),
+            "sdxl_11": OptionRow(),
             "sdxl_refiner_low_aesthetic_score": OptionInfo(2.5, "[SDXL] Low Aesthetic Score", gr.Number),
             "sdxl_refiner_high_aesthetic_score": OptionInfo(6.0, "[SDXL] High Aesthetic Score", gr.Number),
+            "sdxl_10": OptionRow(),
             "divlumina": OptionDiv(),
             "neta_template_positive": OptionInfo(
                 "You are an assistant designed to generate anime images with the highest degree of image-text alignment based on danbooru tags. <Prompt Start>",
@@ -243,8 +248,9 @@ options_templates.update(
                 gr.Textbox,
                 {"lines": 3, "max_lines": 6, "placeholder": "<Prompt Start>"},
             ),
-            "divqwen": OptionDiv(),
-            "qwen_vae_resize": OptionInfo(False, "Resize input image to 1 megapixel for Qwen-Image-Edit ref_latent"),
+            "divmisc": OptionDiv(),
+            "qwen_vae_resize": OptionInfo(False, "[Qwen-Image-Edit] Resize input image to 1 megapixel for ref_latent"),
+            "klein_no_reference": OptionInfo(False, "[Klein] Disable Reference").info("disable Edit ; enable img2img").info("pin to <b>Quicksettings</b> is recommended if changed often"),
         },
     )
 )

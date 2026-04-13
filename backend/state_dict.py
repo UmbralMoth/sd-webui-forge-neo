@@ -1,3 +1,8 @@
+import json
+
+import torch
+
+
 def load_state_dict(model, sd, ignore_errors=[], log_name=None, ignore_start=None):
     missing, unexpected = model.load_state_dict(sd, strict=False)
     missing = [x for x in missing if x not in ignore_errors]
@@ -12,7 +17,6 @@ def load_state_dict(model, sd, ignore_errors=[], log_name=None, ignore_start=Non
         print(f"{log_name} Missing: {missing}")
     if len(unexpected) > 0:
         print(f"{log_name} Unexpected: {unexpected}")
-    return
 
 
 def state_dict_has(sd, prefix):
@@ -96,3 +100,70 @@ def state_dict_prefix_replace(state_dict, replace_prefix, filter_keys=False):
             w = state_dict.pop(x[0])
             out[x[1]] = w
     return out
+
+
+def detect_quantization(state_dict: dict[str, torch.Tensor], *, is_unet: bool = False) -> dict | None:
+    if any(k.endswith(".comfy_quant") for k in state_dict):
+        return {"mixed_ops": True, "TE": not is_unet}
+    return None
+
+
+def convert_quantization(state_dict: dict[str, torch.Tensor], metadata: dict, model_prefix: str = "") -> dict[str, torch.Tensor]:
+    # https://github.com/Comfy-Org/ComfyUI/blob/v0.19.0/comfy/utils.py#L1358
+    if metadata is None:
+        metadata = {}
+
+    if "_quantization_metadata" in metadata:
+        quant_metadata = json.loads(metadata["_quantization_metadata"]) or {}
+    else:
+        scaled_fp8_key = "{}scaled_fp8".format(model_prefix)
+        if scaled_fp8_key not in state_dict:
+            return state_dict, metadata
+
+        scaled_fp8_weight = state_dict[scaled_fp8_key]
+        scaled_fp8_dtype = scaled_fp8_weight.dtype
+        if scaled_fp8_dtype is torch.float32:
+            scaled_fp8_dtype = torch.float8_e4m3fn
+
+        if scaled_fp8_weight.nelement() == 2:
+            full_precision_matrix_mult = True
+        else:
+            full_precision_matrix_mult = False
+
+        out_sd = {}
+        layers = {}
+        for k in list(state_dict.keys()):
+            if k == scaled_fp8_key:
+                continue
+            if not k.startswith(model_prefix):
+                out_sd[k] = state_dict[k]
+                continue
+            k_out = k
+            w = state_dict.pop(k)
+            layer = None
+            if k_out.endswith(".scale_weight"):
+                layer = k_out[: -len(".scale_weight")]
+                k_out = "{}.weight_scale".format(layer)
+
+            if layer is not None:
+                layer_conf = {"format": "float8_e4m3fn"}
+                if full_precision_matrix_mult:
+                    layer_conf["full_precision_matrix_mult"] = full_precision_matrix_mult
+                layers[layer] = layer_conf
+
+            if k_out.endswith(".scale_input"):
+                layer = k_out[: -len(".scale_input")]
+                k_out = "{}.input_scale".format(layer)
+                if w.item() == 1.0:
+                    continue
+
+            out_sd[k_out] = w
+
+        state_dict = out_sd
+        quant_metadata = {"layers": layers}
+
+    if layers := quant_metadata.get("layers", None):
+        for k, v in layers.items():
+            state_dict["{}.comfy_quant".format(k)] = torch.tensor(list(json.dumps(v).encode("utf-8")), dtype=torch.uint8)
+
+    return state_dict, metadata

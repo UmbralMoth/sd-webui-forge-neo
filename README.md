@@ -1,9 +1,7 @@
 <h1 align="center">Stable Diffusion WebUI Forge - Neo</h1>
 
 <p align="center"><sup>
-[ <a href="https://github.com/Haoming02/sd-webui-forge-classic/tree/classic#stable-diffusion-webui-forge---classic">Classic</a> | Neo ]
-<br>
-<a href="https://ko-fi.com/Haoming"><img src="https://img.shields.io/badge/Kofi-0D1117.svg?logo=ko-fi&logoColor=white"></a>
+[ <b>Neo</b> | <a href="https://github.com/Haoming02/sd-webui-forge-classic/tree/classic#stable-diffusion-webui-forge---classic">Classic</a> ]
 </sup></p>
 
 <p align="center"><img src="html\ui.webp" width=512 alt="UI"></p>
@@ -24,14 +22,18 @@ The name "Forge" is inspired by "Minecraft Forge". This project aims to become t
 
 <br>
 
-## Features [Mar.]
+## Features [Apr.]
 > Most base features of the original [Automatic1111 Webui](https://github.com/AUTOMATIC1111/stable-diffusion-webui) should still function
 
 #### New Features
 
 - [X] Support [Anima](https://huggingface.co/circlestone-labs/Anima)
 - [X] Support [Flux.2-Klein](https://huggingface.co/black-forest-labs/FLUX.2-klein-4B)
-    - `4B` / `9B` *(**not** `dev`)*
+    - `4B` / `9B` *(**not** `FLUX.2-Dev`)*
+
+> [!Important]
+> To use `Flux.2-Klein` for regular `img2img`, toggle the functionality in **Settings/Stable Diffusion**
+
 - [X] Support [Z-Image](https://huggingface.co/Tongyi-MAI/Z-Image)
     - `z-image` / `z-image-turbo`
 - [X] Support [Wan 2.2](https://github.com/Wan-Video/Wan2.2)
@@ -41,6 +43,8 @@ The name "Forge" is inspired by "Minecraft Forge". This project aims to become t
 > [!Important]
 > To export a video, you need to have **[FFmpeg](https://ffmpeg.org/)** installed
 
+- [X] Support [Mugen](https://huggingface.co/CabalResearch/Mugen)
+    - display the `Shift` slider for `xl` preset in **Settings/Presets/XL**
 - [X] Support advanced **SDXL** models
 
 > [!Note]
@@ -59,6 +63,7 @@ The name "Forge" is inspired by "Minecraft Forge". This project aims to become t
 > To be detected as a **Kontext** model, the model must include "`kontext`" in its path *(**e.g.** file name or folder name)*
 
 - [X] Support Multi-Image Inputs for **Qwen-Image-Edit** and **Flux-Kontext**
+    - via `ImageStitch Integrated`
 - [X] Support [Nunchaku](https://github.com/nunchaku-tech/nunchaku) (`SVDQ`) Models
     - `flux-dev`, `flux-krea`, `flux-kontext`, `qwen-image`, `qwen-image-edit`, `z-image-turbo`
     - only `Flux` and `Qwen` support LoRA currently
@@ -66,6 +71,8 @@ The name "Forge" is inspired by "Minecraft Forge". This project aims to become t
 - [X] Support [Lumina-Image-2.0](https://huggingface.co/Alpha-VLLM/Lumina-Image-2.0)
     - `Neta-Lumina` / `NetaYume-Lumina`
 - [X] Support [Chroma1-HD](https://huggingface.co/lodestones/Chroma1-HD)
+- [X] Support **MixedPrecision** Models
+    - `fp4mixed` / `fp8mixed` / `mxfp8` / `nvfp4` / `fp8_scaled`
 
 <br>
 
@@ -80,8 +87,8 @@ The name "Forge" is inspired by "Minecraft Forge". This project aims to become t
 - [X] Rewrite Preset System
     - now remembers the checkpoint/module selection and parameters for each preset
 - [X] Support [uv](https://github.com/astral-sh/uv) package manager
-    - requires **manually** installing [uv](https://github.com/astral-sh/uv/releases)
     - drastically speed up installation
+    - requires **manually** installing [uv](https://github.com/astral-sh/uv/releases)
     - see [Commandline](#by-neo)
 - [X] Support [SageAttention](https://github.com/thu-ml/SageAttention), [FlashAttention](https://github.com/Dao-AILab/flash-attention), `fp16_accumulation`, `torch._scaled_mm`
     - see [Commandline](#by-neo)
@@ -93,8 +100,6 @@ The name "Forge" is inspired by "Minecraft Forge". This project aims to become t
     - requires **manually** installing [SpargeAttn](https://github.com/thu-ml/SpargeAttn)
 - [X] Implement fast `state_dict` switching for Refiner
     - enable in **Settings/Refiner**
-- [X] Implement Seed Variance Enhancer
-    - improve seed-to-seed variance for distilled models
 - [X] Implement RescaleCFG
     - reduce burnt colors; mainly for `v-pred` checkpoints
     - enable in **Settings/UI Alternatives**
@@ -103,8 +108,6 @@ The name "Forge" is inspired by "Minecraft Forge". This project aims to become t
     - enable in **Settings/UI Alternatives**
 - [X] Implement [Spectrum](https://github.com/hanjq17/Spectrum)
     - training-free acceleration for all models
-- [X] Implement [Modulation Guidance](https://github.com/quickjkee/modulation-guidance)
-    - quality improvement for `Anima`
 - [X] Implement [Epsilon Scaling](https://github.com/comfyanonymous/ComfyUI/pull/10132)
     - enable in **Settings/Stable Diffusion**
 - [X] Implement Torch.Compile
@@ -114,6 +117,7 @@ The name "Forge" is inspired by "Minecraft Forge". This project aims to become t
     - enable in **Settings/Upscaling**
 - [X] Support running tile composition on GPU
     - enable in **Settings/Upscaling**
+- [X] Support (short) videos in **Extras** tab
 - [X] Update `spandrel`
     - support new Upscaler architectures
 - [X] Add support for `.avif`, `.heif`, and `.jxl` image formats
@@ -132,13 +136,12 @@ The name "Forge" is inspired by "Minecraft Forge". This project aims to become t
 - [X] Some built-in Scripts
 - [X] Some Samplers
 - [X] Sampler in RadioGroup
-- [X] Unix `.sh` launch scripts
-    - You can still use this WebUI by simply copying a launch script from other working WebUI
 
 #### Optimizations
 
 - [X] **[Comfy]** Rewrite the Backend *(`memory_management.py`, `ModelPatcher`, `attention.py`, etc.)*
 - [X] No longer `git` `clone` any repository on fresh install
+- [X] No longer install `open-clip`
 - [X] Fix memory leak when switching checkpoints
 - [X] Speed up launch time
 - [X] Improve timer logs
@@ -159,6 +162,7 @@ The name "Forge" is inspired by "Minecraft Forge". This project aims to become t
     - hotkeys
 - [X] Optimize upscaler logics
 - [X] Optimize certain operations in `Spandrel`
+- [X] Optimize certain operations for `VAE`
 - [X] Speed up model loading
 - [X] Improve memory management
 - [X] Improve color correction
@@ -179,6 +183,7 @@ The name "Forge" is inspired by "Minecraft Forge". This project aims to become t
     - enable again in **Settings/Refiner**
 - [X] No longer install `bitsandbytes` by default
     - see [Commandline](#by-neo)
+- [X] Improved non-Nvidia support
 - [X] Lint & Format
 - [X] Update `Pillow`
     - faster image processing
@@ -190,7 +195,6 @@ The name "Forge" is inspired by "Minecraft Forge". This project aims to become t
 > [!Note]
 > If your GPU does not support the latest PyTorch, manually [install](https://github.com/Haoming02/sd-webui-forge-classic/wiki/Extra-Installations#older-pytorch) older version of PyTorch
 
-- [X] No longer install `open-clip` twice
 - [X] Update some packages to newer versions
 - [X] Update recommended Python to `3.13.12`
 - [X] many more... :tm:
@@ -198,12 +202,16 @@ The name "Forge" is inspired by "Minecraft Forge". This project aims to become t
 <br>
 
 ## Commandline
-> These flags can be added after the `set COMMANDLINE_ARGS=` line in the `webui-user.bat` *(separate each flag with space)*
+> These flags can be added after the `set COMMANDLINE_ARGS=` line in the `webui-user.bat` *(in the same line ; separate each flag with space)*
 
 > [!Tip]
 > Use `python launch.py --help` to see all available flags
 
 - `--xformers`: Install the `xformers` package to speed up generation
+
+> [!Warning]
+> `xformers` does **not** support `RTX 50s`
+
 - `--port`: Specify a server port to use
     - defaults to `7860`
 - `--api`: Enable [API](https://github.com/AUTOMATIC1111/stable-diffusion-webui/wiki/API) access
@@ -221,13 +229,13 @@ The name "Forge" is inspired by "Minecraft Forge". This project aims to become t
     - significantly reduces installation size (`~7 GB` to `~100 MB`)
 
 > [!Important]
-> Using `symlink` means it will directly access the packages from the cache folders; refrain from clearing the cache when setting this option
+> Using `symlink` means it will directly access the packages from the cache folders; refrain from clearing the cache if using this option
 
 - `--model-ref`: Points to a central `models` folder that contains all your models
     - said folder should contain subfolders like `Stable-diffusion`, `Lora`, `VAE`, `ESRGAN`, etc.
 
 > [!Important]
-> This simply **replaces** the `models` folder, rather than adding on top of it
+> This simply **replaces** the `models` folder rather than adding on top of it
 
 - `--forge-ref-a1111-home`: Point to an Automatic1111 installation to load its `models` folders
     - **i.e.** `Stable-diffusion`, `text_encoder`, etc.
@@ -300,6 +308,11 @@ The name "Forge" is inspired by "Minecraft Forge". This project aims to become t
 <br>
 
 > [!Tip]
+> For **Linux** and **macOS**, refer to [Wiki](https://github.com/Haoming02/sd-webui-forge-classic/wiki/Unix)
+
+<br>
+
+> [!Tip]
 > Check out [Extra Installations](https://github.com/Haoming02/sd-webui-forge-classic/wiki/Extra-Installations) for how to install `git`, `uv`, and `FFmpeg`
 
 <br>
@@ -329,10 +342,13 @@ The name "Forge" is inspired by "Minecraft Forge". This project aims to become t
 ## Issues & Requests
 
 - **Issues** about removed features will simply be ignored
-- **Issues** regarding installation will be ignored if it's obviously user-error
-- **Issues** caused by [StabilityMatrix](https://github.com/LykosAI/StabilityMatrix) will also be ignored
-    - only open an Issue if you can reproduce it on a clean install following the official [Installation](#installation) guide
-- Linux, macOS, AMD, Intel will not be officially supported, as I cannot verify nor maintain them...
+- **Issues** that is obviously user-error will simply be ignored
+- **Issues** regarding **AMD** GPU will simply be ignored
+- **Issues** running non-official models will simply be ignored
+    - do not just randomly download every single finetune/quant you find
+    - check the uploader and download count first
+- **Issues** caused by [StabilityMatrix](https://github.com/LykosAI/StabilityMatrix) will simply be ignored
+    - only open an Issue if you can reproduce it on a clean install following the official [Installation](#installation) instruction
 
 <br>
 
@@ -350,6 +366,11 @@ for their invaluable efforts in the open-source image generation community
 <br>
 
 <p align="right">
-<sub><i>Buy me a <a href="https://ko-fi.com/Haoming">Coffee</a>~ ☕
+<sub><i>
+Buy me a <a href="https://ko-fi.com/Haoming">Coffee</a> ☕~
+</i></sub>
+<br>
+<sub><i>
+<a href="https://paypal.me/hmgamingdonation">PayPal</a> me 💳~
 </i></sub>
 </p>

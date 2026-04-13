@@ -15,7 +15,6 @@ class Anima(ForgeDiffusionEngine):
 
     def __init__(self, estimated_config, huggingface_components):
         super().__init__(estimated_config, huggingface_components)
-        self.is_inpaint = False
 
         clip = CLIP(model_dict={"qwen3_06b": huggingface_components["text_encoder"]}, tokenizer_dict={"qwen3_06b": huggingface_components["tokenizer"], "t5xxl": huggingface_components["tokenizer_2"]})
 
@@ -45,6 +44,7 @@ class Anima(ForgeDiffusionEngine):
         memory_management.load_model_gpu(self.forge_objects.clip.patcher)
         shift = getattr(prompt, "distilled_cfg_scale", 3.0)
         self.forge_objects.unet.model.predictor.set_parameters(shift=shift)
+        memory_management.logger.debug(f"Shift: {shift}")
         return self.text_processing_engine_anima(prompt)
 
     @torch.inference_mode()

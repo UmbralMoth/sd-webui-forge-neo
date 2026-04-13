@@ -14,6 +14,7 @@ from backend.diffusion_engine.chroma import Chroma
 from backend.diffusion_engine.flux import Flux
 from backend.diffusion_engine.flux2 import Flux2
 from backend.diffusion_engine.lumina import Lumina2
+from backend.diffusion_engine.mugen import Mugen
 from backend.diffusion_engine.qwen import QwenImage
 from backend.diffusion_engine.sd15 import StableDiffusion
 from backend.diffusion_engine.sdxl import StableDiffusionXL, StableDiffusionXLRF, StableDiffusionXLRefiner
@@ -22,6 +23,8 @@ from backend.diffusion_engine.zimage import ZImage
 from backend.logging import setup_logger
 from backend.operations import using_forge_operations
 from backend.state_dict import (
+    convert_quantization,
+    detect_quantization,
     load_state_dict,
     state_dict_prefix_replace,
     try_filter_state_dict,
@@ -31,8 +34,9 @@ from backend.utils import (
     load_torch_file,
     read_arbitrary_config,
 )
+from modules_forge.packages.comfy.utils import convert_diffusers_mmdit
 
-possible_models = [StableDiffusion, StableDiffusionXLRefiner, StableDiffusionXLRF, StableDiffusionXL, Chroma, Flux, Flux2, Wan, QwenImage, Lumina2, ZImage, Anima]
+possible_models = [StableDiffusion, StableDiffusionXLRefiner, StableDiffusionXLRF, StableDiffusionXL, Mugen, Chroma, Flux, Flux2, Wan, QwenImage, Lumina2, ZImage, Anima]
 
 logger = logging.getLogger("loader")
 setup_logger(logger)
@@ -116,8 +120,12 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
 
             storage_dtype = memory_management.text_encoder_dtype()
             state_dict_dtype = utils.weight_dtype(state_dict)
+            quant_config = detect_quantization(state_dict)
 
-            if state_dict_dtype in [torch.float8_e4m3fn, torch.float8_e5m2, "nf4", "fp4", "gguf"]:
+            if quant_config is not None:
+                storage_dtype = state_dict_dtype
+                logger.info("Using MixedPrecision for Qwen2.5")
+            elif state_dict_dtype in [torch.float8_e4m3fn, torch.float8_e5m2, "nf4", "fp4", "gguf"]:
                 storage_dtype = state_dict_dtype
                 _log = f"{storage_dtype}" + (" (pre-quant)" if state_dict_dtype in ["nf4", "fp4", "gguf"] else "")
                 logger.info(f"Using Detected Qwen2.5 Data Type: {_log}")
@@ -132,7 +140,7 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
                         model = Qwen25_7BVLI(config)
             else:
                 with no_init_weights():
-                    with using_forge_operations(device=memory_management.cpu, dtype=storage_dtype, manual_cast_enabled=True):
+                    with using_forge_operations(device=memory_management.cpu, dtype=storage_dtype, manual_cast_enabled=True, bnb_dtype=quant_config):
                         model = Qwen25_7BVLI(config)
 
             load_state_dict(model, state_dict, log_name=cls_name, ignore_start="lm_head.")
@@ -146,8 +154,12 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
 
             storage_dtype = memory_management.text_encoder_dtype()
             state_dict_dtype = utils.weight_dtype(state_dict)
+            quant_config = detect_quantization(state_dict)
 
-            if state_dict_dtype in [torch.float8_e4m3fn, torch.float8_e5m2, "nf4", "fp4", "gguf"]:
+            if quant_config is not None:
+                storage_dtype = state_dict_dtype
+                logger.info("Using MixedPrecision for Gemma2")
+            elif state_dict_dtype in [torch.float8_e4m3fn, torch.float8_e5m2, "nf4", "fp4", "gguf"]:
                 storage_dtype = state_dict_dtype
                 _log = f"{storage_dtype}" + (" (pre-quant)" if state_dict_dtype in ["nf4", "fp4", "gguf"] else "")
                 logger.info(f"Using Detected Gemma2 Data Type: {_log}")
@@ -162,7 +174,7 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
                         model = Gemma2_2B(config)
             else:
                 with no_init_weights():
-                    with using_forge_operations(device=memory_management.cpu, dtype=storage_dtype, manual_cast_enabled=True):
+                    with using_forge_operations(device=memory_management.cpu, dtype=storage_dtype, manual_cast_enabled=True, bnb_dtype=quant_config):
                         model = Gemma2_2B(config)
 
             load_state_dict(model, state_dict, log_name=cls_name, ignore_start="lm_head.")
@@ -181,8 +193,12 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
 
             storage_dtype = memory_management.text_encoder_dtype()
             state_dict_dtype = utils.weight_dtype(state_dict)
+            quant_config = detect_quantization(state_dict)
 
-            if state_dict_dtype in [torch.float8_e4m3fn, torch.float8_e5m2, "nf4", "fp4", "gguf"]:
+            if quant_config is not None:
+                storage_dtype = state_dict_dtype
+                logger.info("Using MixedPrecision for Qwen3")
+            elif state_dict_dtype in [torch.float8_e4m3fn, torch.float8_e5m2, "nf4", "fp4", "gguf"]:
                 storage_dtype = state_dict_dtype
                 _log = f"{storage_dtype}" + (" (pre-quant)" if state_dict_dtype in ["nf4", "fp4", "gguf"] else "")
                 logger.info(f"Using Detected Qwen3 Data Type: {_log}")
@@ -197,7 +213,7 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
                         model = QTE(config)
             else:
                 with no_init_weights():
-                    with using_forge_operations(device=memory_management.cpu, dtype=storage_dtype, manual_cast_enabled=True):
+                    with using_forge_operations(device=memory_management.cpu, dtype=storage_dtype, manual_cast_enabled=True, bnb_dtype=quant_config):
                         model = QTE(config)
 
             load_state_dict(model, state_dict, log_name=cls_name, ignore_start="lm_head.")
@@ -221,8 +237,12 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
 
             storage_dtype = memory_management.text_encoder_dtype()
             state_dict_dtype = utils.weight_dtype(state_dict)
+            quant_config = detect_quantization(state_dict)
 
-            if state_dict_dtype in [torch.float8_e4m3fn, torch.float8_e5m2, "nf4", "fp4", "gguf"]:
+            if quant_config is not None:
+                storage_dtype = state_dict_dtype
+                logger.info("Using MixedPrecision for T5XXL")
+            elif state_dict_dtype in [torch.float8_e4m3fn, torch.float8_e5m2, "nf4", "fp4", "gguf"]:
                 storage_dtype = state_dict_dtype
                 _log = f"{storage_dtype}" + (" (pre-quant)" if state_dict_dtype in ["nf4", "fp4", "gguf"] else "")
                 logger.info(f"Using Detected T5XXL Data Type: {_log}")
@@ -237,7 +257,7 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
                         model = IntegratedT5(config)
             else:
                 with no_init_weights():
-                    with using_forge_operations(device=memory_management.cpu, dtype=storage_dtype, manual_cast_enabled=True):
+                    with using_forge_operations(device=memory_management.cpu, dtype=storage_dtype, manual_cast_enabled=True, bnb_dtype=quant_config):
                         model = IntegratedT5(config)
 
             load_state_dict(model, state_dict, log_name=cls_name, ignore_errors=["transformer.encoder.embed_tokens.weight", "logit_scale"])
@@ -303,6 +323,7 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
             unet_config = guess.unet_config.copy()
             state_dict_parameters = utils.calculate_parameters(state_dict)
             state_dict_dtype = utils.weight_dtype(state_dict)
+            quant_config = detect_quantization(state_dict, is_unet=True)
 
             try_int8: bool = False
 
@@ -318,6 +339,9 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
             if guess.nunchaku:
                 storage_dtype = torch.bfloat16
                 logger.info(f"Using Nunchaku Model Data Type: {storage_dtype}")
+            elif quant_config is not None:
+                storage_dtype = state_dict_dtype
+                logger.info("Using MixedPrecision for Model")
             elif state_dict_dtype in [torch.float8_e4m3fn, torch.float8_e5m2, "nf4", "fp4", "gguf"]:
                 storage_dtype = state_dict_dtype
                 _log = f"{storage_dtype}" + (" (pre-quant)" if state_dict_dtype in ["nf4", "fp4", "gguf"] else "")
@@ -345,26 +369,24 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
                 initial_device = memory_management.unet_initial_load_device(parameters=state_dict_parameters, dtype=computation_dtype)
                 need_manual_cast = False
                 to_args = dict(device=initial_device, dtype=computation_dtype)
-                ops = None
 
                 with no_init_weights():
-                    with using_forge_operations(operations=ops, **to_args, manual_cast_enabled=need_manual_cast, bnb_dtype=storage_dtype):
+                    with using_forge_operations(**to_args, manual_cast_enabled=need_manual_cast, bnb_dtype=storage_dtype):
                         model = model_loader(unet_config)
             else:
                 initial_device = memory_management.unet_initial_load_device(parameters=state_dict_parameters, dtype=storage_dtype)
                 need_manual_cast = storage_dtype != computation_dtype
                 to_args = dict(device=initial_device, dtype=storage_dtype)
-                ops = False if guess.nunchaku else None
 
                 if try_int8:  # int8 matmul
                     extra_dtype = str(guess.__class__.__name__)
-                elif storage_dtype is torch.float8_e4m3fn:  # fp8 matmul
-                    extra_dtype = torch.float8_e4m3fn
+                elif quant_config is not None:
+                    extra_dtype = quant_config
                 else:
                     extra_dtype = None
 
                 with no_init_weights():
-                    with using_forge_operations(operations=ops, **to_args, manual_cast_enabled=need_manual_cast, bnb_dtype=extra_dtype):
+                    with using_forge_operations(**to_args, manual_cast_enabled=need_manual_cast, bnb_dtype=extra_dtype):
                         model = model_loader(unet_config).to(**to_args)
 
             model = pre_func(model)
@@ -640,12 +662,38 @@ def process_anima(dit: dict[str, torch.Tensor], enc: dict[str, torch.Tensor]):
             enc[k] = dit.pop(k)
 
 
-def split_state_dict(sd, additional_state_dicts: list = None):
+def _load_unet(path: os.PathLike):
     import huggingface_guess
 
-    sd, metadata = load_torch_file(sd, return_metadata=True)
+    sd, metadata = load_torch_file(path, return_metadata=True)
+    _prefix = huggingface_guess.unet_prefix_from_state_dict(sd)
+    sd, metadata = convert_quantization(sd, metadata, _prefix)
     sd = preprocess_state_dict(sd)
     guess = huggingface_guess.guess(sd)
+
+    return sd, metadata, guess
+
+
+def _load_diffuser(path: os.PathLike):
+    import huggingface_guess
+
+    sd, metadata = load_torch_file(path, return_metadata=True)
+    _prefix = huggingface_guess.unet_prefix_from_state_dict(sd)
+    sd, metadata = convert_quantization(sd, metadata, _prefix)
+    sd = convert_diffusers_mmdit(sd, "")
+    sd = preprocess_state_dict(sd)
+    guess = huggingface_guess.guess(sd)
+
+    return sd, metadata, guess
+
+
+def split_state_dict(path: os.PathLike, additional_state_dicts: list[os.PathLike] = None):
+    try:
+        sd, metadata, guess = _load_unet(path)
+    except Exception:
+        sd, metadata, guess = _load_diffuser(path)
+    finally:
+        memory_management.soft_empty_cache()
 
     if getattr(guess, "nunchaku", False) and ("Z-Image" in guess.huggingface_repo or "Qwen" in guess.huggingface_repo):
         import json
@@ -662,7 +710,8 @@ def split_state_dict(sd, additional_state_dicts: list = None):
 
     if isinstance(additional_state_dicts, list):
         for asd in additional_state_dicts:
-            _asd = load_torch_file(asd)
+            _asd, _meta = load_torch_file(asd, return_metadata=True)
+            _asd, _ = convert_quantization(_asd, _meta)
             sd = replace_state_dict(sd, _asd, guess, asd)
             del _asd
 
@@ -704,11 +753,8 @@ def split_state_dict(sd, additional_state_dicts: list = None):
 def forge_loader(sd: os.PathLike, additional_state_dicts: list[os.PathLike] = None):
     try:
         state_dicts, estimated_config = split_state_dict(sd, additional_state_dicts=additional_state_dicts)
-    except Exception as e:
-        from modules.errors import display
-
-        display(e, "forge_loader")
-        raise ValueError("Failed to recognize model type!")
+    except Exception:
+        raise ValueError("Failed to recognize model type!") from None
 
     repo_name = estimated_config.huggingface_repo
     if "xl" in repo_name and ("rectified" in str(sd).lower() or "flow" in str(sd).lower()):

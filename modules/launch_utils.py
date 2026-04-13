@@ -110,7 +110,7 @@ def _torch_version() -> tuple[str, str]:
 
     if m is None:
         print("\n\nFailed to parse PyTorch version...")
-        ver = os.environ.get("PYTORCH_VERSION", "2.9.1+cu128")
+        ver = os.environ.get("PYTORCH_VERSION", "2.10.0+cu130")
         print("Assuming: ", ver)
         print('(you can change this with `export PYTORCH_VERSION="..."`)\n\n')
         m = re.search(r"(\d+\.\d+\.\d+)(?:[^+]+)?\+(.+)", ver)
@@ -271,8 +271,6 @@ def run_extensions_installers(settings_file):
                 run_extension_installer(path)
                 startup_timer.record(dirname_extension)
 
-    return
-
 
 re_requirement = re.compile(r"\s*(\S+)\s*==\s*([^\s;]+)\s*")
 
@@ -314,9 +312,9 @@ def requirements_met(requirements_file):
 
 def prepare_environment():
     torch_index_url = os.environ.get("TORCH_INDEX_URL", "https://download.pytorch.org/whl/cu130")
-    torch_command = os.environ.get("TORCH_COMMAND", f"pip install torch==2.10.0+cu130 torchvision==0.25.0+cu130 --extra-index-url {torch_index_url}")
-    xformers_package = os.environ.get("XFORMERS_PACKAGE", f"xformers==0.0.34 --extra-index-url {torch_index_url}")
-    bnb_package = os.environ.get("BNB_PACKAGE", "bitsandbytes==0.49.1")
+    torch_command = os.environ.get("TORCH_COMMAND", f"pip install torch==2.11.0+cu130 torchvision==0.26.0+cu130 --extra-index-url {torch_index_url}")
+    xformers_package = os.environ.get("XFORMERS_PACKAGE", f"xformers==0.0.35 --extra-index-url {torch_index_url}")
+    bnb_package = os.environ.get("BNB_PACKAGE", "bitsandbytes==0.49.2")
 
     packaging_package = os.environ.get("PACKAGING_PACKAGE", "packaging==26.0")
     gradio_package = os.environ.get("GRADIO_PACKAGE", "gradio==4.40.0 gradio_rangeslider==0.0.8")
@@ -344,11 +342,19 @@ def prepare_environment():
         startup_timer.record("install torch")
 
     if not args.skip_torch_cuda_test:
-        success, err = check_run_python("import torch; assert torch.cuda.is_available()", return_error=True)
+        TORCH_CHECK: str = """
+import torch
+cuda = hasattr(torch, "cuda") and torch.cuda.is_available()
+xpu = hasattr(torch, "xpu") and torch.xpu.is_available()
+mps = hasattr(torch, "mps") and torch.mps.is_available()
+assert cuda or xpu or mps
+        """
+
+        success, err = check_run_python(TORCH_CHECK, return_error=True)
         if not success:
             if "older driver" in str(err).lower():
                 raise SystemError("Please update your GPU driver to support cu130 ; or manually install older PyTorch")
-            raise RuntimeError("PyTorch is not able to access CUDA")
+            raise RuntimeError("PyTorch is not able to access GPU")
         startup_timer.record("torch GPU test")
 
     if not is_installed("packaging"):
@@ -364,16 +370,16 @@ def prepare_environment():
     v_CUDA = f"{ver_CUDA[0:-1]}.{ver_CUDA[-1]}"
 
     if os.name == "nt":
-        ver_TRITON += ".post25"
+        ver_TRITON += ".post26"
 
         sage_package = os.environ.get("SAGE_PACKAGE", f"https://github.com/woct0rdho/SageAttention/releases/download/v{ver_SAGE}-windows.post4/sageattention-{ver_SAGE}+{ver_CUDA}torch2.9.0andhigher.post4-cp39-abi3-win_amd64.whl")
-        flash_package = os.environ.get("FLASH_PACKAGE", f"https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.13/flash_attn-{ver_FLASH}+{ver_CUDA}torch{v_TORCH}-{ver_PY}-{ver_PY}-win_amd64.whl")
+        flash_package = os.environ.get("FLASH_PACKAGE", f"https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.9.6/flash_attn-{ver_FLASH}+{ver_CUDA}torch{v_TORCH}-{ver_PY}-{ver_PY}-win_amd64.whl")
         triton_package = os.environ.get("TRITION_PACKAGE", f"triton-windows=={ver_TRITON}")
         nunchaku_package = os.environ.get("NUNCHAKU_PACKAGE", f"https://github.com/nunchaku-ai/nunchaku/releases/download/v{ver_NUNCHAKU}/nunchaku-{ver_NUNCHAKU}+{v_CUDA}torch{v_TORCH}-{ver_PY}-{ver_PY}-win_amd64.whl")
 
     else:
         sage_package = os.environ.get("SAGE_PACKAGE", f"sageattention=={ver_SAGE}")
-        flash_package = os.environ.get("FLASH_PACKAGE", f"https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.16/flash_attn-{ver_FLASH}+{ver_CUDA}torch{v_TORCH}-{ver_PY}-{ver_PY}-linux_x86_64.whl")
+        flash_package = os.environ.get("FLASH_PACKAGE", f"https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.9.4/flash_attn-{ver_FLASH}+{ver_CUDA}torch{v_TORCH}-{ver_PY}-{ver_PY}-linux_x86_64.whl")
         triton_package = os.environ.get("TRITION_PACKAGE", f"triton=={ver_TRITON}")
         nunchaku_package = os.environ.get("NUNCHAKU_PACKAGE", f"https://github.com/nunchaku-ai/nunchaku/releases/download/v{ver_NUNCHAKU}/nunchaku-{ver_NUNCHAKU}+{v_CUDA}torch{v_TORCH}-{ver_PY}-{ver_PY}-linux_x86_64.whl")
 
@@ -451,7 +457,7 @@ def prepare_environment():
 
     if args.onnxruntime_gpu and not is_installed("onnxruntime-gpu"):
         # https://onnxruntime.ai/docs/install/#nightly-for-cuda-13x
-        _deps = "flatbuffers numpy packaging protobuf sympy coloredlogs"
+        _deps = "coloredlogs flatbuffers numpy packaging protobuf sympy"
         onnxruntime_package = os.environ.get("ONNX_PACKAGE", "onnxruntime-gpu --pre --index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/ort-cuda-13-nightly/pypi/simple/")
         run_pip(f"install {_deps}", "onnxruntime dependencies")
         run_pip(f"install {onnxruntime_package}", "onnxruntime-gpu")

@@ -16,14 +16,21 @@ def install_requirements(req_file):
                 if not launch.is_installed(package):
                     launch.run_pip(
                         f"install {package}",
-                        f"Legacy Preprocessor Requirement: {package}",
+                        f"{package} (for ControlNet Preprocessor)",
                     )
             except Exception as e:
-                display(e, "cnet req")
                 print(f"Failed to install {package}, some Preprocessors may not work...")
+                display(e, f"cnet-{package}")
 
 
 install_requirements(main_req_file)
+
+if not launch.is_installed("insightface"):
+    try:
+        launch.run_pip("install insightface", "insightface (for ControlNet Preprocessor)")
+    except Exception as e:
+        print("Failed to install insightface; Please manually install it")
+        display(e, "cnet-insightface")
 
 
 def try_install_from_wheel(pkg_name: str, wheel_url: str):
@@ -33,11 +40,11 @@ def try_install_from_wheel(pkg_name: str, wheel_url: str):
     try:
         launch.run_pip(
             f"install {wheel_url}",
-            f"Legacy Preprocessor Requirement: {pkg_name}",
+            f"{pkg_name} (for ControlNet Preprocessor)",
         )
     except Exception as e:
-        display(e, "cnet req")
         print(f"Failed to install {pkg_name}, some Preprocessors may not work...")
+        display(e, f"cnet-{pkg_name}")
 
 
 try_install_from_wheel(

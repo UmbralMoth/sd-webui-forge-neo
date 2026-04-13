@@ -57,7 +57,7 @@ class BASE:
         return {}
 
     def inpaint_model(self):
-        return self.unet_config.get("in_channels", -1) > 4
+        return False
 
     def __init__(self, unet_config):
         self.unet_config = unet_config.copy()
@@ -114,6 +114,9 @@ class SD15(BASE):
 
     latent_format = latent.SD15
     memory_usage_factor = 1.0
+
+    def inpaint_model(self):
+        return self.unet_config.get("in_channels", -1) > 4
 
     def process_clip_state_dict(self, state_dict):
         k = list(state_dict.keys())
@@ -179,6 +182,7 @@ class SDXL(BASE):
 
     unet_config = {
         "model_channels": 320,
+        "out_channels": 4,
         "use_linear_in_transformer": True,
         "transformer_depth": [0, 0, 2, 2, 10, 10],
         "context_dim": 2048,
@@ -188,6 +192,9 @@ class SDXL(BASE):
 
     latent_format = latent.SDXL
     memory_usage_factor = 0.8
+
+    def inpaint_model(self):
+        return self.unet_config.get("in_channels", -1) > 4
 
     def model_type(self, state_dict: dict):
         if "v_pred" in state_dict:
@@ -254,6 +261,22 @@ class SDXLRF(SDXL):
     def model_type(self, state_dict: dict):
         return ModelType.FLOW
 
+
+class Mugen(SDXL):
+    huggingface_repo = "CabalResearch/Mugen"
+
+    unet_config = dict(SDXL.unet_config, out_channels=32)
+
+    sampling_settings = {
+        "shift": 12.0,
+    }
+
+    latent_format = latent.SDXL_Flux2
+
+    vae_key_prefix = ["vae.", "first_stage_model."]
+
+    def inpaint_model(self):
+        return False
 
 class Flux(BASE):
     huggingface_repo = "black-forest-labs/FLUX.1-dev"
@@ -567,43 +590,14 @@ class QwenImage(BASE):
             return {"qwen25_7b": "text_encoder"}
 
 
-class Anima(BASE):
-    huggingface_repo = "circlestone-labs/Anima"
 
-    unet_config = {
-        "image_model": "anima",
-    }
-
-    sampling_settings = {
-        "multiplier": 1.0,
-        "shift": 3.0,
-    }
-
-    unet_extra_config = {}
-    latent_format = latent.Wan21
-
-    memory_usage_factor = 1.0
-    supported_inference_dtypes = [torch.bfloat16, torch.float16, torch.float32]
-
-    vae_key_prefix = ["vae."]
-    text_encoder_key_prefix = ["text_encoders."]
-
-    unet_target = "transformer"
-
-    def model_type(self, state_dict):
-        return ModelType.FLOW
-
-    def clip_target(self, state_dict: dict):
-        pref = self.text_encoder_key_prefix[0]
-        if "{}qwen3_06b.transformer.model.embed_tokens.weight".format(pref) in state_dict:
-            return {"qwen3_06b.transformer": "text_encoder"}
-        return {"qwen3_06b": "text_encoder"}
 
 
 models = [
     SD15,
     SDXLRF,
     SDXL,
+    Mugen,
     SDXLRefiner,
     Flux,
     FluxSchnell,
@@ -616,5 +610,4 @@ models = [
     WAN21_T2V,
     WAN21_I2V,
     QwenImage,
-    Anima,
 ]

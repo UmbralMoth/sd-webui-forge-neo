@@ -36,6 +36,7 @@ import torch
 
 from backend.args import args
 from backend.logging import setup_logger
+from backend.quant_ops import QuantizedTensor
 
 if TYPE_CHECKING:
     from backend.patcher.base import ModelPatcher
@@ -111,7 +112,10 @@ if args.directml is not None:
 
 try:
     import intel_extension_for_pytorch as ipex  # noqa: F401
+except Exception:
+    ipex = None
 
+try:
     _ = torch.xpu.device_count()
     xpu_available = torch.xpu.is_available()
 except Exception:
@@ -473,7 +477,7 @@ class LoadedModel:
 
         real_model = self.model.model
 
-        if is_intel_xpu() and not args.disable_ipex_optimize and "ipex" in globals() and real_model is not None:
+        if is_intel_xpu() and not args.disable_ipex_optimize and ipex is not None and real_model is not None:
             with torch.no_grad():
                 real_model = ipex.optimize(real_model.eval(), inplace=True, graph_mode=True, concat_linear=True)
 
@@ -481,8 +485,6 @@ class LoadedModel:
             signal_empty_cache = True
 
         bake_gguf_model(real_model)
-
-        self.model.refresh_loras()
 
         self.real_model = weakref.ref(real_model)
         self.model_finalizer = weakref.finalize(real_model, cleanup_models)
@@ -1003,14 +1005,18 @@ def device_supports_non_blocking(device: torch.device) -> bool:
     return True
 
 
-def cast_to(weight: torch.Tensor, dtype: torch.dtype = None, device: torch.device = None, non_blocking: bool = False, copy: bool = False, context=nullcontext()):
+def cast_to(weight: torch.nn.Parameter, dtype: torch.dtype = None, device: torch.device = None, non_blocking: bool = False, copy: bool = False, *, context=None):
     if device is None or weight.device == device:
         if not copy and (dtype is None or weight.dtype == dtype):
             return weight
-        with context:
+        with context or nullcontext():
             return weight.to(dtype=dtype, copy=copy)
 
-    with context:
+    if type(weight) not in (torch.Tensor, torch.nn.Parameter, QuantizedTensor):  # GGUF / BnB
+        with context or nullcontext():
+            return weight.to(dtype=dtype, device=device, non_blocking=non_blocking, copy=copy)
+
+    with context or nullcontext():
         r = torch.empty_like(weight, dtype=dtype, device=device)
         r.copy_(weight, non_blocking=non_blocking)
         return r
@@ -1273,12 +1279,37 @@ def supports_fp8_compute(device: torch.device = None) -> bool:
     if props.minor < 9:
         return False
 
+    if torch_version_numeric < (2, 3):
+        return False
+
     if WINDOWS:
         if torch_version_numeric < (2, 4):
             return False
-    else:
-        if torch_version_numeric < (2, 3):
-            return False
+
+    return True
+
+
+def supports_nvfp4_compute(device: torch.device = None) -> bool:
+    if not is_nvidia():
+        return False
+
+    props = torch.cuda.get_device_properties(device)
+    if props.major < 10:
+        return False
+
+    return True
+
+
+def supports_mxfp8_compute(device: torch.device = None) -> bool:
+    if not is_nvidia():
+        return False
+
+    if torch_version_numeric < (2, 10):
+        return False
+
+    props = torch.cuda.get_device_properties(device)
+    if props.major < 10:
+        return False
 
     return True
 
