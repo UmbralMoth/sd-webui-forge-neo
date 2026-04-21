@@ -86,15 +86,6 @@ class SemanticShiftingForForge(scripts.Script):
         # We append the user's base prompt to force the Text Encoder's 
         # self-attention layers to contextualize the quality tags against the actual subject.
         base_prompt = getattr(p, "prompt", "")
-        contextualized_pos_prompt = f"{pos_prompt}, {base_prompt}" if base_prompt else pos_prompt
-        contextualized_neg_prompt = f"{neg_prompt}, {base_prompt}" if base_prompt else neg_prompt
-
-        pos_tensor = encode_string(p.sd_model, contextualized_pos_prompt)
-        neg_tensor = encode_string(p.sd_model, contextualized_neg_prompt)
-
-        if pos_tensor is None or neg_tensor is None:
-            print("[Semantic Shifting] Error encoding prompts. Skipping modulation.")
-            return
 
         def get_active_mean(tensor):
             t = tensor[0] if tensor.ndim == 3 else tensor
@@ -122,11 +113,38 @@ class SemanticShiftingForForge(scripts.Script):
             active_tokens = t[active_mask]
             return active_tokens.mean(dim=0) if active_tokens.shape[0] > 0 else t.mean(dim=0)
 
-        pos_mean = get_active_mean(pos_tensor)
-        neg_mean = get_active_mean(neg_tensor)
+        from modules import prompt_parser
+        steps = getattr(p, "steps", 20)
         
-        # Cache the vector on the processing object so the step-hook can grab it instantly
-        p.semantic_shifting_quality_vec = (pos_mean - neg_mean).detach()
+        try:
+            schedules = prompt_parser.get_learned_conditioning_prompt_schedules([base_prompt], steps)[0]
+        except Exception as e:
+            print(f"[Semantic Shifting] Error parsing prompt schedule: {e}")
+            schedules = [[steps, base_prompt]]
+
+        quality_vec_schedule = []
+        for end_step, prompt_str in schedules:
+            # Reconstruct the contextualized prompts for each step in the schedule
+            contextualized_pos_prompt = f"{pos_prompt}, {prompt_str}" if prompt_str else pos_prompt
+            contextualized_neg_prompt = f"{neg_prompt}, {prompt_str}" if prompt_str else neg_prompt
+
+            pos_tensor = encode_string(p.sd_model, contextualized_pos_prompt)
+            neg_tensor = encode_string(p.sd_model, contextualized_neg_prompt)
+
+            if pos_tensor is None or neg_tensor is None:
+                continue
+
+            pos_mean = get_active_mean(pos_tensor)
+            neg_mean = get_active_mean(neg_tensor)
+            
+            quality_vec_schedule.append((end_step, (pos_mean - neg_mean).detach()))
+
+        if not quality_vec_schedule:
+            print("[Semantic Shifting] Error encoding prompts. Skipping modulation.")
+            return
+
+        # Cache the schedule of vectors on the processing object so the step-hook can grab them instantly
+        p.semantic_shifting_quality_schedule = quality_vec_schedule
 
 
     # --- Wrapper Hook: Now lightweight and fast ---
@@ -134,16 +152,25 @@ class SemanticShiftingForForge(scripts.Script):
         if not enable or weight <= 0:
             return
 
-        quality_vec = getattr(p, "semantic_shifting_quality_vec", None)
+        quality_schedule = getattr(p, "semantic_shifting_quality_schedule", None)
         unet = p.sd_model.forge_objects.unet
 
-        if quality_vec is None or unet is None:
+        if not quality_schedule or unet is None:
             return
 
-        # Ensure vector is on the correct UNet device initially
-        quality_vec = quality_vec.to(unet.current_device)
-
         def semantic_shifting_wrapper(model_function, kwargs):
+            from modules import shared
+            current_step = getattr(shared.state, "sampling_step", 0) + 1
+            
+            quality_vec = quality_schedule[-1][1]
+            for end_step, q_vec in quality_schedule:
+                if current_step <= end_step:
+                    quality_vec = q_vec
+                    break
+            
+            # Ensure vector is on the correct UNet device for this step
+            quality_vec = quality_vec.to(unet.current_device)
+
             c_kwargs = kwargs.get("c", {}).copy()
             c_crossattn = c_kwargs.get("c_crossattn", None)
 
