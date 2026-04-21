@@ -82,8 +82,15 @@ class SemanticShiftingForForge(scripts.Script):
             print("[Semantic Shifting] Error: Model does not have a properly initialized Text Encoder.")
             return
 
-        pos_tensor = encode_string(p.sd_model, pos_prompt)
-        neg_tensor = encode_string(p.sd_model, neg_prompt)
+        # Contextualized Delta Vector Implementation:
+        # We append the user's base prompt to force the Text Encoder's 
+        # self-attention layers to contextualize the quality tags against the actual subject.
+        base_prompt = getattr(p, "prompt", "")
+        contextualized_pos_prompt = f"{pos_prompt}, {base_prompt}" if base_prompt else pos_prompt
+        contextualized_neg_prompt = f"{neg_prompt}, {base_prompt}" if base_prompt else neg_prompt
+
+        pos_tensor = encode_string(p.sd_model, contextualized_pos_prompt)
+        neg_tensor = encode_string(p.sd_model, contextualized_neg_prompt)
 
         if pos_tensor is None or neg_tensor is None:
             print("[Semantic Shifting] Error encoding prompts. Skipping modulation.")
