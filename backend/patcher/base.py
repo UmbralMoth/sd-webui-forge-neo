@@ -256,7 +256,7 @@ class ModelPatcher:
             if len(self.patches) != len(clone.patches):
                 logger.warning("something went wrong, same patch uuid but different length of patches...")
             else:
-                if self.lora_patches.keys() == clone.lora_patches.keys():
+                if self.patches.keys() == clone.patches.keys():
                     return True
         
         return False

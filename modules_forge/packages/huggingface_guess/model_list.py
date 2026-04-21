@@ -496,7 +496,7 @@ class Anima(BASE):
     unet_extra_config = {}
     latent_format = latent.QwenImage
 
-    memory_usage_factor = 1.32
+    memory_usage_factor = 1.0
     supported_inference_dtypes = [torch.bfloat16, torch.float16, torch.float32]
 
     vae_key_prefix = ["vae."]
