@@ -512,14 +512,21 @@ class LoadedModel:
         return self.model.partially_load(self.device, extra_memory, force_patch_weights=force_patch_weights)
 
     def __eq__(self, other):
-        return self.model is other.model
+        # Compare underlying nn.Module, not ModelPatcher identity.
+        # This ensures cloned patchers (e.g. from LoRA or Semantic Shifting)
+        # correctly match existing loaded models.
+        try:
+            return self.model.model is other.model.model
+        except Exception:
+            return False
 
     def __del__(self):
         if self._patcher_finalizer is not None:
             self._patcher_finalizer.detach()
 
     def is_dead(self):
-        return self.real_model is not None and self.real_model() is not None and self.model is None
+        # True when the patcher has been garbage collected
+        return self._model is None or self._model() is None
 
 
 def use_more_memory(extra_memory, loaded_models, device):
@@ -669,15 +676,18 @@ def load_models_gpu(models: list["ModelPatcher"], memory_required: float = 0, fo
         total_memory_required[loaded_model.device] = total_memory_required.get(loaded_model.device, 0) + loaded_model.model_memory_required(loaded_model.device)
 
     for device in total_memory_required:
-        if device != torch.device("cpu"):
-            free_memory(total_memory_required[device] * 1.1 + extra_mem, device, keep_loaded=models_to_load)
+        if device != torch.device("cpu") and total_memory_required[device] > 0:
+            # Only request inference overhead from free_memory.
+            # Model weights are allocated by the lowvram partial-load budget,
+            # which gracefully handles partial loading when VRAM is tight.
+            free_memory(extra_mem, device, keep_loaded=models_to_load)
 
     for device in total_memory_required:
-        if device != torch.device("cpu"):
+        if device != torch.device("cpu") and total_memory_required[device] > 0:
             free_mem = get_free_memory(device)
             if free_mem < minimum_memory_required:
                 models_l = free_memory(minimum_memory_required, device, keep_loaded=models_to_load)
-                logger.debug("{} models unloaded.".format(len(models_l)))
+                logger.info("{} models unloaded.".format(len(models_l)))
 
     for loaded_model in models_to_load:
         model = loaded_model.model
@@ -700,11 +710,18 @@ def load_models_gpu(models: list["ModelPatcher"], memory_required: float = 0, fo
         if vram_set_state is VRAMState.NO_VRAM:
             lowvram_model_memory = 0.1
 
-        loaded_model.model_load(lowvram_model_memory, force_patch_weights=force_patch_weights)
+        # Skip expensive model_load if already loaded and no re-patching needed
+        already_loaded = loaded_model in current_loaded_models
+        if not already_loaded or force_patch_weights or loaded_model.should_reload_model(force_patch_weights):
+            loaded_model.model_load(lowvram_model_memory, force_patch_weights=force_patch_weights)
+
+        # MRU reordering: move to front, avoiding duplicates
+        if already_loaded:
+            current_loaded_models.remove(loaded_model)
         current_loaded_models.insert(0, loaded_model)
 
     if (moving_time := time.perf_counter() - execution_start_time) > 0.1:
-        logger.info(f"Moving model(s) has taken {moving_time:.2f} seconds")
+        logger.info(f"Moving model(s) has taken {moving_time:.2f} seconds [Total Loaded: {len(current_loaded_models)}]")
 
 
 def load_model_gpu(model: "ModelPatcher"):
@@ -728,11 +745,19 @@ def cleanup_models_gc(*, target: list["ModelPatcher"] = []):
         cur = current_loaded_models[i]
         if not cur.is_dead():
             continue
-        if any(mdl.model is cur.real_model() for mdl in target):
+        # Model's patcher has been GC'd — check if any target shares the real model
+        if cur.real_model is not None and any(mdl.model is cur.real_model() for mdl in target):
             _del.append(i)
             break
 
-        logger.info("Potential memory leak detected with model {}...".format(cur.real_model().__class__.__name__))
+        if cur.real_model is not None:
+            try:
+                name = cur.real_model().__class__.__name__
+            except Exception:
+                name = "<unknown>"
+        else:
+            name = "<freed>"
+        logger.info("Potential memory leak detected with model {}...".format(name))
         _gc = True
 
     if not _gc and len(_del) == 0:
@@ -747,13 +772,20 @@ def cleanup_models_gc(*, target: list["ModelPatcher"] = []):
 
     for mdl in current_loaded_models:
         if mdl.is_dead():
-            logger.warning("Memory Leak with model {} !".format(mdl.real_model().__class__.__name__))
+            if mdl.real_model is not None:
+                try:
+                    name = mdl.real_model().__class__.__name__
+                except Exception:
+                    name = "<unknown>"
+            else:
+                name = "<freed>"
+            logger.warning("Memory Leak with model {} !".format(name))
 
 
 def cleanup_models():
     to_delete = []
     for i in range(len(current_loaded_models)):
-        if current_loaded_models[i].real_model() is None:
+        if current_loaded_models[i].is_dead() or (current_loaded_models[i].real_model is not None and current_loaded_models[i].real_model() is None):
             to_delete = [i] + to_delete
 
     for i in to_delete:
