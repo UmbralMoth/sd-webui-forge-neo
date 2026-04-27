@@ -62,52 +62,14 @@ def _unwrap_cond(c):
     return cross, pool
 
 
-def batch_encode(sd_model, prompts):
-    """Encodes list of prompts; handles batched dict/tensor/list returns."""
-    if not prompts: return []
-    with torch.no_grad():
-        try:
-            raw = sd_model.get_learned_conditioning(prompts)
-        except Exception as exc:
-            logger.error(f"Encoding error: {exc}")
-            return [(None, None)] * len(prompts)
-
-    results = []
-
-    # Case 1: Batched Dict (Flux/SDXL)
-    if isinstance(raw, dict):
-        cross = _get_cond(raw, ("crossattn", "cross_attn", "c_crossattn"))
-        pool  = _get_cond(raw, ("vector", "pooled_output", "y"))
-
-        if isinstance(cross, torch.Tensor) and cross.ndim == 3 and cross.shape[0] == len(prompts):
-            for i in range(len(prompts)):
-                p_i = pool[i] if (isinstance(pool, torch.Tensor) and pool.ndim >= 2 and pool.shape[0] == len(prompts)) else pool
-                results.append((cross[i], p_i))
-            return results
-        results.append(_unwrap_cond(raw))
-        return results
-
-    # Case 2: Batched Tensor (Anima/Qwen)
-    if isinstance(raw, torch.Tensor) and raw.ndim == 3 and raw.shape[0] == len(prompts):
-        for i in range(len(prompts)):
-            results.append((raw[i], None))
-        return results
-
-    # Case 3: List of conditionings (Legacy)
-    if not isinstance(raw, list): raw = [raw]
-    for item in raw:
-        results.append(_unwrap_cond(item))
-    return results
-
-
 def get_active_len(tensor, sd_model=None):
     """Detects content length by diffing against empty-string encoding or tail padding."""
     if tensor is None: return 77
     if sd_model:
         try:
-            pad_enc = batch_encode(sd_model, [""])
-            if pad_enc and pad_enc[0][0] is not None:
-                pad = pad_enc[0][0]
+            pad_cond = prompt_parser.get_learned_conditioning(sd_model, [""], 1)[0][0].cond
+            pad, _ = _unwrap_cond(pad_cond)
+            if pad is not None:
                 T = min(tensor.shape[0], pad.shape[0])
                 for i in range(T - 1, 0, -1):
                     if not torch.allclose(tensor[i], pad[i], atol=1e-4): return i + 1
@@ -207,33 +169,24 @@ class OrthogonalConditioningSteering(scripts.Script):
         if not enable or (w_cross <= 0 and w_pool <= 0): return
         p.extra_generation_params.update({"OCS Enable": True, "OCS Pos": pos_tags, "OCS Neg": neg_tags, "OCS CW": w_cross, "OCS PW": w_pool, "OCS Perp": use_perp, "OCS Uncond": steer_un})
 
-        # ── 1. Resolve Schedules ──────────────────────────────────────────────
+        # ── 1. Resolve Schedules & Encode ─────────────────────────────────────
         steps = p.steps
-        pos_sched  = prompt_parser.get_learned_conditioning_prompt_schedules([pos_tags], steps)[0]
-        neg_sched  = prompt_parser.get_learned_conditioning_prompt_schedules([neg_tags], steps)[0]
-        base_sched = prompt_parser.get_learned_conditioning_prompt_schedules([p.all_prompts[0] if p.all_prompts else p.prompt], steps)[0]
-
-        # Collect unique texts for batch encoding
-        unique_texts = set()
-        for _, t in pos_sched:  unique_texts.add(t)
-        for _, t in neg_sched:  unique_texts.add(t)
-        if use_perp or use_norm:
-            for _, t in base_sched: unique_texts.add(t)
+        base_prompt = p.all_prompts[0] if p.all_prompts else p.prompt
         
-        text_list = list(unique_texts)
-        logger.debug(f"Encoding {len(text_list)} unique schedule segments...")
-        enc_results = batch_encode(p.sd_model, text_list)
-        text_map = {txt: res for txt, res in zip(text_list, enc_results)}
-
+        try:
+            conds = prompt_parser.get_learned_conditioning(p.sd_model, [pos_tags, neg_tags, base_prompt], steps)
+            pos_cond_raw = conds[0][0].cond
+            neg_cond_raw = conds[1][0].cond
+            base_cond_raw = conds[2][0].cond
+        except Exception as exc:
+            logger.error(f"Encoding error: {exc}")
+            return
+            
+        pos_cross, pos_pool = _unwrap_cond(pos_cond_raw)
+        neg_cross, neg_pool = _unwrap_cond(neg_cond_raw)
+        base_cross, base_pool = _unwrap_cond(base_cond_raw)
+        
         # ── 2. Pre-calculate Velocity ─────────────────────────────────────────
-        # Prompt scheduling is not supported yet, taking first step
-        pt = pos_sched[0][1] if pos_sched else pos_tags
-        nt = neg_sched[0][1] if neg_sched else neg_tags
-        bt = base_sched[0][1] if base_sched else (p.all_prompts[0] if p.all_prompts else p.prompt)
-        
-        pos_cross, pos_pool = text_map.get(pt, (None, None))
-        neg_cross, neg_pool = text_map.get(nt, (None, None))
-        base_cross, base_pool = text_map.get(bt, (None, None))
         
         v_m, v_p, base_len = None, None, 77
         
