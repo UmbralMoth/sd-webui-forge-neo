@@ -21,19 +21,32 @@ setup_logger(logger)
 # Encoding
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _get_cond(d, keys):
+    if not isinstance(d, dict): return None
+    for k in keys:
+        if k in d and d[k] is not None:
+            return d[k]
+    return None
+
 def _unwrap_cond(c):
     """Extracts (cross [T, D], pool [D]) from Forge/Comfy dict/list/tensor."""
     cross, pool = None, None
 
     if isinstance(c, dict):
-        cross = c.get("crossattn") or c.get("cross_attn") or c.get("c_crossattn")
-        pool  = c.get("vector")    or c.get("pooled_output") or c.get("y")
+        cross = _get_cond(c, ("crossattn", "cross_attn", "c_crossattn"))
+        pool  = _get_cond(c, ("vector", "pooled_output", "y"))
 
-    elif isinstance(c, list) and c:
+    elif isinstance(c, (list, tuple)) and c:
         first = c[0]
-        if isinstance(first, dict):
-            cross = first.get("crossattn") or first.get("cross_attn") or first.get("c_crossattn")
-            pool  = first.get("vector")    or first.get("pooled_output") or first.get("y")
+        if isinstance(first, (list, tuple)) and len(first) == 2:
+            tensor_part, extra_part = first
+            if isinstance(tensor_part, torch.Tensor):
+                cross = tensor_part
+            if isinstance(extra_part, dict):
+                pool = _get_cond(extra_part, ("pooled_output", "vector", "y"))
+        elif isinstance(first, dict):
+            cross = _get_cond(first, ("crossattn", "cross_attn", "c_crossattn"))
+            pool  = _get_cond(first, ("vector", "pooled_output", "y"))
         elif isinstance(first, torch.Tensor):
             cross = first
 
@@ -63,8 +76,8 @@ def batch_encode(sd_model, prompts):
 
     # Case 1: Batched Dict (Flux/SDXL)
     if isinstance(raw, dict):
-        cross = raw.get("crossattn") or raw.get("cross_attn") or raw.get("c_crossattn")
-        pool  = raw.get("vector")    or raw.get("pooled_output") or raw.get("y")
+        cross = _get_cond(raw, ("crossattn", "cross_attn", "c_crossattn"))
+        pool  = _get_cond(raw, ("vector", "pooled_output", "y"))
 
         if isinstance(cross, torch.Tensor) and cross.ndim == 3 and cross.shape[0] == len(prompts):
             for i in range(len(prompts)):
@@ -106,6 +119,28 @@ def get_active_len(tensor, sd_model=None):
     return max(2, tensor.shape[0])
 
 
+def _is_vpred(sd_model):
+    """Check if the active model uses v-parameterization."""
+    candidates = [sd_model]
+    obj = sd_model
+    for _ in range(4):
+        inner = getattr(obj, "inner_model", None)
+        if inner is None:
+            break
+        candidates.append(inner)
+        obj = inner
+    for m in candidates:
+        if getattr(m, "parameterization", None) == "v":
+            return True
+        model_attr = getattr(m, "model", None)
+        if model_attr and getattr(model_attr, "parameterization", None) == "v":
+            return True
+    return False
+
+
+
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Vector Math
 # ══════════════════════════════════════════════════════════════════════════════
@@ -136,16 +171,10 @@ def compute_steering_vectors(pos_cross, neg_cross, pos_pool, neg_pool, pos_len, 
     if pos_pool is not None and neg_pool is not None:
         v_pool = pos_pool - neg_pool
         if use_perp and base_pool is not None:
-            v_pool = perp_reject(v_pool, base_pool)
+            basis_unit = base_pool / (torch.linalg.vector_norm(base_pool).clamp(min=1e-12))
+            v_pool = perp_reject(v_pool, basis_unit)
 
     return v_mean, v_pool
-
-
-def adaptive_norm(v, ref_norms, scale):
-    """Rescales v to target magnitude: scale * mean(ref_norms)."""
-    target = ref_norms.mean().item() * scale
-    v_mag  = torch.linalg.vector_norm(v).clamp(min=1e-12)
-    return v * (target / v_mag)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -170,17 +199,13 @@ class OrthogonalConditioningSteering(scripts.Script):
             with gr.Row():
                 use_perp = gr.Checkbox(True, label="Perpendicular Projection", info="Removes subject-parallel components.", elem_id=f"{px}_ocs_perp")
                 steer_un = gr.Checkbox(False, label="Steer Unconditional (Push-Pull)", info="Applies opposite push to Uncond.", elem_id=f"{px}_ocs_un")
-            with gr.Row():
-                use_norm = gr.Checkbox(False, label="Adaptive Normalization", elem_id=f"{px}_ocs_norm")
-                n_scale  = gr.Slider(0.01, 1.0, 0.15, step=0.01, label="Norm Scale", visible=False, elem_id=f"{px}_ocs_nscale")
-            use_norm.change(fn=lambda x: gr.update(visible=x), inputs=[use_norm], outputs=[n_scale])
 
-        self.infotext_fields = [(enable, "OCS Enable"), (pos_tags, "OCS Pos"), (neg_tags, "OCS Neg"), (w_cross, "OCS CW"), (w_pool, "OCS PW"), (use_perp, "OCS Perp"), (steer_un, "OCS Uncond"), (use_norm, "OCS Norm"), (n_scale, "OCS NScale")]
-        return [enable, pos_tags, neg_tags, w_cross, w_pool, use_perp, steer_un, use_norm, n_scale]
+        self.infotext_fields = [(enable, "OCS Enable"), (pos_tags, "OCS Pos"), (neg_tags, "OCS Neg"), (w_cross, "OCS CW"), (w_pool, "OCS PW"), (use_perp, "OCS Perp"), (steer_un, "OCS Uncond")]
+        return [enable, pos_tags, neg_tags, w_cross, w_pool, use_perp, steer_un]
 
-    def process(self, p, enable, pos_tags, neg_tags, w_cross, w_pool, use_perp, steer_un, use_norm, n_scale):
+    def process(self, p, enable, pos_tags, neg_tags, w_cross, w_pool, use_perp, steer_un):
         if not enable or (w_cross <= 0 and w_pool <= 0): return
-        p.extra_generation_params.update({"OCS Enable": True, "OCS Pos": pos_tags, "OCS Neg": neg_tags, "OCS CW": w_cross, "OCS PW": w_pool, "OCS Perp": use_perp, "OCS Uncond": steer_un, "OCS Norm": use_norm, "OCS NScale": n_scale if use_norm else "—"})
+        p.extra_generation_params.update({"OCS Enable": True, "OCS Pos": pos_tags, "OCS Neg": neg_tags, "OCS CW": w_cross, "OCS PW": w_pool, "OCS Perp": use_perp, "OCS Uncond": steer_un})
 
         # ── 1. Resolve Schedules ──────────────────────────────────────────────
         steps = p.steps
@@ -200,37 +225,36 @@ class OrthogonalConditioningSteering(scripts.Script):
         enc_results = batch_encode(p.sd_model, text_list)
         text_map = {txt: res for txt, res in zip(text_list, enc_results)}
 
-        # ── 2. Pre-calculate Velocity Schedule ────────────────────────────────
-        v_schedule = []
+        # ── 2. Pre-calculate Velocity ─────────────────────────────────────────
+        # Prompt scheduling is not supported yet, taking first step
+        pt = pos_sched[0][1] if pos_sched else pos_tags
+        nt = neg_sched[0][1] if neg_sched else neg_tags
+        bt = base_sched[0][1] if base_sched else (p.all_prompts[0] if p.all_prompts else p.prompt)
         
-        def get_at(sched, s):
-            for end_step, txt in sched:
-                if s <= end_step: return txt
-            return sched[-1][1]
+        pos_cross, pos_pool = text_map.get(pt, (None, None))
+        neg_cross, neg_pool = text_map.get(nt, (None, None))
+        base_cross, base_pool = text_map.get(bt, (None, None))
+        
+        v_m, v_p, base_len = None, None, 77
+        
+        if pos_cross is not None and neg_cross is not None:
+            plen = get_active_len(pos_cross, p.sd_model)
+            base_len = get_active_len(base_cross, p.sd_model) if base_cross is not None else 77
 
-        for s in range(1, steps + 1):
-            pt, nt, bt = get_at(pos_sched, s), get_at(neg_sched, s), get_at(base_sched, s)
+            v_m, v_p = compute_steering_vectors(pos_cross, neg_cross, pos_pool, neg_pool, plen, base_cross, base_pool, base_len, use_perp)
             
-            pc, pp = text_map.get(pt, (None, None))
-            nc, np = text_map.get(nt, (None, None))
-            bc, bp = text_map.get(bt, (None, None))
-            
-            if pc is None or nc is None:
-                v_schedule.append(None)
-                continue
-                
-            plen = get_active_len(pc, p.sd_model)
-            blen = get_active_len(bc, p.sd_model) if bc is not None else 77
+            is_vp = _is_vpred(p.sd_model)
+            vpred_pool_dampen = 0.3 if is_vp else 1.0
+            if is_vp:
+                logger.info("V-Pred model detected — dampening pooled vector push (×0.3) to prevent AdaLN saturation.")
 
-            vm, vp = compute_steering_vectors(pc, nc, pp, np, plen, bc, bp, blen, use_perp)
-            
-            if vm is not None and use_norm and bc is not None:
-                vm = adaptive_norm(vm, torch.linalg.vector_norm(bc[1:blen], dim=-1), n_scale)
-                if vp is not None and bp is not None:
-                    vp = adaptive_norm(vp, torch.linalg.vector_norm(bp).unsqueeze(0), n_scale)
+            if v_p is not None:
+                v_p = v_p * vpred_pool_dampen
 
-        logger.debug(f"‖v_m‖={torch.linalg.vector_norm(v_m).item():.4f}, ‖v_p‖={torch.linalg.vector_norm(v_p).item():.4f if v_p is not None else 0}")
-        p.ocs_payload = {"v_m": v_m.detach().cpu(), "v_p": v_p.detach().cpu() if v_p is not None else None, "N": base_len, "wc": w_cross, "wp": w_pool, "sun": steer_un}
+        vm_norm = torch.linalg.vector_norm(v_m).item() if v_m is not None else 0.0
+        vp_norm = torch.linalg.vector_norm(v_p).item() if v_p is not None else 0.0
+        logger.debug(f"‖v_m‖={vm_norm:.4f}, ‖v_p‖={vp_norm:.4f}")
+        p.ocs_payload = {"v_m": v_m.detach().cpu() if v_m is not None else None, "v_p": v_p.detach().cpu() if v_p is not None else None, "N": base_len, "wc": w_cross, "wp": w_pool, "sun": steer_un}
 
         def steering_modifier(model, x, timestep, uncond, cond, cond_scale, model_options, seed):
             payload = getattr(p, "ocs_payload", None)
@@ -267,6 +291,8 @@ class OrthogonalConditioningSteering(scripts.Script):
                 return out
 
             return model, x, timestep, push(uncond, -1.0) if payload["sun"] else uncond, push(cond, 1.0), cond_scale, model_options, seed
+        
+        steering_modifier.__name__ = "ocs_steering_modifier"
 
         unet = p.sd_model.forge_objects.unet
         if unet:
@@ -291,6 +317,6 @@ def _rebuild_conds(nc, keys, tensor):
 
 def _clear_mod(unet):
     if "conditioning_modifiers" in unet.model_options:
-        unet.model_options["conditioning_modifiers"] = [m for m in unet.model_options["conditioning_modifiers"] if getattr(m, "__name__", "") != "steering_modifier"]
+        unet.model_options["conditioning_modifiers"] = [m for m in unet.model_options["conditioning_modifiers"] if getattr(m, "__name__", "") != "ocs_steering_modifier"]
 
 script_callbacks.on_script_unloaded(lambda: None)
