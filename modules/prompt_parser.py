@@ -20,14 +20,15 @@ from modules import shared
 schedule_parser = lark.Lark(
     r"""
 !start: (prompt | /[][():]/+)*
-prompt: (emphasized | scheduled | alternate | plain | WHITESPACE)*
+prompt: (emphasized | scheduled | alternate | blended | plain | WHITESPACE)*
 !emphasized: "(" prompt ")"
         | "(" prompt ":" prompt ")"
         | "[" prompt "]"
 scheduled: "[" [prompt ":"] prompt ":" [WHITESPACE] NUMBER [WHITESPACE] "]"
 alternate: "[" prompt ("|" [prompt])+ "]"
+blended: "[" prompt ("~" [prompt])+ [":" NUMBER] "]"
 WHITESPACE: /\s+/
-plain: /([^\\\[\]():|]|\\.)+/
+plain: /([^\\\[\]():|~]|\\.)+/
 %import common.SIGNED_NUMBER -> NUMBER
 """
 )
@@ -175,20 +176,56 @@ def get_learned_conditioning_prompt_schedules(prompts, base_steps, hires_steps=N
                 else:
                     return eval_topdown(after, step, state) if after else ""
                     
+            elif getattr(node, 'data', None) == 'blended':
+                weight = 0.5
+                prompts = []
+                for c in node.children:
+                    if isinstance(c, lark.Token) and c.type == 'NUMBER':
+                        weight = float(c)
+                    else:
+                        prompts.append(c)
+                
+                if len(prompts) < 2:
+                    return eval_topdown(prompts[0], step, state) if prompts else ""
+                    
+                evaluated_prompts = [eval_topdown(p, step, state) if p else "" for p in prompts]
+                
+                result = evaluated_prompts[-1]
+                for p in reversed(evaluated_prompts[:-1]):
+                    result = LatentBlendNode(p, result, weight)
+                return result
+                
             elif getattr(node, 'data', None) == 'plain':
                 return str(node.children[0].value)
                 
             else:
-                def flatten(x):
-                    if isinstance(x, str):
-                        yield x
-                    elif isinstance(x, tuple) and len(x) == 0:
-                        pass
+                def combine(items):
+                    items = [x for x in items if x != () and x is not None]
+                    if len(items) == 0:
+                        return ""
+                    if len(items) == 1:
+                        return items[0]
+                        
+                    first = items[0]
+                    rest = combine(items[1:])
+                    
+                    if isinstance(first, LatentBlendNode):
+                        return LatentBlendNode(
+                            combine([first.left, rest]),
+                            combine([first.right, rest]),
+                            first.weight
+                        )
+                    elif isinstance(rest, LatentBlendNode):
+                        return LatentBlendNode(
+                            combine([first, rest.left]),
+                            combine([first, rest.right]),
+                            rest.weight
+                        )
                     else:
-                        for gen in x:
-                            yield from flatten(gen)
+                        return str(first) + str(rest)
+                        
                 res = [eval_topdown(c, step, state) for c in node.children if c is not None]
-                return "".join(flatten(res))
+                return combine(res)
 
         ts = collect_steps(steps, tree)
         state_dict = {}
@@ -199,6 +236,16 @@ def get_learned_conditioning_prompt_schedules(prompts, base_steps, hires_steps=N
 
     promptdict = {prompt: get_schedule(prompt) for prompt in set(prompts)}
     return [promptdict[prompt] for prompt in prompts]
+
+
+class LatentBlendNode(str):
+    def __new__(cls, left, right, weight):
+        longest = str(left) if len(str(left)) > len(str(right)) else str(right)
+        obj = str.__new__(cls, longest)
+        obj.left = left
+        obj.right = right
+        obj.weight = float(weight)
+        return obj
 
 
 ScheduledPromptConditioning = namedtuple("ScheduledPromptConditioning", ["end_at_step", "cond"])
@@ -254,16 +301,41 @@ def get_learned_conditioning(model, prompts: SdConditioning | list[str], steps, 
             res.append(cached)
             continue
 
-        texts = SdConditioning([x[1] for x in prompt_schedule], copy_from=prompts)
-        conds = model.get_learned_conditioning(texts)
-
-        cond_schedule = []
-        for i, (end_at_step, _) in enumerate(prompt_schedule):
-            if isinstance(conds, dict):
-                cond = {k: v[i] for k, v in conds.items()}
+        texts_to_encode = []
+        def extract_texts(node):
+            if isinstance(node, LatentBlendNode):
+                extract_texts(node.left)
+                extract_texts(node.right)
             else:
-                cond = conds[i]
-
+                if node not in texts_to_encode:
+                    texts_to_encode.append(node)
+                    
+        for _, text_or_blend in prompt_schedule:
+            extract_texts(text_or_blend)
+            
+        texts_obj = SdConditioning(texts_to_encode, copy_from=prompts)
+        encoded_conds = model.get_learned_conditioning(texts_obj)
+        
+        encoded_list = []
+        for i in range(len(texts_to_encode)):
+            if isinstance(encoded_conds, dict):
+                encoded_list.append({k: v[i] for k, v in encoded_conds.items()})
+            else:
+                encoded_list.append(encoded_conds[i])
+                
+        cond_dict = dict(zip(texts_to_encode, encoded_list))
+        
+        def build_cond(node):
+            if isinstance(node, LatentBlendNode):
+                cond_left = build_cond(node.left)
+                cond_right = build_cond(node.right)
+                return equalized_blend_conds(cond_left, cond_right, node.weight, alpha=1.0)
+            else:
+                return cond_dict[node]
+                
+        cond_schedule = []
+        for end_at_step, text_or_blend in prompt_schedule:
+            cond = build_cond(text_or_blend)
             cond_schedule.append(ScheduledPromptConditioning(end_at_step, cond))
 
         cache[prompt] = cond_schedule
@@ -357,6 +429,52 @@ class DictWithShape(dict):
             if isinstance(self[k], torch.Tensor):
                 result[k] = self[k][item]
         return DictWithShape(result)
+
+
+def _pad_seq(t1, t2):
+    if getattr(t1, 'ndim', 0) < 2 or getattr(t2, 'ndim', 0) < 2: return t1, t2
+    seq_dim = 1 if getattr(t1, 'ndim', 0) == 3 else 0
+    if t1.shape[seq_dim] != t2.shape[seq_dim]:
+        max_len = max(t1.shape[seq_dim], t2.shape[seq_dim])
+        
+        pad_shape1 = list(t1.shape)
+        pad_shape1[seq_dim] = max_len - t1.shape[seq_dim]
+        t1 = torch.cat([t1, torch.zeros(pad_shape1, dtype=t1.dtype, device=t1.device)], dim=seq_dim)
+        
+        pad_shape2 = list(t2.shape)
+        pad_shape2[seq_dim] = max_len - t2.shape[seq_dim]
+        t2 = torch.cat([t2, torch.zeros(pad_shape2, dtype=t2.dtype, device=t2.device)], dim=seq_dim)
+    return t1, t2
+
+def equalized_blend_conds(cond1, cond2, weight, alpha=1.0):
+    if weight <= 0.001: return cond1
+    if weight >= 0.999: return cond2
+        
+    if isinstance(cond1, dict):
+        res = {}
+        for k in cond1.keys():
+            if isinstance(cond1[k], torch.Tensor) and isinstance(cond2[k], torch.Tensor):
+                t1, t2 = _pad_seq(cond1[k], cond2[k])
+                n1 = torch.linalg.vector_norm(t1, dim=-1, keepdim=True)
+                n2 = torch.linalg.vector_norm(t2, dim=-1, keepdim=True)
+                gm = torch.sqrt(n1 * n2).clamp(min=1e-12)
+                t1s = t1 * (torch.lerp(n1, gm, alpha) / n1.clamp(min=1e-12))
+                t2s = t2 * (torch.lerp(n2, gm, alpha) / n2.clamp(min=1e-12))
+                res[k] = t1s * (1.0 - weight) + t2s * weight
+            else:
+                res[k] = cond1[k]
+        if hasattr(cond1, "shape"):
+            return type(cond1)(res, shape=getattr(cond1, 'shape', None))
+        return type(cond1)(res)
+    elif isinstance(cond1, torch.Tensor) and isinstance(cond2, torch.Tensor):
+        t1, t2 = _pad_seq(cond1, cond2)
+        n1 = torch.linalg.vector_norm(t1, dim=-1, keepdim=True)
+        n2 = torch.linalg.vector_norm(t2, dim=-1, keepdim=True)
+        gm = torch.sqrt(n1 * n2).clamp(min=1e-12)
+        t1s = t1 * (torch.lerp(n1, gm, alpha) / n1.clamp(min=1e-12))
+        t2s = t2 * (torch.lerp(n2, gm, alpha) / n2.clamp(min=1e-12))
+        return t1s * (1.0 - weight) + t2s * weight
+    return cond1
 
 
 def blend_conds(cond1, cond2, weight):
