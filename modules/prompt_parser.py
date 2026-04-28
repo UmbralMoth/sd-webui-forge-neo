@@ -458,9 +458,18 @@ def equalized_blend_conds(cond1, cond2, weight, alpha=1.0):
                 n1 = torch.linalg.vector_norm(t1, dim=-1, keepdim=True)
                 n2 = torch.linalg.vector_norm(t2, dim=-1, keepdim=True)
                 gm = torch.sqrt(n1 * n2).clamp(min=1e-12)
-                t1s = t1 * (torch.lerp(n1, gm, alpha) / n1.clamp(min=1e-12))
-                t2s = t2 * (torch.lerp(n2, gm, alpha) / n2.clamp(min=1e-12))
-                res[k] = t1s * (1.0 - weight) + t2s * weight
+                
+                target_n1 = torch.lerp(n1, gm, alpha)
+                target_n2 = torch.lerp(n2, gm, alpha)
+                
+                t1s = t1 * (target_n1 / n1.clamp(min=1e-12))
+                t2s = t2 * (target_n2 / n2.clamp(min=1e-12))
+                
+                blend = t1s * (1.0 - weight) + t2s * weight
+                blend_norm = torch.linalg.vector_norm(blend, dim=-1, keepdim=True)
+                target_norm = target_n1 * (1.0 - weight) + target_n2 * weight
+                
+                res[k] = blend * (target_norm / blend_norm.clamp(min=1e-12))
             else:
                 res[k] = cond1[k]
         if hasattr(cond1, "shape"):
@@ -471,9 +480,18 @@ def equalized_blend_conds(cond1, cond2, weight, alpha=1.0):
         n1 = torch.linalg.vector_norm(t1, dim=-1, keepdim=True)
         n2 = torch.linalg.vector_norm(t2, dim=-1, keepdim=True)
         gm = torch.sqrt(n1 * n2).clamp(min=1e-12)
-        t1s = t1 * (torch.lerp(n1, gm, alpha) / n1.clamp(min=1e-12))
-        t2s = t2 * (torch.lerp(n2, gm, alpha) / n2.clamp(min=1e-12))
-        return t1s * (1.0 - weight) + t2s * weight
+        
+        target_n1 = torch.lerp(n1, gm, alpha)
+        target_n2 = torch.lerp(n2, gm, alpha)
+        
+        t1s = t1 * (target_n1 / n1.clamp(min=1e-12))
+        t2s = t2 * (target_n2 / n2.clamp(min=1e-12))
+        
+        blend = t1s * (1.0 - weight) + t2s * weight
+        blend_norm = torch.linalg.vector_norm(blend, dim=-1, keepdim=True)
+        target_norm = target_n1 * (1.0 - weight) + target_n2 * weight
+        
+        return blend * (target_norm / blend_norm.clamp(min=1e-12))
     return cond1
 
 
@@ -486,14 +504,26 @@ def blend_conds(cond1, cond2, weight):
         res = {}
         for k in cond1.keys():
             if isinstance(cond1[k], torch.Tensor) and isinstance(cond2[k], torch.Tensor):
-                res[k] = cond1[k] * (1.0 - weight) + cond2[k] * weight
+                t1, t2 = _pad_seq(cond1[k], cond2[k])
+                blend = t1 * (1.0 - weight) + t2 * weight
+                n1 = torch.linalg.vector_norm(t1, dim=-1, keepdim=True)
+                n2 = torch.linalg.vector_norm(t2, dim=-1, keepdim=True)
+                blend_norm = torch.linalg.vector_norm(blend, dim=-1, keepdim=True)
+                target_norm = n1 * (1.0 - weight) + n2 * weight
+                res[k] = blend * (target_norm / blend_norm.clamp(min=1e-12))
             else:
                 res[k] = cond1[k]
         if hasattr(cond1, "shape"):
             return type(cond1)(res, shape=getattr(cond1, 'shape', None))
         return type(cond1)(res)
     else:
-        return cond1 * (1.0 - weight) + cond2 * weight
+        t1, t2 = _pad_seq(cond1, cond2)
+        blend = t1 * (1.0 - weight) + t2 * weight
+        n1 = torch.linalg.vector_norm(t1, dim=-1, keepdim=True)
+        n2 = torch.linalg.vector_norm(t2, dim=-1, keepdim=True)
+        blend_norm = torch.linalg.vector_norm(blend, dim=-1, keepdim=True)
+        target_norm = n1 * (1.0 - weight) + n2 * weight
+        return blend * (target_norm / blend_norm.clamp(min=1e-12))
 
 
 def get_continuous_cond(schedules, step_float):
