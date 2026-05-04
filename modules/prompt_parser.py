@@ -115,6 +115,10 @@ def get_learned_conditioning_prompt_schedules(prompts, base_steps, hires_steps=N
                 args = ["" if not arg else arg for arg in args]
                 yield args[(step - 1) % len(args)]
 
+            def blended(self, args):
+                args = ["" if not arg else arg for arg in args if arg is not None and (not isinstance(arg, lark.Token) or arg.type != 'NUMBER')]
+                yield args[0] if args else ""
+
             def start(self, args):
                 def flatten(x):
                     if isinstance(x, str):
@@ -180,6 +184,8 @@ def get_learned_conditioning_prompt_schedules(prompts, base_steps, hires_steps=N
                 weight = 0.5
                 prompts = []
                 for c in node.children:
+                    if c is None:
+                        continue
                     if isinstance(c, lark.Token) and c.type == 'NUMBER':
                         weight = float(c)
                     else:
@@ -445,6 +451,25 @@ def _pad_seq(t1, t2):
         pad_shape2[seq_dim] = max_len - t2.shape[seq_dim]
         t2 = torch.cat([t2, torch.zeros(pad_shape2, dtype=t2.dtype, device=t2.device)], dim=seq_dim)
     return t1, t2
+def slerp_tensor(val: float, low: torch.Tensor, high: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
+    low_n = torch.linalg.vector_norm(low, dim=dim, keepdim=True)
+    high_n = torch.linalg.vector_norm(high, dim=dim, keepdim=True)
+    
+    low_norm = low / low_n.clamp(min=eps)
+    high_norm = high / high_n.clamp(min=eps)
+    
+    dot = (low_norm * high_norm).sum(dim=dim, keepdim=True).clamp(-1 + eps, 1 - eps)
+    omega = torch.acos(dot)
+    so = torch.sin(omega)
+    
+    mask = so.abs() < eps
+    so = torch.where(mask, torch.ones_like(so), so)
+    
+    res_dir = (torch.sin((1.0 - val) * omega) / so) * low_norm + (torch.sin(val * omega) / so) * high_norm
+    res_dir = torch.where(mask, (1.0 - val) * low_norm + val * high_norm, res_dir)
+    
+    target_n = low_n * (1.0 - val) + high_n * val
+    return res_dir * target_n
 
 def equalized_blend_conds(cond1, cond2, weight, alpha=1.0):
     if weight <= 0.001: return cond1
@@ -465,11 +490,7 @@ def equalized_blend_conds(cond1, cond2, weight, alpha=1.0):
                 t1s = t1 * (target_n1 / n1.clamp(min=1e-12))
                 t2s = t2 * (target_n2 / n2.clamp(min=1e-12))
                 
-                blend = t1s * (1.0 - weight) + t2s * weight
-                blend_norm = torch.linalg.vector_norm(blend, dim=-1, keepdim=True)
-                target_norm = target_n1 * (1.0 - weight) + target_n2 * weight
-                
-                res[k] = blend * (target_norm / blend_norm.clamp(min=1e-12))
+                res[k] = slerp_tensor(weight, t1s, t2s, dim=-1)
             else:
                 res[k] = cond1[k]
         if hasattr(cond1, "shape"):
@@ -487,11 +508,7 @@ def equalized_blend_conds(cond1, cond2, weight, alpha=1.0):
         t1s = t1 * (target_n1 / n1.clamp(min=1e-12))
         t2s = t2 * (target_n2 / n2.clamp(min=1e-12))
         
-        blend = t1s * (1.0 - weight) + t2s * weight
-        blend_norm = torch.linalg.vector_norm(blend, dim=-1, keepdim=True)
-        target_norm = target_n1 * (1.0 - weight) + target_n2 * weight
-        
-        return blend * (target_norm / blend_norm.clamp(min=1e-12))
+        return slerp_tensor(weight, t1s, t2s, dim=-1)
     return cond1
 
 
@@ -505,12 +522,7 @@ def blend_conds(cond1, cond2, weight):
         for k in cond1.keys():
             if isinstance(cond1[k], torch.Tensor) and isinstance(cond2[k], torch.Tensor):
                 t1, t2 = _pad_seq(cond1[k], cond2[k])
-                blend = t1 * (1.0 - weight) + t2 * weight
-                n1 = torch.linalg.vector_norm(t1, dim=-1, keepdim=True)
-                n2 = torch.linalg.vector_norm(t2, dim=-1, keepdim=True)
-                blend_norm = torch.linalg.vector_norm(blend, dim=-1, keepdim=True)
-                target_norm = n1 * (1.0 - weight) + n2 * weight
-                res[k] = blend * (target_norm / blend_norm.clamp(min=1e-12))
+                res[k] = slerp_tensor(weight, t1, t2, dim=-1)
             else:
                 res[k] = cond1[k]
         if hasattr(cond1, "shape"):
@@ -518,12 +530,7 @@ def blend_conds(cond1, cond2, weight):
         return type(cond1)(res)
     else:
         t1, t2 = _pad_seq(cond1, cond2)
-        blend = t1 * (1.0 - weight) + t2 * weight
-        n1 = torch.linalg.vector_norm(t1, dim=-1, keepdim=True)
-        n2 = torch.linalg.vector_norm(t2, dim=-1, keepdim=True)
-        blend_norm = torch.linalg.vector_norm(blend, dim=-1, keepdim=True)
-        target_norm = n1 * (1.0 - weight) + n2 * weight
-        return blend * (target_norm / blend_norm.clamp(min=1e-12))
+        return slerp_tensor(weight, t1, t2, dim=-1)
 
 
 def get_continuous_cond(schedules, step_float):
