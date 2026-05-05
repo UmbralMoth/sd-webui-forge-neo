@@ -26,7 +26,7 @@ prompt: (emphasized | scheduled | alternate | blended | plain | WHITESPACE)*
         | "[" prompt "]"
 scheduled: "[" [prompt ":"] prompt ":" [WHITESPACE] NUMBER [WHITESPACE] "]"
 alternate: "[" prompt ("|" [prompt])+ "]"
-blended: "[" prompt ("~" [prompt])+ [":" NUMBER] "]"
+blended: "[" prompt ("~" [prompt])+ "]"
 WHITESPACE: /\s+/
 plain: /([^\\\[\]():|~]|\\.)+/
 %import common.SIGNED_NUMBER -> NUMBER
@@ -181,25 +181,20 @@ def get_learned_conditioning_prompt_schedules(prompts, base_steps, hires_steps=N
                     return eval_topdown(after, step, state) if after else ""
                     
             elif getattr(node, 'data', None) == 'blended':
-                weight = 0.5
-                prompts = []
-                for c in node.children:
-                    if c is None:
-                        continue
-                    if isinstance(c, lark.Token) and c.type == 'NUMBER':
-                        weight = float(c)
-                    else:
-                        prompts.append(c)
-                
+                prompts = [c for c in node.children if c is not None]
                 if len(prompts) < 2:
                     return eval_topdown(prompts[0], step, state) if prompts else ""
                     
                 evaluated_prompts = [eval_topdown(p, step, state) if p else "" for p in prompts]
                 
-                result = evaluated_prompts[-1]
-                for p in reversed(evaluated_prompts[:-1]):
-                    result = LatentBlendNode(p, result, weight)
-                return result
+                items = []
+                for p in evaluated_prompts:
+                    match = re.search(r"^(.*?)(?::([-+]?(?:\d+\.?|\d*\.\d+)))?$", p)
+                    text, weight = match.groups() if match else (p, "1.0")
+                    weight = float(weight) if weight is not None else 1.0
+                    items.append((text, weight))
+                    
+                return LatentBlendNode(items)
                 
             elif getattr(node, 'data', None) == 'plain':
                 return str(node.children[0].value)
@@ -216,17 +211,11 @@ def get_learned_conditioning_prompt_schedules(prompts, base_steps, hires_steps=N
                     rest = combine(items[1:])
                     
                     if isinstance(first, LatentBlendNode):
-                        return LatentBlendNode(
-                            combine([first.left, rest]),
-                            combine([first.right, rest]),
-                            first.weight
-                        )
+                        new_items = [(combine([item[0], rest]), item[1]) for item in first.items]
+                        return LatentBlendNode(new_items)
                     elif isinstance(rest, LatentBlendNode):
-                        return LatentBlendNode(
-                            combine([first, rest.left]),
-                            combine([first, rest.right]),
-                            rest.weight
-                        )
+                        new_items = [(combine([first, item[0]]), item[1]) for item in rest.items]
+                        return LatentBlendNode(new_items)
                     else:
                         return str(first) + str(rest)
                         
@@ -245,12 +234,10 @@ def get_learned_conditioning_prompt_schedules(prompts, base_steps, hires_steps=N
 
 
 class LatentBlendNode(str):
-    def __new__(cls, left, right, weight):
-        longest = str(left) if len(str(left)) > len(str(right)) else str(right)
+    def __new__(cls, items):
+        longest = str(max((item[0] for item in items), key=lambda x: len(str(x))))
         obj = str.__new__(cls, longest)
-        obj.left = left
-        obj.right = right
-        obj.weight = float(weight)
+        obj.items = items
         return obj
 
 
@@ -310,8 +297,8 @@ def get_learned_conditioning(model, prompts: SdConditioning | list[str], steps, 
         texts_to_encode = []
         def extract_texts(node):
             if isinstance(node, LatentBlendNode):
-                extract_texts(node.left)
-                extract_texts(node.right)
+                for item in node.items:
+                    extract_texts(item[0])
             else:
                 if node not in texts_to_encode:
                     texts_to_encode.append(node)
@@ -333,9 +320,9 @@ def get_learned_conditioning(model, prompts: SdConditioning | list[str], steps, 
         
         def build_cond(node):
             if isinstance(node, LatentBlendNode):
-                cond_left = build_cond(node.left)
-                cond_right = build_cond(node.right)
-                return equalized_blend_conds(cond_left, cond_right, node.weight, alpha=1.0)
+                conds = [build_cond(item[0]) for item in node.items]
+                weights = [item[1] for item in node.items]
+                return n_way_blend_conds(conds, weights, alpha=1.0)
             else:
                 return cond_dict[node]
                 
@@ -471,45 +458,82 @@ def slerp_tensor(val: float, low: torch.Tensor, high: torch.Tensor, dim: int = -
     target_n = low_n * (1.0 - val) + high_n * val
     return res_dir * target_n
 
-def equalized_blend_conds(cond1, cond2, weight, alpha=1.0):
-    if weight <= 0.001: return cond1
-    if weight >= 0.999: return cond2
+def n_way_blend_conds(conds, weights, alpha=1.0):
+    total_weight = sum(weights)
+    if total_weight <= 0.001:
+        return conds[0]
         
-    if isinstance(cond1, dict):
+    normalized_weights = [w / total_weight for w in weights]
+    
+    if isinstance(conds[0], dict):
         res = {}
-        for k in cond1.keys():
-            if isinstance(cond1[k], torch.Tensor) and isinstance(cond2[k], torch.Tensor):
-                t1, t2 = _pad_seq(cond1[k], cond2[k])
-                n1 = torch.linalg.vector_norm(t1, dim=-1, keepdim=True)
-                n2 = torch.linalg.vector_norm(t2, dim=-1, keepdim=True)
-                gm = torch.sqrt(n1 * n2).clamp(min=1e-12)
+        for k in conds[0].keys():
+            tensors = [c[k] for c in conds if k in c]
+            if len(tensors) != len(conds) or not all(isinstance(t, torch.Tensor) for t in tensors):
+                res[k] = conds[0][k]
+                continue
                 
-                target_n1 = torch.lerp(n1, gm, alpha)
-                target_n2 = torch.lerp(n2, gm, alpha)
-                
-                t1s = t1 * (target_n1 / n1.clamp(min=1e-12))
-                t2s = t2 * (target_n2 / n2.clamp(min=1e-12))
-                
-                res[k] = slerp_tensor(weight, t1s, t2s, dim=-1)
+            if tensors[0].ndim < 2:
+                padded = tensors
             else:
-                res[k] = cond1[k]
-        if hasattr(cond1, "shape"):
-            return type(cond1)(res, shape=getattr(cond1, 'shape', None))
-        return type(cond1)(res)
-    elif isinstance(cond1, torch.Tensor) and isinstance(cond2, torch.Tensor):
-        t1, t2 = _pad_seq(cond1, cond2)
-        n1 = torch.linalg.vector_norm(t1, dim=-1, keepdim=True)
-        n2 = torch.linalg.vector_norm(t2, dim=-1, keepdim=True)
-        gm = torch.sqrt(n1 * n2).clamp(min=1e-12)
+                seq_dim = 1 if tensors[0].ndim == 3 else 0
+                max_len = max(t.shape[seq_dim] for t in tensors)
+                padded = []
+                for t in tensors:
+                    if t.shape[seq_dim] < max_len:
+                        pad_shape = list(t.shape)
+                        pad_shape[seq_dim] = max_len - t.shape[seq_dim]
+                        t = torch.cat([t, torch.zeros(pad_shape, dtype=t.dtype, device=t.device)], dim=seq_dim)
+                    padded.append(t)
+            
+            norms = [torch.linalg.vector_norm(t, dim=-1, keepdim=True).clamp(min=1e-12) for t in padded]
+            
+            # Weighted Geometric Mean
+            log_gm = sum(w * torch.log(n) for w, n in zip(normalized_weights, norms))
+            gm = torch.exp(log_gm)
+            
+            # Arithmetic Mean
+            mean_norm = sum(w * n for w, n in zip(normalized_weights, norms))
+            target_norm = torch.lerp(mean_norm, gm, alpha)
+            
+            directions = [t / n for t, n in zip(padded, norms)]
+            blended_dir = sum(w * d for w, d in zip(normalized_weights, directions))
+            blended_dir = blended_dir / torch.linalg.vector_norm(blended_dir, dim=-1, keepdim=True).clamp(min=1e-12)
+            
+            res[k] = blended_dir * target_norm
+            
+        if hasattr(conds[0], "shape"):
+            return type(conds[0])(res, shape=getattr(conds[0], 'shape', None))
+        return type(conds[0])(res)
         
-        target_n1 = torch.lerp(n1, gm, alpha)
-        target_n2 = torch.lerp(n2, gm, alpha)
+    elif isinstance(conds[0], torch.Tensor):
+        tensors = conds
+        if tensors[0].ndim < 2:
+            padded = tensors
+        else:
+            seq_dim = 1 if tensors[0].ndim == 3 else 0
+            max_len = max(t.shape[seq_dim] for t in tensors)
+            padded = []
+            for t in tensors:
+                if t.shape[seq_dim] < max_len:
+                    pad_shape = list(t.shape)
+                    pad_shape[seq_dim] = max_len - t.shape[seq_dim]
+                    t = torch.cat([t, torch.zeros(pad_shape, dtype=t.dtype, device=t.device)], dim=seq_dim)
+                padded.append(t)
+            
+        norms = [torch.linalg.vector_norm(t, dim=-1, keepdim=True).clamp(min=1e-12) for t in padded]
+        log_gm = sum(w * torch.log(n) for w, n in zip(normalized_weights, norms))
+        gm = torch.exp(log_gm)
+        mean_norm = sum(w * n for w, n in zip(normalized_weights, norms))
+        target_norm = torch.lerp(mean_norm, gm, alpha)
         
-        t1s = t1 * (target_n1 / n1.clamp(min=1e-12))
-        t2s = t2 * (target_n2 / n2.clamp(min=1e-12))
+        directions = [t / n for t, n in zip(padded, norms)]
+        blended_dir = sum(w * d for w, d in zip(normalized_weights, directions))
+        blended_dir = blended_dir / torch.linalg.vector_norm(blended_dir, dim=-1, keepdim=True).clamp(min=1e-12)
         
-        return slerp_tensor(weight, t1s, t2s, dim=-1)
-    return cond1
+        return blended_dir * target_norm
+        
+    return conds[0]
 
 
 def blend_conds(cond1, cond2, weight):
