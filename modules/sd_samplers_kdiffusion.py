@@ -15,8 +15,8 @@ samplers_k_diffusion = [
     ("DPM++ 2M", "sample_dpmpp_2m", ["k_dpmpp_2m"], {"scheduler": "karras"}),
     ("DPM++ SDE", "sample_dpmpp_sde", ["k_dpmpp_sde"], {"scheduler": "karras", "second_order": True, "brownian_noise": True}),
     ("DPM++ 2M SDE", "sample_dpmpp_2m_sde", ["k_dpmpp_2m_sde"], {"scheduler": "exponential", "brownian_noise": True}),
-    ("DPM++ 3M SDE", "sample_dpmpp_3m_sde", ["k_dpmpp_3m_sde"], {"scheduler": "exponential", "discard_next_to_last_sigma": True, "brownian_noise": True}),
-    ("DPM++ 3M SDE Ctrl-Z", "sample_dpmpp_3m_sde_ctrlz", ["k_dpmpp_3m_sde_ctrlz"], {"scheduler": "exponential", "discard_next_to_last_sigma": True, "brownian_noise": True}),
+    ("DPM++ 3M SDE", "sample_dpmpp_3m_sde", ["k_dpmpp_3m_sde"], {"scheduler": "exponential", "brownian_noise": True}),
+    ("DPM++ 3M SDE Ctrl-Z", "sample_dpmpp_3m_sde_ctrlz", ["k_dpmpp_3m_sde_ctrlz"], {"scheduler": "exponential", "brownian_noise": True}),
     ("Flux Realistic" if opts.forbidden_knowledge else "DPM++ 2s a RF", "sample_dpmpp_2s_ancestral_RF", ["sample_dpmpp_2s_ancestral_RF"], {}),
     ("Euler a2 RF", "sample_euler_a2", ["euler_a2_rf"], {}),
     ("Euler a", "sample_euler_ancestral", ["k_euler_a", "k_euler_ancestral"], {"uses_ensd": True}),
@@ -25,11 +25,12 @@ samplers_k_diffusion = [
     ("LCM", "sample_lcm", ["k_lcm"], {}),
     ("LMS", "sample_lms", ["k_lms"], {}),
     ("Heun", "sample_heun", ["k_heun"], {"second_order": True}),
-    ("DPM2", "sample_dpm_2", ["k_dpm_2"], {"scheduler": "karras", "discard_next_to_last_sigma": True, "second_order": True}),
+    ("DPM2", "sample_dpm_2", ["k_dpm_2"], {"scheduler": "karras", "second_order": True}),
     ("Res Multistep", "sample_res_multistep", ["res_multistep"], {}),
     ("Kohaku LoNyu Yog", "sample_Kohaku_LoNyu_Yog", ["Kohaku_LoNyu_Yog"], {}),
     ("Restart", sd_samplers_extra.restart_sampler, ["restart"], {"scheduler": "karras", "second_order": True}),
-    ("UniPC", sd_samplers_extra.sample_unipc, ["unipc"], {"discard_next_to_last_sigma": True}),
+    ("UniPC", sd_samplers_extra.sample_unipc, ["unipc"], {}),
+    ("Forge Chimera", sd_samplers_extra.sample_forge_chimera, ["k_forge_chimera"], {"scheduler": "karras", "brownian_noise": True}),
 ]
 
 
@@ -37,12 +38,13 @@ samplers_data_k_diffusion = [sd_samplers_common.SamplerData(label, lambda model,
 
 sampler_extra_params = {
     "sample_dpmpp_sde": ["eta", "s_noise", "r"],
-    "sample_dpmpp_2m_sde": ["eta", "s_noise"],
+    "sample_dpmpp_2m_sde": ["eta", "s_noise", "solver_type"],
     "sample_dpmpp_3m_sde": ["eta", "s_noise"],
-    "sample_dpmpp_3m_sde_ctrlz": ["eta", "s_noise"],
+    "sample_dpmpp_3m_sde_ctrlz": ["eta", "s_noise", "gamma_scale"],
     "sample_dpmpp_3m_sde_cfgpp_ctrlz": ["eta", "s_noise"],
     "sample_euler_ancestral": ["eta", "s_noise"],
     "sample_euler_a2": ["eta", "s_noise"],
+    "sample_forge_chimera": ["eta", "s_noise"],
     "sample_euler": ["s_churn", "s_tmin", "s_tmax", "s_noise"],
     "sample_heun": ["s_churn", "s_tmin", "s_tmax", "s_noise"],
     "sample_dpm_2": ["s_churn", "s_tmin", "s_tmax", "s_noise"],
@@ -76,8 +78,17 @@ class KDiffusionSampler(sd_samplers_common.Sampler):
 
     def get_sigmas(self, p, steps):
         discard_next_to_last_sigma = self.config is not None and self.config.options.get("discard_next_to_last_sigma", False)
+        
+        # Intelligent Router: Hardcode destructive discard for specific samplers, but disable it on Flow architectures
+        if self.funcname in ["sample_dpmpp_3m_sde", "sample_dpmpp_3m_sde_ctrlz", "sample_dpm_2", "sample_unipc"]:
+            is_flow = getattr(shared.sd_model, 'is_flow', False) or getattr(shared.sd_model, 'is_anima', False)
+            if not is_flow:
+                discard_next_to_last_sigma = True
+                
         if opts.always_discard_next_to_last_sigma and not discard_next_to_last_sigma:
             discard_next_to_last_sigma = True
+            
+        if discard_next_to_last_sigma:
             p.extra_generation_params["Discard penultimate sigma"] = True
 
         steps += 1 if discard_next_to_last_sigma else 0

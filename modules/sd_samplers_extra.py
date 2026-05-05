@@ -127,3 +127,103 @@ def sample_unipc(model, x, sigmas, extra_args=None, callback=None, disable=False
     x = uni_pc.sample(x, timesteps=timesteps, skip_type="time_uniform", method="multistep", order=order, lower_order_final=True, callback=callback, disable_pbar=disable)
     x /= ns.marginal_alpha(timesteps[-1])
     return x
+
+import math
+from modules import shared
+
+@torch.no_grad()
+def sample_forge_chimera(model, x, sigmas, extra_args=None, callback=None, disable=None, eta=1.0, s_noise=1.0, noise_sampler=None, **kwargs):
+    from modules_forge.packages.k_diffusion.sampling import _dpm_solver_step_standard, sigma_to_half_log_snr, BrownianTreeNoiseSampler
+    from functools import partial
+    import math
+    import torch
+    
+    extra_args = {} if extra_args is None else extra_args
+    s_in = x.new_ones([x.shape[0]])
+    
+    is_flow = False
+    if hasattr(shared, 'sd_model'):
+        is_flow = getattr(shared.sd_model, 'is_flow', False) or getattr(shared.sd_model, 'is_anima', False)
+        
+    N = len(sigmas) - 1
+    base_cfg = extra_args.get('cond_scale', 7.0)
+    
+    # Initialize robust DPM++ lambda function
+    if is_flow or (sigmas[0] <= 2.0):
+        def lambda_fn(sigma):
+            sigma = torch.clamp(sigma, min=1e-4, max=1.0 - 1e-4)
+            return -torch.logit(sigma)
+    else:
+        model_sampling = model.inner_model.predictor
+        lambda_fn = partial(sigma_to_half_log_snr, model_sampling=model_sampling)
+        
+    # SDE noise setup
+    sigma_min, sigma_max = sigmas[sigmas > 0].min(), sigmas.max()
+    if noise_sampler is None:
+        noise_sampler = BrownianTreeNoiseSampler(x, sigma_min, sigma_max, seed=extra_args.get("seed", None), cpu=True)
+        
+    denoised_1, denoised_2 = None, None
+    h_1, h_2 = None, None
+    
+    for i in range(N):
+        sigma = sigmas[i]
+        sigma_next = sigmas[i + 1]
+        
+        # Calculate strictly step-based progress to guarantee UI-scheduler immunity
+        progress = float(i) / max(1, N - 1)
+            
+        # Trapezoidal CFG curve: Ramp up -> Hold -> Mild Decay
+        if progress <= 0.05:
+            p = progress / 0.05
+            p_smooth = p * p * (3 - 2 * p) # Smoothstep
+            current_cfg = 1.0 + (base_cfg - 1.0) * p_smooth
+        elif progress <= 0.65:
+            current_cfg = base_cfg
+        else:
+            p = (progress - 0.65) / 0.35
+            p_smooth = p * p * (3 - 2 * p)
+            current_cfg = base_cfg * (1.0 - 0.2 * p_smooth)
+            
+        if 'cond_scale' in extra_args:
+            extra_args['cond_scale'] = current_cfg
+            
+        denoised = model(x, sigma * s_in, **extra_args)
+        
+        if callback is not None:
+            callback({'x': x, 'i': i, 'sigma': sigma, 'sigma_hat': sigma, 'denoised': denoised})
+            
+        # Dynamic Eta calculation
+        if progress < 0.70:
+            current_eta = eta
+        elif progress < 0.85:
+            current_eta = eta * (1.0 - (progress - 0.70) / 0.15)
+        else:
+            current_eta = 0.0
+            
+        if sigma_next == 0 or i == N - 1:
+            d = (x - denoised) / sigma
+            dt = 0 - sigma
+            x = x + d * dt
+            continue
+            
+        lambda_s, lambda_t = lambda_fn(sigma), lambda_fn(sigma_next)
+        h = lambda_t - lambda_s
+        
+        # User requested Architecture Phase Drops
+        if progress >= 0.70:
+            h_2 = None # Drop from 3M to 2M SDE/ODE
+        
+        # Core DPM++ 3M SDE Solver Step (Automatically handles 1M/2M warmup and phase drops)
+        x = _dpm_solver_step_standard(
+            x=x, t=lambda_s, s=lambda_t, 
+            denoised=denoised, denoised_1=denoised_1, denoised_2=denoised_2, 
+            h_1=h_1, h_2=h_2, 
+            eta=current_eta, noise_sampler=noise_sampler, s_noise=s_noise, 
+            sigma_t=sigma, sigma_s=sigma_next, lambda_fn=lambda_fn
+        )
+        
+        # Shift history
+        denoised_2, denoised_1 = denoised_1, denoised
+        h_2, h_1 = h_1, h
+        
+    return x

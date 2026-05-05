@@ -55,8 +55,15 @@ class CompVisSampler(sd_samplers_common.Sampler):
 
     def get_timesteps(self, p, steps):
         discard_next_to_last_sigma = self.config is not None and self.config.options.get("discard_next_to_last_sigma", False)
+        
+        is_flow = getattr(shared.sd_model, 'is_flow', False) or getattr(shared.sd_model, 'is_anima', False)
+        if is_flow:
+            discard_next_to_last_sigma = False
+            
         if opts.always_discard_next_to_last_sigma and not discard_next_to_last_sigma:
             discard_next_to_last_sigma = True
+            
+        if discard_next_to_last_sigma:
             p.extra_generation_params["Discard penultimate sigma"] = True
 
         steps += 1 if discard_next_to_last_sigma else 0

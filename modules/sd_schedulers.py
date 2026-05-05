@@ -67,22 +67,6 @@ def sgm_uniform(n, sigma_min, sigma_max, inner_model, device):
     sigs += [0.0]
     return torch.FloatTensor(sigs).to(device)
 
-def get_align_your_steps_sigmas(n, sigma_min, sigma_max, device):
-    """
-    Align Your Steps scheduler, based on "Align Your Steps: Optimal Noise Schedules for Diffusion Models" [arXiv:2406.16157] (Zhao et al., 2024).
-    
-    Key features:
-    - Log-Logistic Distribution: For SDXL and SD1.5, uses a log-logistic distribution in t-space to optimally space noise levels based on model-specific parameters (loc, scale).
-    - Dynamic Shift Tuning: For Anima models, dynamically adjusts the shift based on resolution and step count to tailor the noise schedule.
-    - Smart Cap: Limits maximum sigma to an optimal value (14.61 for SDXL/SD1.5, 80.0 for Anima) to prevent training instability.
-    - Resolution-Aware: Scales parameters based on image resolution for better adaptability across different input sizes.
-    """
-    try:
-        is_sdxl = getattr(shared.sd_model, 'is_sdxl', False)
-        is_anima = getattr(shared.sd_model, 'is_anima', False)
-    except (ImportError, NameError, AttributeError):
-        is_sdxl = False
-        is_anima = False
 
 def _get_ays_diffusion_sigmas(
     n: int,
@@ -103,7 +87,7 @@ def _get_ays_diffusion_sigmas(
     # Build fine table for beta (or just n)
     m = n * 3 if apply_beta and n < 50 else n
 
-    t = torch.linspace(1.0, 0.0, m + 1, device=device)
+    t = torch.linspace(1.0, 0.0, m, device=device)
 
     def sigma_to_t(sigma: float, loc: float, scale: float) -> float:
         sigma = max(sigma, 1e-5)
@@ -118,6 +102,9 @@ def _get_ays_diffusion_sigmas(
 
     log_sigmas = loc + scale * torch.log(t / (1.0 - t))
     sigmas = torch.exp(log_sigmas)
+    
+    # Append terminal 0.0 step
+    sigmas = torch.cat([sigmas, sigmas.new_zeros([1])])
 
     return sigmas
 
@@ -143,7 +130,9 @@ def _get_ays_flow_sigmas(
         unet = inner_model.inner_model.forge_objects.unet
         shift = getattr(unet.model.predictor, "shift", 3.0)
 
-    # Linear timesteps in [sigma_max, 0], then apply the flow-matching shift warp.
+    flow_sigma_min = max(float(sigma_min), 1e-4)
+
+    # Linear timesteps in [sigma_max, 0.0], then apply the flow-matching shift warp.
     timesteps = torch.linspace(flow_sigma_max, 0.0, n + 1, dtype=torch.float32, device=device)
     sigmas = (timesteps * shift) / (1.0 + (shift - 1.0) * timesteps)
 
