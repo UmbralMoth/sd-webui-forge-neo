@@ -26,15 +26,39 @@ class Condition:
         return self._copy_with(repeat_to_batch_size(self.cond, batch_size).to(device))
 
     def can_concat(self, other):
-        if self.cond.shape != other.cond.shape:
-            return False
+        if hasattr(self.cond, "shape") and hasattr(other.cond, "shape"):
+            if self.cond.shape != other.cond.shape:
+                return False
         return True
 
     def concat(self, others):
         conds = [self.cond]
         for x in others:
             conds.append(x.cond)
-        return torch.cat(conds)
+            
+        def _cat(lst):
+            if not lst: return None
+            if isinstance(lst[0], dict):
+                res = {}
+                for k in lst[0].keys():
+                    tensors = [c[k] for c in lst if isinstance(c, dict) and k in c]
+                    if all(isinstance(t, torch.Tensor) for t in tensors):
+                        res[k] = torch.cat(tensors)
+                    else:
+                        res[k] = tensors[0]
+                return type(lst[0])(res, shape=getattr(lst[0], 'shape', None))
+            elif isinstance(lst[0], torch.Tensor):
+                return torch.cat(lst)
+            return lst[0]
+
+        is_layered = any(hasattr(c, "in_mid_cond") for c in conds)
+        if is_layered:
+            in_mids = [c.in_mid_cond if hasattr(c, "in_mid_cond") else c for c in conds]
+            outs = [c.out_cond if hasattr(c, "out_cond") else c for c in conds]
+            cls = next(type(c) for c in conds if hasattr(c, "in_mid_cond"))
+            return cls(_cat(in_mids), _cat(outs))
+
+        return _cat(conds)
 
 
 class ConditionNoiseShape(Condition):
@@ -70,7 +94,30 @@ class ConditionCrossAttn(Condition):
             if c.shape[1] < crossattn_max_len:
                 c = c.repeat(1, crossattn_max_len // c.shape[1], 1)
             out.append(c)
-        return torch.cat(out)
+            
+        def _cat(lst):
+            if not lst: return None
+            if isinstance(lst[0], dict):
+                res = {}
+                for k in lst[0].keys():
+                    tensors = [c[k] for c in lst if isinstance(c, dict) and k in c]
+                    if all(isinstance(t, torch.Tensor) for t in tensors):
+                        res[k] = torch.cat(tensors)
+                    else:
+                        res[k] = tensors[0]
+                return type(lst[0])(res, shape=getattr(lst[0], 'shape', None))
+            elif isinstance(lst[0], torch.Tensor):
+                return torch.cat(lst)
+            return lst[0]
+            
+        is_layered = any(hasattr(c, "in_mid_cond") for c in out)
+        if is_layered:
+            in_mids = [c.in_mid_cond if hasattr(c, "in_mid_cond") else c for c in out]
+            outs = [c.out_cond if hasattr(c, "out_cond") else c for c in out]
+            cls = next(type(c) for c in out if hasattr(c, "in_mid_cond"))
+            return cls(_cat(in_mids), _cat(outs))
+
+        return _cat(out)
 
 
 class ConditionConstant(Condition):
@@ -96,9 +143,35 @@ def compile_conditions(cond):
     if cond is None:
         return None
 
+    if hasattr(cond, "in_mid_cond") and hasattr(cond, "out_cond"):
+        # LayeredConditioning support
+        cross_attn = cond["crossattn"]
+        pooled_output = cond["vector"]
 
+        model_conds = dict(c_crossattn=ConditionCrossAttn(cross_attn), y=Condition(pooled_output))
+
+        # We need to iterate over available keys in the underlying dicts
+        # Since LayeredConditioning wraps dicts
+        keys = set()
+        if isinstance(cond.in_mid_cond, dict): keys.update(cond.in_mid_cond.keys())
+        if isinstance(cond.out_cond, dict): keys.update(cond.out_cond.keys())
+
+        for k in keys:
+            if k in {"crossattn", "vector", "guidance"}:
+                continue
+            v = cond[k]
+            model_conds[k] = Condition(v)
+
+        result = dict(cross_attn=cross_attn, pooled_output=pooled_output, model_conds=model_conds)
+
+        guidance = cond["guidance"]
+        if guidance is not None:
+             result["model_conds"]["guidance"] = Condition(guidance)
+
+        return [result]
 
     if isinstance(cond, torch.Tensor):
+
         result = dict(
             cross_attn=cond,
             model_conds=dict(

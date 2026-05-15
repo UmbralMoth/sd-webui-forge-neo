@@ -28,6 +28,10 @@ class Qwen3TextProcessingEngine:
 
         self.id_pad = 151643
         self.llama_template = "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n"
+        
+        parts = self.llama_template.split("{}")
+        self.template_before = self.tokenizer(parts[0], add_special_tokens=False)["input_ids"]
+        self.template_after = self.tokenizer(parts[1], add_special_tokens=False)["input_ids"]
         self.intermediate_output = -2
         self.layer_norm_hidden_state = False
 
@@ -71,7 +75,18 @@ class Qwen3TextProcessingEngine:
             if line in cache:
                 line_z_values = cache[line]
             else:
-                chunks = self.tokenize_line(line)
+                tokens = None
+                if hasattr(line, "aligned_tokens_dict") and line.aligned_tokens_dict is not None:
+                    tokens = line.aligned_tokens_dict.get("qwen", None)
+                
+                if tokens is not None:
+                    chunk = PromptChunk()
+                    chunk.tokens = self.template_before + tokens + self.template_after
+                    chunk.multipliers = [1.0] * len(chunk.tokens)
+                    chunks = [chunk]
+                else:
+                    chunks = self.tokenize_line(line)
+                
                 line_z_values = []
 
                 for chunk in chunks:

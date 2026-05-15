@@ -11,6 +11,7 @@ class PresetArch(Enum):
     zit = 7  # Z-Image-Turbo
     wan = 8  # Wan2.2
     anima = 9  # Anima
+    mugen = 10  # Mugen
 
     @staticmethod
     def choices() -> list[str]:
@@ -27,6 +28,7 @@ SAMPLERS = {
     PresetArch.zit: "Euler",
     PresetArch.wan: "Euler",
     PresetArch.anima: "ER SDE",
+    PresetArch.mugen: "Euler a",
 }
 
 SCHEDULERS = {
@@ -39,6 +41,7 @@ SCHEDULERS = {
     PresetArch.zit: "Beta",
     PresetArch.wan: "Simple",
     PresetArch.anima: "Beta",
+    PresetArch.mugen: "Simple",
 }
 
 STEPS = {
@@ -51,6 +54,7 @@ STEPS = {
     PresetArch.zit: 9,
     PresetArch.wan: 4,
     PresetArch.anima: 32,
+    PresetArch.mugen: 24,
 }
 
 CFG = {
@@ -63,6 +67,7 @@ CFG = {
     PresetArch.zit: 1.0,
     PresetArch.wan: 1.0,
     PresetArch.anima: 4.0,
+    PresetArch.mugen: 5.0,
 }
 
 DISTILL = {
@@ -75,6 +80,7 @@ SHIFT = {
     PresetArch.zit: 9.0,
     PresetArch.wan: 5.0,
     PresetArch.anima: 3.0,
+    PresetArch.mugen: 9.0,
 }
 
 

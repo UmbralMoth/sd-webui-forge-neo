@@ -146,7 +146,27 @@ class CrossAttention(nn.Module):
             del value
         else:
             v = self.to_v(context)
-        out = attention_function(q, k, v, self.heads, mask)
+            
+        # Independent Chunk Attention with Renormalization (ICA-R)
+        # Prevents style-erasure in long prompts by isolating attention passes.
+        seq_len = k.shape[1]
+        is_clip_chunked = seq_len > 77 and seq_len % 77 == 0 and (k.shape[-1] == 768 or k.shape[-1] == 2048)
+        
+        if is_clip_chunked:
+            from backend.text_processing.blending import n_way_blend
+            chunks = seq_len // 77
+            chunk_outs = []
+            for i in range(chunks):
+                k_chunk = k[:, i*77:(i+1)*77, :]
+                v_chunk = v[:, i*77:(i+1)*77, :]
+                chunk_outs.append(attention_function(q, k_chunk, v_chunk, self.heads, mask))
+            
+            # Fuse the independent attention results using shared renormalization math
+            # alpha=0.0 ensures a 'clean' arithmetic average of the signals.
+            out = n_way_blend(chunk_outs, weights=[1.0]*chunks, alpha=0.0)
+        else:
+            out = attention_function(q, k, v, self.heads, mask)
+            
         return self.to_out(out)
 
 
@@ -294,6 +314,14 @@ class SpatialTransformer(nn.Module):
 
     def forward(self, x, context=None, transformer_options={}):
         if not isinstance(context, list):
+            # Anchored Blend Routing
+            if hasattr(context, "in_mid_cond") and "block" in transformer_options:
+                block_type = transformer_options["block"][0]
+                if block_type in ["input", "middle"]:
+                    context = context.in_mid_cond
+                elif block_type == "output":
+                    context = context.out_cond
+
             context = [context] * len(self.transformer_blocks)
         b, c, h, w = x.shape
         x_in = x
@@ -663,15 +691,31 @@ class IntegratedUNet2DConditionModel(nn.Module, ConfigMixin):
         hs = []
         t_emb = timestep_embedding(timesteps, self.model_channels, repeat_only=False).to(x.dtype)
         emb = self.time_embed(t_emb)
+        
+        emb_in_mid = None
+        emb_out = None
+        
         if self.num_classes is not None:
-            assert y.shape[0] == x.shape[0]
-            emb = emb + self.label_emb(y)
+            if hasattr(y, "in_mid_cond"):
+                # Anchored Blend for pooled vector
+                assert y.shape[0] == x.shape[0]
+                emb_in_mid = emb + self.label_emb(y.in_mid_cond)
+                emb_out = emb + self.label_emb(y.out_cond)
+            else:
+                assert y.shape[0] == x.shape[0]
+                emb = emb + self.label_emb(y)
+                emb_in_mid = emb
+                emb_out = emb
+        else:
+            emb_in_mid = emb
+            emb_out = emb
+
         h = x
         for id, module in enumerate(self.input_blocks):
             transformer_options["block"] = ("input", id)
             for block_modifier in block_modifiers:
                 h = block_modifier(h, "before", transformer_options)
-            h = module(h, emb, context, transformer_options)
+            h = module(h, emb_in_mid, context, transformer_options)
             h = apply_control(h, control, "input")
             for block_modifier in block_modifiers:
                 h = block_modifier(h, "after", transformer_options)
@@ -687,7 +731,7 @@ class IntegratedUNet2DConditionModel(nn.Module, ConfigMixin):
         transformer_options["block"] = ("middle", 0)
         for block_modifier in block_modifiers:
             h = block_modifier(h, "before", transformer_options)
-        h = self.middle_block(h, emb, context, transformer_options)
+        h = self.middle_block(h, emb_in_mid, context, transformer_options)
         h = apply_control(h, control, "middle")
         for block_modifier in block_modifiers:
             h = block_modifier(h, "after", transformer_options)
@@ -707,7 +751,7 @@ class IntegratedUNet2DConditionModel(nn.Module, ConfigMixin):
                 output_shape = None
             for block_modifier in block_modifiers:
                 h = block_modifier(h, "before", transformer_options)
-            h = module(h, emb, context, transformer_options, output_shape)
+            h = module(h, emb_out, context, transformer_options, output_shape)
             for block_modifier in block_modifiers:
                 h = block_modifier(h, "after", transformer_options)
         transformer_options["block"] = ("last", 0)

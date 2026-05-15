@@ -30,6 +30,13 @@ class QwenTextProcessingEngine:
         self.llama_template = "<|im_start|>system\nDescribe the image by detailing the color, shape, size, texture, quantity, text, spatial relationships of the objects and background:<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n"
         self.image_template = "<|im_start|>system\nDescribe the key features of the input image (color, shape, size, texture, objects, background), then explain how the user's text instruction should alter or modify the image. Generate a new image that meets the user's requirements while maintaining consistency with the original input where appropriate.<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n"
 
+        def get_template_tokens(t):
+            parts = t.split("{}")
+            return self.tokenizer(parts[0], add_special_tokens=False)["input_ids"], self.tokenizer(parts[1], add_special_tokens=False)["input_ids"]
+
+        self.llama_before, self.llama_after = get_template_tokens(self.llama_template)
+        self.image_before, self.image_after = get_template_tokens(self.image_template)
+
     def tokenize(self, texts, vision=False):
         llama_texts = [(self.image_template if vision else self.llama_template).format(text) for text in texts]
         return self.tokenizer(llama_texts)["input_ids"]
@@ -83,7 +90,21 @@ class QwenTextProcessingEngine:
             if line in cache:
                 line_z_values = cache[line]
             else:
-                chunks = self.tokenize_line(line, images)
+                tokens = None
+                if hasattr(line, "aligned_tokens_dict") and line.aligned_tokens_dict is not None:
+                    tokens = line.aligned_tokens_dict.get("qwen", None)
+                
+                if tokens is not None:
+                    before = self.image_before if bool(images) else self.llama_before
+                    after = self.image_after if bool(images) else self.llama_after
+                    
+                    chunk = PromptChunk()
+                    chunk.tokens = before + tokens + after
+                    chunk.multipliers = [1.0] * len(chunk.tokens)
+                    chunks = [chunk]
+                else:
+                    chunks = self.tokenize_line(line, images)
+                
                 line_z_values = []
 
                 for chunk in chunks:

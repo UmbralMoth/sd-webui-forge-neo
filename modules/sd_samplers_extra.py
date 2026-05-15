@@ -227,3 +227,125 @@ def sample_forge_chimera(model, x, sigmas, extra_args=None, callback=None, disab
         h_2, h_1 = h_1, h
         
     return x
+
+@torch.no_grad()
+def sample_aflops(model, x, sigmas, extra_args=None, callback=None, disable=None, s_noise=1.0, **kwargs):
+    """
+    Implements A-FloPS (Adaptive Flow Path Sampler) 
+    Reference: A-FloPS: Accelerating Diffusion Sampling with Adaptive Flow Path Sampler
+    """
+    from k_diffusion.sampling import to_d, trange
+    
+    extra_args = {} if extra_args is None else extra_args
+    s_in = x.new_ones([x.shape[0]])
+    
+    x_prev = None
+    d_prev = None
+    t_prev = None
+    
+    # Explicit model property detection for schedule mapping
+    from modules import shared
+    sd_model = getattr(shared, "sd_model", None)
+    is_flow = getattr(sd_model, "is_flow", False) or getattr(sd_model, "is_anima", False)
+    
+    shift = 1.0
+    if is_flow and sd_model:
+        try:
+            # Safe nested lookup for Forge architecture shift
+            forge_objects = getattr(sd_model, "forge_objects", None)
+            if forge_objects:
+                # Support both attribute and dictionary-style access for robustness
+                unet = getattr(forge_objects, "unet", None) if not isinstance(forge_objects, dict) else forge_objects.get("unet")
+                if unet and hasattr(unet, "model") and hasattr(unet.model, "predictor"):
+                    shift = getattr(unet.model.predictor, "shift", 3.0)
+        except Exception:
+            pass
+            
+    N = len(sigmas) - 1
+    
+    for i in trange(N, disable=disable):
+        old_sigma = sigmas[i]
+        new_sigma = sigmas[i + 1]
+        
+        denoised = model(x, old_sigma * s_in, **extra_args)
+        
+        if callback is not None:
+            callback({'x': x, 'i': i, 'sigma': old_sigma, 'sigma_hat': old_sigma, 'denoised': denoised})
+            
+        # 1. Manifold Linearization
+        # Rectified Flow models use a shifted time domain. We must solve in the linear 't' space [1, 0].
+        if is_flow:
+            t = old_sigma / (shift - old_sigma * (shift - 1.0) + 1e-8)
+            t_next = new_sigma / (shift - new_sigma * (shift - 1.0) + 1e-8)
+            
+            # Velocity in linearized t-space: v = dx/dt = dx/dsigma * dsigma/dt
+            v_scaling = shift / ((1.0 + (shift - 1.0) * t)**2 + 1e-8)
+            v = to_d(x, old_sigma, denoised) * v_scaling
+        else:
+            # Standard Diffusion (EPS/V) or unshifted Flow
+            t = old_sigma
+            t_next = new_sigma
+            v = to_d(x, old_sigma, denoised)
+            
+        h = t_next - t  # negative step size
+        
+        if i == 0:
+            # First order jump for the very first step (no history) and the final jump to 0.
+            # This prevents numerical instability and error amplification near the sigma=0 singularity.
+            x_next = x + v * h
+            
+            x_prev = x.detach()
+            d_prev = v.detach()
+            t_prev = t
+            x = x_next
+
+        else:
+            # Second order A-FloPS for all intermediate steps.
+            h_prev = t - t_prev  # negative
+            
+            deltax = x - x_prev
+            deltav = v - d_prev
+            
+            # Optimized Global Rayleigh quotient calculation
+            # Reshape is safer than view for non-contiguous tensors
+            a_flat = deltax.reshape(deltax.size(0), -1)
+            b_flat = deltav.reshape(deltav.size(0), -1)
+            
+            # Sum with float32 accumulator for overflow protection
+            numerator = torch.sum(b_flat * a_flat, dim=1, dtype=torch.float32)
+            denominator = torch.sum(a_flat ** 2, dim=1, dtype=torch.float32) + 1e-10
+            c = (numerator / denominator).to(x.dtype)
+            
+            # Clamp c as per paper to prevent over-correction/instability
+            c = torch.clamp(c, -1.0, 1.0)
+            c_batch = c.reshape(-1, *([1] * (x.ndim - 1)))
+            
+            # Predict linear offset and slope in linearized space
+            v1 = v - c_batch * x
+            history_record = d_prev - c_batch * x_prev
+            v2 = (v1 - history_record) / (h_prev + 1e-10)
+            
+            # Numerical Stability: Clamp exponent to prevent overflow (fp16 limit is ~11.0, but we use safe logic)
+            ch = torch.clamp(c_batch * h, min=-40.0, max=40.0)
+            c_abs = torch.abs(c_batch)
+            is_small = c_abs < 1e-4
+            
+            # Safe division: Replace zeros in denominator branch to avoid NaNs even in unused branches
+            safe_c = torch.where(is_small, torch.ones_like(c_batch), c_batch)
+            
+            # Use expm1 for high precision at small values and to avoid catastrophic cancellation
+            # x_next = x * exp(ch) + d1 * (exp(ch)-1)/c + d2 * (exp(ch)-1-ch)/c^2
+            exp_ch = torch.exp(ch)
+            expm1_ch = torch.expm1(ch)
+            
+            term_A = torch.where(is_small, h + 0.5 * c_batch * (h ** 2), expm1_ch / safe_c)
+            term_B = torch.where(is_small, 0.5 * (h ** 2) + (c_batch * (h ** 3)) / 6.0, (expm1_ch - ch) / (safe_c ** 2))
+            
+            x_next = x * exp_ch + term_A * v1 + term_B * v2
+            
+            x_prev = x.detach()
+            d_prev = v.detach()
+            t_prev = t
+            x = x_next
+            
+    return x

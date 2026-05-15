@@ -9,6 +9,13 @@ import torch
 
 from modules import shared
 
+from backend.logging import setup_logger
+import logging
+logger = logging.getLogger("prompt_parser")
+setup_logger(logger)
+
+logger.info("[Actias] Prompt Parser Extension Loaded (Anchored Blend + Token Alignment)")
+
 # a prompt like this: "fantasy landscape with a [mountain:lake:0.25] and [an oak:a christmas tree:0.75] [in foreground::0.6] [:in background:0.25] [shoddy:masterful:0.5]"
 # will be represented with prompt_schedule like this (assuming steps=100):
 # [25,  'fantasy landscape with a mountain and an oak in foreground shoddy']
@@ -19,22 +26,25 @@ from modules import shared
 
 schedule_parser = lark.Lark(
     r"""
-!start: (prompt | /[][():]/+)*
-prompt: (emphasized | scheduled | alternate | blended | plain | WHITESPACE)*
+!start: (prompt | /[][():|~]/+)*
+?prompt: (scheduled | alternate | blended | emphasized | plain | WHITESPACE)*
 !emphasized: "(" prompt ")"
         | "(" prompt ":" prompt ")"
         | "[" prompt "]"
 scheduled: "[" [prompt ":"] prompt ":" [WHITESPACE] NUMBER [WHITESPACE] "]"
-alternate: "[" prompt ("|" [prompt])+ "]"
-blended: "[" prompt ("~" [prompt])+ "]"
+alternate.2: "[" prompt_item ("|" [prompt_item])+ "]"
+blended.2: "[" prompt_item ("~" [prompt_item])+ "]"
+prompt_item: (scheduled | alternate | blended | emphasized | plain_item | WHITESPACE)*
 WHITESPACE: /\s+/
 plain: /([^\\\[\]():|~]|\\.)+/
+plain_item: /([^\\\[\]()|~]|\\.)+/
 %import common.SIGNED_NUMBER -> NUMBER
 """
 )
 
 
 def get_learned_conditioning_prompt_schedules(prompts, base_steps, hires_steps=None, use_old_scheduling=False):
+    logger.info(f"Conditioning: Processing {len(prompts)} prompt schedules (Steps: {base_steps})")
     r"""
     >>> g = lambda p: get_learned_conditioning_prompt_schedules([p], 10)[0]
     >>> g("test")
@@ -131,6 +141,9 @@ def get_learned_conditioning_prompt_schedules(prompts, base_steps, hires_steps=N
 
             def plain(self, args):
                 yield args[0].value
+            
+            def plain_item(self, args):
+                yield args[0].value
 
             def __default__(self, data, children, meta):
                 for child in children:
@@ -141,11 +154,8 @@ def get_learned_conditioning_prompt_schedules(prompts, base_steps, hires_steps=N
     def get_schedule(prompt):
         try:
             tree = schedule_parser.parse(prompt)
-        except lark.exceptions.LarkError:
-            if 0:
-                import traceback
-
-                traceback.print_exc()
+        except lark.exceptions.LarkError as e:
+            logger.info(f"[Actias] Parse failed for prompt: {prompt[:100]}... Error: {str(e)[:100]}")
             return [[steps, prompt]]
 
         use_legacy_alternation = getattr(shared.opts, "use_legacy_alternation_behavior", False)
@@ -187,12 +197,51 @@ def get_learned_conditioning_prompt_schedules(prompts, base_steps, hires_steps=N
                     
                 evaluated_prompts = [eval_topdown(p, step, state) if p else "" for p in prompts]
                 
-                items = []
+                parsed_items = []
                 for p in evaluated_prompts:
-                    match = re.search(r"^(.*?)(?::([-+]?(?:\d+\.?|\d*\.\d+)))?$", p)
-                    text, weight = match.groups() if match else (p, "1.0")
-                    weight = float(weight) if weight is not None else 1.0
-                    items.append((text, weight))
+                    p_str = str(p).strip()
+                    # Match weight suffix like ":1.2"
+                    match = re.search(r"^\s*(.*?)\s*:\s*([-+]?(?:\d+\.?|\d*\.\d+))\s*$", p_str)
+                    
+                    if match:
+                        text, weight_str = match.groups()
+                        weight = float(weight_str)
+                        if isinstance(p, LatentBlendNode):
+                            # It's a nested blend with a weight suffix
+                            suffix = p_str[len(text):].strip()
+                            
+                            def _strip(n):
+                                if isinstance(n, LatentBlendNode):
+                                    return LatentBlendNode([[_strip(c), w] for c, w in n.items])
+                                s = str(n)
+                                if s.endswith(suffix):
+                                    return s[:-len(suffix)]
+                                return s
+                            
+                            p = _strip(p)
+                            parsed_items.append([p, weight])
+                        else:
+                            parsed_items.append([text.strip(), weight])
+                    else:
+                        parsed_items.append([p, None])
+                        
+                explicit_sum = sum(w for _, w in parsed_items if w is not None)
+                unweighted = [item for item in parsed_items if item[1] is None]
+                
+                if len(unweighted) > 0:
+                    remainder = max(0.0, 1.0 - explicit_sum)
+                    fill_weight = remainder / len(unweighted)
+                else:
+                    fill_weight = 1.0
+                    
+                items = []
+                for text, w in parsed_items:
+                    final_w = w if w is not None else fill_weight
+                    items.append([text, final_w])
+                
+                # Clean Logging: show the user the resolved weights
+                weight_report = ", ".join([f"{str(t)[:50]}: {w:.2f}" for t, w in items])
+                logger.info(f"Prompt Blend: Resolved [{weight_report}]")
                     
                 return LatentBlendNode(items)
                 
@@ -211,10 +260,14 @@ def get_learned_conditioning_prompt_schedules(prompts, base_steps, hires_steps=N
                     rest = combine(items[1:])
                     
                     if isinstance(first, LatentBlendNode):
-                        new_items = [(combine([item[0], rest]), item[1]) for item in first.items]
+                        new_items = []
+                        for child, weight in first.items:
+                            new_items.append((combine([child, rest]), weight))
                         return LatentBlendNode(new_items)
                     elif isinstance(rest, LatentBlendNode):
-                        new_items = [(combine([first, item[0]]), item[1]) for item in rest.items]
+                        new_items = []
+                        for child, weight in rest.items:
+                            new_items.append((combine([first, child]), weight))
                         return LatentBlendNode(new_items)
                     else:
                         return str(first) + str(rest)
@@ -235,10 +288,155 @@ def get_learned_conditioning_prompt_schedules(prompts, base_steps, hires_steps=N
 
 class LatentBlendNode(str):
     def __new__(cls, items):
+        # We still use the longest string for compatibility with length-checks in SD
         longest = str(max((item[0] for item in items), key=lambda x: len(str(x))))
         obj = str.__new__(cls, longest)
         obj.items = items
         return obj
+
+    def __repr__(self):
+        return f"[LatentBlendNode: {str(self)}]"
+
+
+class LayeredConditioning:
+    def __init__(self, in_mid_cond, out_cond):
+        self.in_mid_cond = in_mid_cond
+        self.out_cond = out_cond
+
+    @property
+    def shape(self):
+        if isinstance(self.in_mid_cond, dict):
+            return self.in_mid_cond["crossattn"].shape
+        return self.in_mid_cond.shape
+
+    @property
+    def dtype(self):
+        def _dtype(c):
+            if isinstance(c, dict):
+                # Return the dtype of the first tensor found in the dict
+                for v in c.values():
+                    if isinstance(v, torch.Tensor):
+                        return v.dtype
+                return torch.float32
+            elif isinstance(c, torch.Tensor):
+                return c.dtype
+            return torch.float32
+        return _dtype(self.in_mid_cond)
+
+    @property
+    def device(self):
+        def _device(c):
+            if isinstance(c, dict):
+                # Return the device of the first tensor found in the dict
+                for v in c.values():
+                    if isinstance(v, torch.Tensor):
+                        return v.device
+                return torch.device("cpu")
+            elif isinstance(c, torch.Tensor):
+                return c.device
+            return torch.device("cpu")
+        return _device(self.in_mid_cond)
+
+    def to(self, *args, **kwargs):
+        def _to(c):
+            if isinstance(c, dict):
+                return DictWithShape({k: v.to(*args, **kwargs) if isinstance(v, torch.Tensor) else v for k, v in c.items()}, shape=getattr(c, 'shape', None))
+            elif isinstance(c, torch.Tensor):
+                return c.to(*args, **kwargs)
+            return c
+        return LayeredConditioning(_to(self.in_mid_cond), _to(self.out_cond))
+
+    def __getitem__(self, item):
+        if isinstance(item, str):
+            def _get_val(c):
+                if isinstance(c, dict):
+                    return c.get(item, None)
+                return None
+            val_in_mid = _get_val(self.in_mid_cond)
+            val_out = _get_val(self.out_cond)
+            
+            if val_in_mid is None and val_out is None:
+                return None
+            return LayeredConditioning(val_in_mid, val_out)
+
+        def _get(c):
+            if isinstance(c, dict):
+                res = {k: v[item] if isinstance(v, torch.Tensor) else v for k, v in c.items()}
+                return DictWithShape(res, shape=getattr(c, 'shape', None))
+            elif isinstance(c, torch.Tensor):
+                return c[item]
+            return c
+        return LayeredConditioning(_get(self.in_mid_cond), _get(self.out_cond))
+
+    def advanced_indexing(self, item):
+        return self.__getitem__(item)
+
+    def repeat(self, *args, **kwargs):
+        def _repeat(c):
+            if isinstance(c, dict):
+                res = {k: v.repeat(*args, **kwargs) if isinstance(v, torch.Tensor) else v for k, v in c.items()}
+                return DictWithShape(res, shape=getattr(c, 'shape', None))
+            elif isinstance(c, torch.Tensor):
+                return c.repeat(*args, **kwargs)
+            return c
+        return LayeredConditioning(_repeat(self.in_mid_cond), _repeat(self.out_cond))
+
+    def chunk(self, *args, **kwargs):
+        def _chunk(c):
+            if isinstance(c, dict):
+                chunks = [{} for _ in range(args[0] if args else 1)]
+                for k, v in c.items():
+                    if isinstance(v, torch.Tensor):
+                        for i, chunk_v in enumerate(v.chunk(*args, **kwargs)):
+                            chunks[i][k] = chunk_v
+                    else:
+                        for i in range(len(chunks)):
+                            chunks[i][k] = v
+                return [DictWithShape(ch, shape=getattr(c, 'shape', None)) for ch in chunks]
+            elif isinstance(c, torch.Tensor):
+                return c.chunk(*args, **kwargs)
+            return [c]
+        
+        in_mid_chunks = _chunk(self.in_mid_cond)
+        out_chunks = _chunk(self.out_cond)
+        return [LayeredConditioning(i, o) for i, o in zip(in_mid_chunks, out_chunks)]
+
+
+def align_token_ids(token_ids_list, pad_id):
+    if not token_ids_list:
+        return token_ids_list
+    
+    # 1. Find common prefix
+    prefix_len = 0
+    min_len = min(len(ids) for ids in token_ids_list)
+    for i in range(min_len):
+        if all(ids[i] == token_ids_list[0][i] for ids in token_ids_list):
+            prefix_len += 1
+        else:
+            break
+            
+    # 2. Find common suffix
+    suffix_len = 0
+    for i in range(1, min_len - prefix_len + 1):
+        if all(ids[-i] == token_ids_list[0][-i] for ids in token_ids_list):
+            suffix_len += 1
+        else:
+            break
+            
+    # 3. Differing middle parts
+    max_mid_len = max(len(ids) - prefix_len - suffix_len for ids in token_ids_list)
+    
+    aligned = []
+    for ids in token_ids_list:
+        prefix = ids[:prefix_len]
+        suffix = ids[len(ids)-suffix_len:] if suffix_len > 0 else []
+        mid = ids[prefix_len : len(ids)-suffix_len] if suffix_len > 0 else ids[prefix_len:]
+        
+        # Pad mid part at the end
+        padded_mid = list(mid) + [pad_id] * (max_mid_len - len(mid))
+        aligned.append(prefix + padded_mid + suffix)
+        
+    return aligned
 
 
 ScheduledPromptConditioning = namedtuple("ScheduledPromptConditioning", ["end_at_step", "cond"])
@@ -263,25 +461,14 @@ class SdConditioning(list):
         self.distilled_cfg_scale = distilled_cfg_scale or getattr(copy_from, "distilled_cfg_scale", None)
 
 
+class PrealignedString(str):
+    def __new__(cls, text, aligned_tokens_dict):
+        obj = str.__new__(cls, text)
+        obj.aligned_tokens_dict = aligned_tokens_dict
+        return obj
+
+
 def get_learned_conditioning(model, prompts: SdConditioning | list[str], steps, hires_steps=None, use_old_scheduling=False):
-    r"""
-    converts a list of prompts into a list of prompt schedules - each schedule is a list of ScheduledPromptConditioning,
-    specifying the condition (cond), and the sampling step at which this condition is to be replaced by the next one.
-
-    Input:
-    (model, ['a red crown', 'a [blue:green:5] jeweled crown'], 20)
-
-    Output:
-    [
-        [
-            ScheduledPromptConditioning(end_at_step=20, cond=tensor([[-0.3886,  0.0229, -0.0523,  ..., -0.4901, -0.3066,  0.0674], ..., [ 0.3317, -0.5102, -0.4066,  ...,  0.4119, -0.7647, -1.0160]], device='cuda:0'))
-        ],
-        [
-            ScheduledPromptConditioning(end_at_step=5, cond=tensor([[-0.3886,  0.0229, -0.0522,  ..., -0.4901, -0.3067,  0.0673], ..., [-0.0192,  0.3867, -0.4644,  ...,  0.1135, -0.3696, -0.4625]], device='cuda:0')),
-            ScheduledPromptConditioning(end_at_step=20, cond=tensor([[-0.3886,  0.0229, -0.0522,  ..., -0.4901, -0.3067,  0.0673], ..., [-0.7352, -0.4356, -0.7888,  ...,  0.6994, -0.4312, -1.2593]], device='cuda:0'))
-        ]
-    ]
-    """
     res = []
 
     prompt_schedules = get_learned_conditioning_prompt_schedules(prompts, steps, hires_steps, use_old_scheduling)
@@ -294,17 +481,51 @@ def get_learned_conditioning(model, prompts: SdConditioning | list[str], steps, 
             res.append(cached)
             continue
 
-        texts_to_encode = []
-        def extract_texts(node):
-            if isinstance(node, LatentBlendNode):
-                for item in node.items:
-                    extract_texts(item[0])
+        # 1. Expand the tree to find every unique prompt permutation string
+        all_unique_texts = set()
+        
+        def find_all_texts(n):
+            if isinstance(n, LatentBlendNode):
+                for child, _ in n.items:
+                    find_all_texts(child)
             else:
-                if node not in texts_to_encode:
-                    texts_to_encode.append(node)
-                    
+                all_unique_texts.add(str(n))
+        
         for _, text_or_blend in prompt_schedule:
-            extract_texts(text_or_blend)
+            find_all_texts(text_or_blend)
+            
+        unique_texts_list = list(all_unique_texts)
+
+        # 2. Global Token Alignment pass
+        tokenizers = {}
+        if hasattr(model, "forge_objects"):
+            tokenizers = getattr(model.forge_objects.clip.tokenizer, "__dict__", {})
+            
+        aligned_token_ids_map = {} # (text, tokenizer_key) -> ids
+
+        for k, tokenizer in tokenizers.items():
+            if tokenizer is None or k.startswith("__"): continue
+            try:
+                token_ids_list = [tokenizer([t], add_special_tokens=False)["input_ids"][0] for t in unique_texts_list]
+                pad_id = getattr(tokenizer, "pad_token_id", 0) or 0
+                aligned_ids = align_token_ids(token_ids_list, pad_id)
+                
+                for text, ids in zip(unique_texts_list, aligned_ids):
+                    aligned_token_ids_map[(text, k)] = ids
+            except Exception as e:
+                logger.error(f"[Actias] Global Alignment failed for {k}: {e}")
+
+        # 3. Create PrealignedString objects for encoding
+        prealigned_objects = {}
+        texts_to_encode = []
+        for text in unique_texts_list:
+            token_dict = {tk: aligned_token_ids_map[(text, tk)] for tk in tokenizers.keys() if (text, tk) in aligned_token_ids_map}
+            obj = PrealignedString(text, token_dict)
+            prealigned_objects[text] = obj
+            texts_to_encode.append(obj)
+
+        if not texts_to_encode:
+            texts_to_encode = [prompt]
             
         texts_obj = SdConditioning(texts_to_encode, copy_from=prompts)
         encoded_conds = model.get_learned_conditioning(texts_obj)
@@ -318,13 +539,103 @@ def get_learned_conditioning(model, prompts: SdConditioning | list[str], steps, 
                 
         cond_dict = dict(zip(texts_to_encode, encoded_list))
         
+        # 4. Final Recursive Resolution (Surgical Delta Grafting)
         def build_cond(node):
             if isinstance(node, LatentBlendNode):
-                conds = [build_cond(item[0]) for item in node.items]
-                weights = [item[1] for item in node.items]
-                return n_way_blend_conds(conds, weights, alpha=1.0)
+                # 4a. Identify the "Global Baseline" string and generate a Slot Mask
+                # The mask tracks which token indices belong to a blend slot (True) vs static (False)
+                tokenizers = {}
+                if hasattr(model, "forge_objects"):
+                    tokenizers = getattr(model.forge_objects.clip.tokenizer, "__dict__", {})
+                
+                # We'll use the first available tokenizer to build the mask
+                tokenizer_key = next((k for k in tokenizers.keys() if not k.startswith("__")), "default")
+                
+                def get_metadata(n):
+                    if isinstance(n, LatentBlendNode):
+                        # Find the baseline child marker
+                        base_child = next((c for c, w in n.items if w < 0.0), None)
+                        if base_child is None:
+                            base_child = n.items[0][0]
+                            
+                        # Recursively find the baseline text and sub-masks
+                        base_text, sub_mask = get_metadata(base_child)
+                        
+                        # Get the aligned token IDs for this node to determine slot range
+                        ids = aligned_token_ids_map.get((str(n), tokenizer_key), [])
+                        ids_base = aligned_token_ids_map.get((str(base_text), tokenizer_key), [])
+                        
+                        # A slot index is any index where the variant IDs differ from baseline IDs
+                        node_mask = [i != j for i, j in zip(ids, ids_base)]
+                        
+                        # Merge sub_mask into node_mask (OR logic)
+                        if not sub_mask:
+                            return base_text, node_mask
+                            
+                        mlen = max(len(node_mask), len(sub_mask))
+                        merged = []
+                        for i in range(mlen):
+                            v1 = node_mask[i] if i < len(node_mask) else False
+                            v2 = sub_mask[i] if i < len(sub_mask) else False
+                            merged.append(v1 or v2)
+                        return base_text, merged
+                    return str(n), []
+
+                baseline_text, raw_mask = get_metadata(node)
+                baseline_obj = cond_dict.get(prealigned_objects.get(baseline_text), None)
+                
+                # Convert raw_mask to a tensor [Batch, Seq, 1]
+                seq_len = baseline_obj["crossattn"].shape[1] if isinstance(baseline_obj, dict) else baseline_obj.shape[0]
+                full_mask = torch.zeros((1, seq_len, 1), dtype=torch.bool)
+                
+                # Correct index mapping accounting for BOS/EOS tokens at every 77th position (chunk size 75)
+                # Formula: tensor_idx = 1 + i + 2 * (i // 75)
+                for i, is_unique in enumerate(raw_mask):
+                    idx = 1 + i + 2 * (i // 75)
+                    if idx < seq_len:
+                        full_mask[0, idx, 0] = is_unique
+
+                # 4b. Flatten and blend aligned permutations
+                flat_perms = []
+                def _expand(n, w_acc=1.0, path=""):
+                    if isinstance(n, LatentBlendNode):
+                        for child, w in n.items:
+                            if w < 0.0: continue # Skip baseline marker
+                            child_text = str(child)
+                            new_path = f"{path} + {child_text[:15]}" if path else child_text[:15]
+                            _expand(child, w_acc * w, new_path)
+                    else:
+                        text = str(n)
+                        obj = prealigned_objects.get(text, n)
+                        flat_perms.append((obj, w_acc, path))
+                
+                _expand(node)
+                
+                # Consolidate weights
+                consolidated = {}
+                for obj, weight, path in flat_perms:
+                    curr_w, curr_p = consolidated.get(obj, (0.0, path))
+                    consolidated[obj] = (curr_w + weight, curr_p)
+                
+                final_items = []
+                for obj, (w, p) in consolidated.items():
+                    final_items.append((obj, w, p))
+                final_items.sort(key=lambda x: str(x[0]))
+                
+                # Surgical Blending
+                from backend.text_processing.blending import surgical_delta_blend_conds
+                
+                logger.info(f"Prompt Blend: Surgically grafting {len(final_items)} aligned deltas onto baseline.")
+                
+                variants = [cond_dict[obj] for obj, w, p in final_items]
+                weights = [w for obj, w, p in final_items]
+                
+                return surgical_delta_blend_conds(baseline_obj, variants, weights, full_mask, alpha=0.0)
             else:
-                return cond_dict[node]
+                # Leaf node
+                text = str(node)
+                obj = prealigned_objects.get(text, node)
+                return cond_dict.get(obj, None)
                 
         cond_schedule = []
         for end_at_step, text_or_blend in prompt_schedule:
@@ -424,20 +735,13 @@ class DictWithShape(dict):
         return DictWithShape(result)
 
 
+from backend.text_processing.blending import n_way_blend, blend_layered_conds, pad_tensors
+
+
 def _pad_seq(t1, t2):
-    if getattr(t1, 'ndim', 0) < 2 or getattr(t2, 'ndim', 0) < 2: return t1, t2
-    seq_dim = 1 if getattr(t1, 'ndim', 0) == 3 else 0
-    if t1.shape[seq_dim] != t2.shape[seq_dim]:
-        max_len = max(t1.shape[seq_dim], t2.shape[seq_dim])
-        
-        pad_shape1 = list(t1.shape)
-        pad_shape1[seq_dim] = max_len - t1.shape[seq_dim]
-        t1 = torch.cat([t1, torch.zeros(pad_shape1, dtype=t1.dtype, device=t1.device)], dim=seq_dim)
-        
-        pad_shape2 = list(t2.shape)
-        pad_shape2[seq_dim] = max_len - t2.shape[seq_dim]
-        t2 = torch.cat([t2, torch.zeros(pad_shape2, dtype=t2.dtype, device=t2.device)], dim=seq_dim)
-    return t1, t2
+    res = pad_tensors([t1, t2])
+    return res[0], res[1]
+
 def slerp_tensor(val: float, low: torch.Tensor, high: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
     low_n = torch.linalg.vector_norm(low, dim=dim, keepdim=True)
     high_n = torch.linalg.vector_norm(high, dim=dim, keepdim=True)
@@ -463,98 +767,22 @@ def n_way_blend_conds(conds, weights, alpha=1.0):
     if total_weight <= 0.001:
         return conds[0]
         
-    normalized_weights = [w / total_weight for w in weights]
+    in_mid_inputs = [c.in_mid_cond if isinstance(c, LayeredConditioning) else c for c in conds]
+    out_inputs = [c.out_cond if isinstance(c, LayeredConditioning) else c for c in conds]
+
+    # Dual-Alpha Routing for Layered Conditioning
+    comp_alpha = alpha if alpha < 0.5 else 0.8
+    style_alpha = alpha if alpha < 0.5 else 0.0
     
-    if isinstance(conds[0], dict):
-        res = {}
-        for k in conds[0].keys():
-            tensors = [c[k] for c in conds if k in c]
-            if len(tensors) != len(conds) or not all(isinstance(t, torch.Tensor) for t in tensors):
-                res[k] = conds[0][k]
-                continue
-                
-            if tensors[0].ndim < 2:
-                padded = tensors
-            else:
-                seq_dim = 1 if tensors[0].ndim == 3 else 0
-                max_len = max(t.shape[seq_dim] for t in tensors)
-                padded = []
-                for t in tensors:
-                    if t.shape[seq_dim] < max_len:
-                        pad_shape = list(t.shape)
-                        pad_shape[seq_dim] = max_len - t.shape[seq_dim]
-                        t = torch.cat([t, torch.zeros(pad_shape, dtype=t.dtype, device=t.device)], dim=seq_dim)
-                    padded.append(t)
-            
-            norms = [torch.linalg.vector_norm(t, dim=-1, keepdim=True).clamp(min=1e-12) for t in padded]
-            
-            # Weighted Geometric Mean
-            log_gm = sum(w * torch.log(n) for w, n in zip(normalized_weights, norms))
-            gm = torch.exp(log_gm)
-            
-            # Arithmetic Mean
-            mean_norm = sum(w * n for w, n in zip(normalized_weights, norms))
-            target_norm = torch.lerp(mean_norm, gm, alpha)
-            
-            directions = [t / n for t, n in zip(padded, norms)]
-            blended_dir = sum(w * d for w, d in zip(normalized_weights, directions))
-            blended_dir = blended_dir / torch.linalg.vector_norm(blended_dir, dim=-1, keepdim=True).clamp(min=1e-12)
-            
-            res[k] = blended_dir * target_norm
-            
-        if hasattr(conds[0], "shape"):
-            return type(conds[0])(res, shape=getattr(conds[0], 'shape', None))
-        return type(conds[0])(res)
-        
-    elif isinstance(conds[0], torch.Tensor):
-        tensors = conds
-        if tensors[0].ndim < 2:
-            padded = tensors
-        else:
-            seq_dim = 1 if tensors[0].ndim == 3 else 0
-            max_len = max(t.shape[seq_dim] for t in tensors)
-            padded = []
-            for t in tensors:
-                if t.shape[seq_dim] < max_len:
-                    pad_shape = list(t.shape)
-                    pad_shape[seq_dim] = max_len - t.shape[seq_dim]
-                    t = torch.cat([t, torch.zeros(pad_shape, dtype=t.dtype, device=t.device)], dim=seq_dim)
-                padded.append(t)
-            
-        norms = [torch.linalg.vector_norm(t, dim=-1, keepdim=True).clamp(min=1e-12) for t in padded]
-        log_gm = sum(w * torch.log(n) for w, n in zip(normalized_weights, norms))
-        gm = torch.exp(log_gm)
-        mean_norm = sum(w * n for w, n in zip(normalized_weights, norms))
-        target_norm = torch.lerp(mean_norm, gm, alpha)
-        
-        directions = [t / n for t, n in zip(padded, norms)]
-        blended_dir = sum(w * d for w, d in zip(normalized_weights, directions))
-        blended_dir = blended_dir / torch.linalg.vector_norm(blended_dir, dim=-1, keepdim=True).clamp(min=1e-12)
-        
-        return blended_dir * target_norm
-        
-    return conds[0]
+    return LayeredConditioning(
+        blend_layered_conds(in_mid_inputs, weights, comp_alpha),
+        blend_layered_conds(out_inputs, weights, style_alpha)
+    )
 
 
 def blend_conds(cond1, cond2, weight):
-    if weight <= 0.001:
-        return cond1
-    if weight >= 0.999:
-        return cond2
-    if isinstance(cond1, dict):
-        res = {}
-        for k in cond1.keys():
-            if isinstance(cond1[k], torch.Tensor) and isinstance(cond2[k], torch.Tensor):
-                t1, t2 = _pad_seq(cond1[k], cond2[k])
-                res[k] = slerp_tensor(weight, t1, t2, dim=-1)
-            else:
-                res[k] = cond1[k]
-        if hasattr(cond1, "shape"):
-            return type(cond1)(res, shape=getattr(cond1, 'shape', None))
-        return type(cond1)(res)
-    else:
-        t1, t2 = _pad_seq(cond1, cond2)
-        return slerp_tensor(weight, t1, t2, dim=-1)
+    return n_way_blend_conds([cond1, cond2], [1.0 - weight, weight])
+
 
 
 def get_continuous_cond(schedules, step_float):
@@ -596,12 +824,17 @@ def reconstruct_cond_batch(c: list[list[ScheduledPromptConditioning]], current_s
         step_float = float(current_step)
 
     param = c[0][0].cond
+    if isinstance(param, LayeredConditioning):
+        in_mid_batch = reconstruct_cond_batch([[ScheduledPromptConditioning(s.end_at_step, s.cond.in_mid_cond) for s in sched] for sched in c], current_step, step_float)
+        out_batch = reconstruct_cond_batch([[ScheduledPromptConditioning(s.end_at_step, s.cond.out_cond) for s in sched] for sched in c], current_step, step_float)
+        return LayeredConditioning(in_mid_batch, out_batch)
+
     is_dict = isinstance(param, dict)
 
     if is_dict:
         dict_cond = param
         res = {k: torch.zeros((len(c),) + param.shape, device=param.device, dtype=param.dtype) for k, param in dict_cond.items()}
-        res = DictWithShape(res)
+        res = DictWithShape(res, shape=getattr(dict_cond, 'shape', None))
     else:
         res = torch.zeros((len(c),) + param.shape, device=param.device, dtype=param.dtype)
 
@@ -638,6 +871,30 @@ def reconstruct_multicond_batch(c: MulticondLearnedConditioning, current_step, s
         step_float = float(current_step)
 
     param = c.batch[0][0].schedules[0].cond
+    if isinstance(param, LayeredConditioning):
+        # We need to manually reconstruct this because MulticondLearnedConditioning is complex
+        # But we can just create two MulticondLearnedConditioning objects!
+        
+        batch_in_mid = []
+        batch_out = []
+        for composable_prompts in c.batch:
+            scheds_in_mid = []
+            scheds_out = []
+            for cp in composable_prompts:
+                s_in_mid = [ScheduledPromptConditioning(s.end_at_step, s.cond.in_mid_cond) for s in cp.schedules]
+                s_out = [ScheduledPromptConditioning(s.end_at_step, s.cond.out_cond) for s in cp.schedules]
+                scheds_in_mid.append(ComposableScheduledPromptConditioning(s_in_mid, cp.weight))
+                scheds_out.append(ComposableScheduledPromptConditioning(s_out, cp.weight))
+            batch_in_mid.append(scheds_in_mid)
+            batch_out.append(scheds_out)
+            
+        m_in_mid = MulticondLearnedConditioning(c.shape, batch_in_mid)
+        m_out = MulticondLearnedConditioning(c.shape, batch_out)
+        
+        conds_list, stacked_in_mid = reconstruct_multicond_batch(m_in_mid, current_step, step_float)
+        _, stacked_out = reconstruct_multicond_batch(m_out, current_step, step_float)
+        
+        return conds_list, LayeredConditioning(stacked_in_mid, stacked_out)
 
     tensors = []
     conds_list = []
@@ -654,7 +911,7 @@ def reconstruct_multicond_batch(c: MulticondLearnedConditioning, current_step, s
     if isinstance(tensors[0], dict):
         keys = list(tensors[0].keys())
         stacked = {k: stack_conds([x[k] for x in tensors]) for k in keys}
-        stacked = DictWithShape(stacked)
+        stacked = DictWithShape(stacked, shape=getattr(tensors[0], 'shape', None))
     else:
         stacked = stack_conds(tensors).to(device=param.device, dtype=param.dtype)
 

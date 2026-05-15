@@ -22,6 +22,7 @@ class T5TextProcessingEngine:
         self.min_padding = min_padding
         self.id_end = 1
         self.id_pad = 0
+        self.break_tokens = self.tokenizer(["BREAK"], add_special_tokens=False)["input_ids"][0]
 
     def tokenize(self, texts):
         tokenized = self.tokenizer(texts, truncation=False, add_special_tokens=False)["input_ids"]
@@ -91,7 +92,47 @@ class T5TextProcessingEngine:
             if line in cache:
                 line_z_values = cache[line]
             else:
-                chunks, token_count = self.tokenize_line(line)
+                tokens = None
+                if hasattr(line, "aligned_tokens_dict") and line.aligned_tokens_dict is not None:
+                    tokens = line.aligned_tokens_dict.get("t5xxl", None)
+                elif hasattr(line, "aligned_tokens") and line.aligned_tokens is not None:
+                    tokens = line.aligned_tokens
+                
+                if tokens is not None:
+                    chunks = []
+                    current_chunk = PromptChunk()
+                    
+                    def pad_chunk(c):
+                        c.tokens = c.tokens + [self.id_end]
+                        c.multipliers = c.multipliers + [1.0]
+
+                        if self.min_padding > 0:
+                            c.tokens += [self.id_pad] * self.min_padding
+                            c.multipliers += [1.0] * self.min_padding
+
+                        current_chunk_length = len(c.tokens)
+                        remaining_count = self.min_length - current_chunk_length
+
+                        if self.min_length > 0 and remaining_count > 0:
+                            c.tokens += [self.id_pad] * remaining_count
+                            c.multipliers += [1.0] * remaining_count
+                        return c
+
+                    pos = 0
+                    while pos < len(tokens):
+                        if self.break_tokens and tokens[pos : pos + len(self.break_tokens)] == self.break_tokens:
+                            chunks.append(pad_chunk(current_chunk))
+                            current_chunk = PromptChunk()
+                            pos += len(self.break_tokens)
+                            continue
+                        current_chunk.tokens.append(tokens[pos])
+                        current_chunk.multipliers.append(1.0)
+                        pos += 1
+                    chunks.append(pad_chunk(current_chunk))
+                    token_count = sum(len(c.tokens) for c in chunks)
+                else:
+                    chunks, token_count = self.tokenize_line(line)
+                
                 line_z_values = []
 
                 # pad all chunks to length of longest chunk

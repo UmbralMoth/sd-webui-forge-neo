@@ -89,12 +89,26 @@ class GemmaTextProcessingEngine:
         self.emphasis = emphasis.get_current_option(opts.emphasis)()
 
         for line in texts:
-            line = self.process_template(line, texts.is_negative_prompt)
+            line_str = self.process_template(line, texts.is_negative_prompt)
 
-            if line in cache:
-                line_z_values = cache[line]
+            if line_str in cache:
+                line_z_values = cache[line_str]
             else:
-                chunks = self.tokenize_line(line)
+                tokens = None
+                if hasattr(line, "aligned_tokens_dict") and line.aligned_tokens_dict is not None:
+                    tokens = line.aligned_tokens_dict.get("gemma", None)
+
+                if tokens is not None:
+                    template = opts.neta_template_negative if texts.is_negative_prompt else opts.neta_template_positive
+                    template_tokens = self.tokenizer(template + "\n", add_special_tokens=False)["input_ids"]
+                    
+                    chunk = PromptChunk()
+                    chunk.tokens = [self.id_start] + template_tokens + tokens
+                    chunk.multipliers = [1.0] * (len(template_tokens) + len(tokens) + 1)
+                    chunks = [chunk]
+                else:
+                    chunks = self.tokenize_line(line_str)
+
                 line_z_values = []
 
                 for chunk in chunks:

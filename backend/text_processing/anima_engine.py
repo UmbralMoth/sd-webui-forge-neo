@@ -86,7 +86,22 @@ class AnimaTextProcessingEngine:
             if line in cache:
                 z, qwen_mask, chunk = cache[line]
             else:
-                chunks: list[PromptChunk] = self.tokenize_line(line)
+                tokens_qwen = None
+                tokens_t5 = None
+                if hasattr(line, "aligned_tokens_dict") and line.aligned_tokens_dict is not None:
+                    tokens_qwen = line.aligned_tokens_dict.get("qwen", None)
+                    tokens_t5 = line.aligned_tokens_dict.get("t5", None)
+
+                if tokens_qwen is not None and tokens_t5 is not None:
+                    chunk = PromptChunk()
+                    chunk.qwen_tokens = [self.id_pad] + tokens_qwen
+                    chunk.qwen_multipliers = [1.0] * (len(tokens_qwen) + 1)
+                    chunk.t5_tokens = tokens_t5 + [self.id_end]
+                    chunk.t5_multipliers = [1.0] * (len(tokens_t5) + 1)
+                    chunks = [chunk]
+                else:
+                    chunks: list[PromptChunk] = self.tokenize_line(line)
+
                 assert len(chunks) == 1
 
                 for chunk in chunks:

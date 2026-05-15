@@ -144,7 +144,7 @@ class StableDiffusionXL(ForgeDiffusionEngine):
 class StableDiffusionXLRF(StableDiffusionXL):
     """NoobAI Rectified Flow: SDXL UNet + 32-channel Flux2 VAE."""
 
-    matched_guesses = [model_list.SDXLRF]
+    matched_guesses = [model_list.SDXLRF, model_list.Mugen]
 
     def __init__(self, estimated_config, huggingface_components):
         # We cannot call super().__init__ directly because the UNet creation
@@ -153,9 +153,11 @@ class StableDiffusionXLRF(StableDiffusionXL):
         # shift=1.0, multiplier=1000 is the standard for SDXL-based flow models.
         ForgeDiffusionEngine.__init__(self, estimated_config, huggingface_components)
 
+        memory_management.logger.info("Using Rectified-Flow Scheduler (SDXL-Flow)...")
+
         clip = CLIP(model_dict={"clip_l": huggingface_components["text_encoder"], "clip_g": huggingface_components["text_encoder_2"]}, tokenizer_dict={"clip_l": huggingface_components["tokenizer"], "clip_g": huggingface_components["tokenizer_2"]})
 
-        vae = VAE(model=huggingface_components["vae"])
+        vae = VAE(model=huggingface_components["vae"], is_mugen=True)
 
         k_predictor = PredictionDiscreteFlow(estimated_config)
 

@@ -81,7 +81,8 @@ class ClassicTextProcessingEngine:
         model_embeddings.token_embedding = CLIPEmbeddingForTextualInversion(model_embeddings.token_embedding, self.embeddings, textual_inversion_key=embedding_key)
 
         vocab = self.tokenizer.get_vocab()
-        self.comma_token = vocab[",</w>"]
+        self.comma_token = vocab.get(",</w>", None)
+        self.break_tokens = self.tokenizer(["BREAK"], add_special_tokens=False)["input_ids"][0]
 
     def empty_chunk(self):
         chunk = PromptChunk()
@@ -216,7 +217,17 @@ class ClassicTextProcessingEngine:
             if line in cache:
                 chunks = cache[line]
             else:
-                chunks, current_token_count = self.tokenize_line(line)
+                if hasattr(line, "aligned_tokens_dict") and line.aligned_tokens_dict is not None:
+                    tokens = line.aligned_tokens_dict.get(self.embedding_key, None)
+                    if tokens is not None:
+                        chunks, current_token_count = self.tokenize_line_from_tokens(tokens)
+                    else:
+                        chunks, current_token_count = self.tokenize_line(line)
+                elif hasattr(line, "aligned_tokens") and line.aligned_tokens is not None:
+                    chunks, current_token_count = self.tokenize_line_from_tokens(line.aligned_tokens)
+                else:
+                    chunks, current_token_count = self.tokenize_line(line)
+
                 token_count = max(current_token_count, token_count)
 
                 cache[line] = chunks
@@ -224,6 +235,70 @@ class ClassicTextProcessingEngine:
             batch_chunks.append(chunks)
 
         return batch_chunks, token_count
+
+    def tokenize_line_from_tokens(self, tokens):
+        chunks = []
+        chunk = PromptChunk()
+        token_count = 0
+        last_comma = -1
+
+        def next_chunk(is_last=False):
+            nonlocal token_count
+            nonlocal last_comma
+            nonlocal chunk
+
+            if is_last:
+                token_count += len(chunk.tokens)
+            else:
+                token_count += self.chunk_length
+
+            to_add = self.chunk_length - len(chunk.tokens)
+            if to_add > 0:
+                chunk.tokens += [self.id_end] * to_add
+                chunk.multipliers += [1.0] * to_add
+
+            chunk.tokens = [self.id_start] + chunk.tokens + [self.id_end]
+            chunk.multipliers = [1.0] + chunk.multipliers + [1.0]
+
+            chunks.append(chunk)
+            chunk = PromptChunk()
+            last_comma = -1
+
+        position = 0
+        while position < len(tokens):
+            token = tokens[position]
+
+            if self.break_tokens and tokens[position : position + len(self.break_tokens)] == self.break_tokens:
+                next_chunk()
+                position += len(self.break_tokens)
+                continue
+
+            if token == self.comma_token:
+                last_comma = len(chunk.tokens)
+
+            if len(chunk.tokens) == self.chunk_length:
+                next_chunk()
+
+            embedding, embedding_length_in_tokens = self.embeddings.find_embedding_at_position(tokens, position)
+            if embedding is None:
+                chunk.tokens.append(token)
+                chunk.multipliers.append(1.0)
+                position += 1
+                continue
+
+            emb_len = int(embedding.vectors)
+            if len(chunk.tokens) + emb_len > self.chunk_length:
+                next_chunk()
+
+            chunk.fixes.append(PromptChunkFix(len(chunk.tokens), embedding))
+            chunk.tokens += [0] * emb_len
+            chunk.multipliers += [1.0] * emb_len
+            position += embedding_length_in_tokens
+
+        if chunk.tokens or not chunks:
+            next_chunk(is_last=True)
+
+        return chunks, token_count
 
     def __call__(self, texts):
         self.emphasis = emphasis.get_current_option(opts.emphasis)()

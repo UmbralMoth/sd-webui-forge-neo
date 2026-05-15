@@ -36,7 +36,7 @@ from backend.utils import (
 )
 from modules_forge.packages.comfy.utils import convert_diffusers_mmdit
 
-possible_models = [StableDiffusion, StableDiffusionXLRefiner, StableDiffusionXLRF, StableDiffusionXL, Mugen, Chroma, Flux, Flux2, Wan, QwenImage, Lumina2, ZImage, Anima]
+possible_models = [StableDiffusion, StableDiffusionXLRefiner, Mugen, StableDiffusionXLRF, StableDiffusionXL, Chroma, Flux, Flux2, Wan, QwenImage, Lumina2, ZImage, Anima]
 
 logger = logging.getLogger("loader")
 setup_logger(logger)

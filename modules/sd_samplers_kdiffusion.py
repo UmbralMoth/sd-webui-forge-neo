@@ -31,6 +31,7 @@ samplers_k_diffusion = [
     ("Restart", sd_samplers_extra.restart_sampler, ["restart"], {"scheduler": "karras", "second_order": True}),
     ("UniPC", sd_samplers_extra.sample_unipc, ["unipc"], {}),
     ("Forge Chimera", sd_samplers_extra.sample_forge_chimera, ["k_forge_chimera"], {"scheduler": "karras", "brownian_noise": True}),
+    ("A-FloPS", sd_samplers_extra.sample_aflops, ["k_aflops"], {}),
 ]
 
 
@@ -45,6 +46,7 @@ sampler_extra_params = {
     "sample_euler_ancestral": ["eta", "s_noise"],
     "sample_euler_a2": ["eta", "s_noise"],
     "sample_forge_chimera": ["eta", "s_noise"],
+    "sample_aflops": ["s_noise"],
     "sample_euler": ["s_churn", "s_tmin", "s_tmax", "s_noise"],
     "sample_heun": ["s_churn", "s_tmin", "s_tmax", "s_noise"],
     "sample_dpm_2": ["s_churn", "s_tmin", "s_tmax", "s_noise"],

@@ -265,15 +265,20 @@ class SDXLRF(SDXL):
 class Mugen(SDXL):
     huggingface_repo = "CabalResearch/Mugen"
 
-    unet_config = dict(SDXL.unet_config, out_channels=32)
+    unet_config = dict(SDXL.unet_config, in_channels=32, out_channels=32)
 
     sampling_settings = {
-        "shift": 12.0,
+        "shift": 9.0,
+        "multiplier": 1000,
+        "RF": True,
     }
 
-    latent_format = latent.SDXL_Flux2
+    latent_format = latent.SDXLRF
 
     vae_key_prefix = ["vae.", "first_stage_model."]
+
+    def model_type(self, state_dict: dict):
+        return ModelType.FLOW
 
     def inpaint_model(self):
         return False
@@ -600,9 +605,9 @@ class QwenImage(BASE):
 
 models = [
     SD15,
+    Mugen,
     SDXLRF,
     SDXL,
-    Mugen,
     SDXLRefiner,
     Flux,
     FluxSchnell,
