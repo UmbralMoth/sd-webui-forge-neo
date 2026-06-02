@@ -2,6 +2,132 @@
 import torch
 import math
 
+class DictWithShape(dict):
+    def __init__(self, x, shape=None):
+        super().__init__()
+        self.update(x)
+
+    @property
+    def shape(self):
+        return self["crossattn"].shape
+
+    def to(self, *args, **kwargs):
+        for k in self.keys():
+            if isinstance(self[k], torch.Tensor):
+                self[k] = self[k].to(*args, **kwargs)
+        return self
+
+    def advanced_indexing(self, item):
+        result = {}
+        for k in self.keys():
+            if isinstance(self[k], torch.Tensor):
+                result[k] = self[k][item]
+        return DictWithShape(result)
+
+
+class LayeredConditioning:
+    def __init__(self, in_mid_cond, out_cond):
+        self.in_mid_cond = in_mid_cond
+        self.out_cond = out_cond
+
+    @property
+    def shape(self):
+        if isinstance(self.in_mid_cond, dict):
+            return self.in_mid_cond["crossattn"].shape
+        return self.in_mid_cond.shape
+
+    @property
+    def dtype(self):
+        def _dtype(c):
+            if isinstance(c, dict):
+                # Return the dtype of the first tensor found in the dict
+                for v in c.values():
+                    if isinstance(v, torch.Tensor):
+                        return v.dtype
+                return torch.float32
+            elif isinstance(c, torch.Tensor):
+                return c.dtype
+            return torch.float32
+        return _dtype(self.in_mid_cond)
+
+    @property
+    def device(self):
+        def _device(c):
+            if isinstance(c, dict):
+                # Return the device of the first tensor found in the dict
+                for v in c.values():
+                    if isinstance(v, torch.Tensor):
+                        return v.device
+                return torch.device("cpu")
+            elif isinstance(c, torch.Tensor):
+                return c.device
+            return torch.device("cpu")
+        return _device(self.in_mid_cond)
+
+    def to(self, *args, **kwargs):
+        def _to(c):
+            if isinstance(c, dict):
+                return DictWithShape({k: v.to(*args, **kwargs) if isinstance(v, torch.Tensor) else v for k, v in c.items()}, shape=getattr(c, 'shape', None))
+            elif isinstance(c, torch.Tensor):
+                return c.to(*args, **kwargs)
+            return c
+        return LayeredConditioning(_to(self.in_mid_cond), _to(self.out_cond))
+
+    def __getitem__(self, item):
+        if isinstance(item, str):
+            def _get_val(c):
+                if isinstance(c, dict):
+                    return c.get(item, None)
+                return None
+            val_in_mid = _get_val(self.in_mid_cond)
+            val_out = _get_val(self.out_cond)
+            
+            if val_in_mid is None and val_out is None:
+                return None
+            return LayeredConditioning(val_in_mid, val_out)
+
+        def _get(c):
+            if isinstance(c, dict):
+                res = {k: v[item] if isinstance(v, torch.Tensor) else v for k, v in c.items()}
+                return DictWithShape(res, shape=getattr(c, 'shape', None))
+            elif isinstance(c, torch.Tensor):
+                return c[item]
+            return c
+        return LayeredConditioning(_get(self.in_mid_cond), _get(self.out_cond))
+
+    def advanced_indexing(self, item):
+        return self.__getitem__(item)
+
+    def repeat(self, *args, **kwargs):
+        def _repeat(c):
+            if isinstance(c, dict):
+                res = {k: v.repeat(*args, **kwargs) if isinstance(v, torch.Tensor) else v for k, v in c.items()}
+                return DictWithShape(res, shape=getattr(c, 'shape', None))
+            elif isinstance(c, torch.Tensor):
+                return c.repeat(*args, **kwargs)
+            return c
+        return LayeredConditioning(_repeat(self.in_mid_cond), _repeat(self.out_cond))
+
+    def chunk(self, *args, **kwargs):
+        def _chunk(c):
+            if isinstance(c, dict):
+                chunks = [{} for _ in range(args[0] if args else 1)]
+                for k, v in c.items():
+                    if isinstance(v, torch.Tensor):
+                        for i, chunk_v in enumerate(v.chunk(*args, **kwargs)):
+                            chunks[i][k] = chunk_v
+                    else:
+                        for i in range(len(chunks)):
+                            chunks[i][k] = v
+                return [DictWithShape(ch, shape=getattr(c, 'shape', None)) for ch in chunks]
+            elif isinstance(c, torch.Tensor):
+                return c.chunk(*args, **kwargs)
+            return [c]
+        
+        in_mid_chunks = _chunk(self.in_mid_cond)
+        out_chunks = _chunk(self.out_cond)
+        return [LayeredConditioning(i, o) for i, o in zip(in_mid_chunks, out_chunks)]
+
 def pad_tensors(tensors):
     """
     Pads a list of tensors to match the maximum sequence length using 'repeat last' strategy.
@@ -114,7 +240,15 @@ def blend_layered_conds(conds, weights=None, alpha=0.0, preserve_magnitude=True)
     if len(conds) == 1: return conds[0]
     
     first = conds[0]
-    if isinstance(first, dict):
+    if isinstance(first, LayeredConditioning):
+        # Recursive support for Layered Conditioning
+        in_mids = [c.in_mid_cond if isinstance(c, LayeredConditioning) else c for c in conds]
+        outs = [c.out_cond if isinstance(c, LayeredConditioning) else c for c in conds]
+        return LayeredConditioning(
+            blend_layered_conds(in_mids, weights, alpha, preserve_magnitude),
+            blend_layered_conds(outs, weights, alpha, preserve_magnitude)
+        )
+    elif isinstance(first, dict):
         res = {}
         all_keys = set().union(*(c.keys() for c in conds if isinstance(c, dict)))
         for k in all_keys:
@@ -123,7 +257,7 @@ def blend_layered_conds(conds, weights=None, alpha=0.0, preserve_magnitude=True)
                 res[k] = n_way_blend(subset, weights, alpha, preserve_magnitude=preserve_magnitude)
             else:
                 res[k] = subset[0] if subset else None
-        return res
+        return DictWithShape(res) if isinstance(first, DictWithShape) else res
     elif isinstance(first, torch.Tensor):
         return n_way_blend(conds, weights, alpha, preserve_magnitude=preserve_magnitude)
     
@@ -162,19 +296,27 @@ def surgical_delta_blend(baseline, variants, weights, slot_mask, alpha=0.0, eps=
     contextual_graft = b_fp32 + blended_delta
     
     # 3. Surgical Recombination
-    # We only use the slot mask if the tensor has a sequence dimension (3D: [B, S, D])
-    # Pooled vectors (2D: [B, D]) get the global contextual graft.
-    if b_fp32.ndim == 3 and slot_mask is not None:
+    # We only use the slot mask if the tensor has a sequence dimension (2D: [S, D] or 3D: [B, S, D])
+    # Pooled vectors (1D: [D] or 2D: [B, D]) get the global contextual graft.
+    if b_fp32.ndim >= 2 and slot_mask is not None:
         mask = slot_mask.to(device=b_fp32.device, dtype=torch.bool)
         if mask.ndim == 2:
             mask = mask.unsqueeze(-1)
+        if mask.ndim == 3 and b_fp32.ndim == 2:
+            mask = mask.squeeze(0)  # Strip batch dim from mask to match b_fp32
         
         # Ensure mask matches sequence length (important for multi-chunk prompts)
-        if mask.shape[1] != b_fp32.shape[1]:
+        seq_dim = 1 if b_fp32.ndim == 3 else 0
+        if mask.shape[seq_dim] != b_fp32.shape[seq_dim]:
             # If the mask is shorter than the sequence, pad it with False
-            new_mask = torch.zeros_like(b_fp32[:, :, :1], dtype=torch.bool)
-            m_len = min(mask.shape[1], b_fp32.shape[1])
-            new_mask[:, :m_len, :] = mask[:, :m_len, :]
+            if b_fp32.ndim == 3:
+                new_mask = torch.zeros_like(b_fp32[:, :1, :1], dtype=torch.bool).expand(-1, b_fp32.shape[1], -1).clone()
+                m_len = min(mask.shape[1], b_fp32.shape[1])
+                new_mask[:, :m_len, :] = mask[:, :m_len, :]
+            else:
+                new_mask = torch.zeros_like(b_fp32[:1, :1], dtype=torch.bool).expand(b_fp32.shape[0], -1).clone()
+                m_len = min(mask.shape[0], b_fp32.shape[0])
+                new_mask[:m_len, :] = mask[:m_len, :]
             mask = new_mask
             
         # Ensure mask is on the same device as the tensors
@@ -182,7 +324,7 @@ def surgical_delta_blend(baseline, variants, weights, slot_mask, alpha=0.0, eps=
             
         final_res = torch.where(mask, direct_blend, contextual_graft)
     else:
-        # For 2D pooled vectors, the 'delta' is always global
+        # For pooled vectors, the 'delta' is always global
         final_res = contextual_graft
     
     # 4. Magnitude Restoration (Velocity Matching)
@@ -201,7 +343,14 @@ def surgical_delta_blend_conds(baseline, variants, weights, slot_mask, alpha=0.0
     """
     Recursively applies Surgical Delta Grafting.
     """
-    if isinstance(baseline, dict):
+    if isinstance(baseline, LayeredConditioning):
+        in_mids = [v.in_mid_cond if isinstance(v, LayeredConditioning) else v for v in variants]
+        outs = [v.out_cond if isinstance(v, LayeredConditioning) else v for v in variants]
+        return LayeredConditioning(
+            surgical_delta_blend_conds(baseline.in_mid_cond, in_mids, weights, slot_mask, alpha),
+            surgical_delta_blend_conds(baseline.out_cond, outs, weights, slot_mask, alpha)
+        )
+    elif isinstance(baseline, dict):
         res = {}
         for k in baseline.keys():
             v_subset = [v[k] for v in variants if isinstance(v, dict) and k in v]
@@ -209,7 +358,42 @@ def surgical_delta_blend_conds(baseline, variants, weights, slot_mask, alpha=0.0
                 res[k] = surgical_delta_blend(baseline[k], v_subset, weights, slot_mask, alpha)
             else:
                 res[k] = baseline[k]
-        return res
+        return DictWithShape(res) if isinstance(baseline, DictWithShape) else res
     elif isinstance(baseline, torch.Tensor):
         return surgical_delta_blend(baseline, variants, weights, slot_mask, alpha)
     return baseline
+
+
+def blend_chunk_attention(tensors, eps=1e-8):
+    """
+    Blends independent chunk attention outputs using norm-weighted magnitude renormalization.
+    This prevents style-erasure and prompt strength dilution by ensuring padding/noise chunks
+    do not dilute the direction or magnitude of active prompt chunks.
+    """
+    if not tensors:
+        return None
+    if len(tensors) == 1:
+        return tensors[0]
+
+    calc_dtype = tensors[0].dtype
+    
+    # Calculate vector norms of each tensor along the channel dimension (last dimension)
+    norms = [torch.linalg.vector_norm(t.to(torch.float32), dim=-1, keepdim=True) for t in tensors]
+    
+    # Sum of norms (clamped to avoid division by zero)
+    total_norm = sum(norms)
+    total_norm_clamped = torch.clamp(total_norm, min=eps)
+    
+    # Sum of tensors
+    sum_tensors = sum(t.to(torch.float32) for t in tensors)
+    sum_tensors_n = torch.linalg.vector_norm(sum_tensors, dim=-1, keepdim=True).clamp(min=eps)
+    blended_sum_dir = sum_tensors / sum_tensors_n
+    
+    # Norm-weighted average of norms: sum(norm_i^2) / total_norm
+    sum_sq_norms = sum(n * n for n in norms)
+    target_norm = sum_sq_norms / total_norm_clamped
+    
+    # Scale the blended direction by the target norm
+    res = blended_sum_dir * target_norm
+    return res.to(calc_dtype)
+

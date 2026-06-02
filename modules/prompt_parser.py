@@ -43,6 +43,11 @@ plain_item: /([^\\\[\]()|~]|\\.)+/
 )
 
 
+from backend.text_processing.blending import (
+    n_way_blend, blend_layered_conds, pad_tensors, 
+    DictWithShape, LayeredConditioning, surgical_delta_blend_conds
+)
+
 def get_learned_conditioning_prompt_schedules(prompts, base_steps, hires_steps=None, use_old_scheduling=False):
     logger.info(f"Conditioning: Processing {len(prompts)} prompt schedules (Steps: {base_steps})")
     r"""
@@ -286,120 +291,7 @@ def get_learned_conditioning_prompt_schedules(prompts, base_steps, hires_steps=N
     return [promptdict[prompt] for prompt in prompts]
 
 
-class LatentBlendNode(str):
-    def __new__(cls, items):
-        # We still use the longest string for compatibility with length-checks in SD
-        longest = str(max((item[0] for item in items), key=lambda x: len(str(x))))
-        obj = str.__new__(cls, longest)
-        obj.items = items
-        return obj
 
-    def __repr__(self):
-        return f"[LatentBlendNode: {str(self)}]"
-
-
-class LayeredConditioning:
-    def __init__(self, in_mid_cond, out_cond):
-        self.in_mid_cond = in_mid_cond
-        self.out_cond = out_cond
-
-    @property
-    def shape(self):
-        if isinstance(self.in_mid_cond, dict):
-            return self.in_mid_cond["crossattn"].shape
-        return self.in_mid_cond.shape
-
-    @property
-    def dtype(self):
-        def _dtype(c):
-            if isinstance(c, dict):
-                # Return the dtype of the first tensor found in the dict
-                for v in c.values():
-                    if isinstance(v, torch.Tensor):
-                        return v.dtype
-                return torch.float32
-            elif isinstance(c, torch.Tensor):
-                return c.dtype
-            return torch.float32
-        return _dtype(self.in_mid_cond)
-
-    @property
-    def device(self):
-        def _device(c):
-            if isinstance(c, dict):
-                # Return the device of the first tensor found in the dict
-                for v in c.values():
-                    if isinstance(v, torch.Tensor):
-                        return v.device
-                return torch.device("cpu")
-            elif isinstance(c, torch.Tensor):
-                return c.device
-            return torch.device("cpu")
-        return _device(self.in_mid_cond)
-
-    def to(self, *args, **kwargs):
-        def _to(c):
-            if isinstance(c, dict):
-                return DictWithShape({k: v.to(*args, **kwargs) if isinstance(v, torch.Tensor) else v for k, v in c.items()}, shape=getattr(c, 'shape', None))
-            elif isinstance(c, torch.Tensor):
-                return c.to(*args, **kwargs)
-            return c
-        return LayeredConditioning(_to(self.in_mid_cond), _to(self.out_cond))
-
-    def __getitem__(self, item):
-        if isinstance(item, str):
-            def _get_val(c):
-                if isinstance(c, dict):
-                    return c.get(item, None)
-                return None
-            val_in_mid = _get_val(self.in_mid_cond)
-            val_out = _get_val(self.out_cond)
-            
-            if val_in_mid is None and val_out is None:
-                return None
-            return LayeredConditioning(val_in_mid, val_out)
-
-        def _get(c):
-            if isinstance(c, dict):
-                res = {k: v[item] if isinstance(v, torch.Tensor) else v for k, v in c.items()}
-                return DictWithShape(res, shape=getattr(c, 'shape', None))
-            elif isinstance(c, torch.Tensor):
-                return c[item]
-            return c
-        return LayeredConditioning(_get(self.in_mid_cond), _get(self.out_cond))
-
-    def advanced_indexing(self, item):
-        return self.__getitem__(item)
-
-    def repeat(self, *args, **kwargs):
-        def _repeat(c):
-            if isinstance(c, dict):
-                res = {k: v.repeat(*args, **kwargs) if isinstance(v, torch.Tensor) else v for k, v in c.items()}
-                return DictWithShape(res, shape=getattr(c, 'shape', None))
-            elif isinstance(c, torch.Tensor):
-                return c.repeat(*args, **kwargs)
-            return c
-        return LayeredConditioning(_repeat(self.in_mid_cond), _repeat(self.out_cond))
-
-    def chunk(self, *args, **kwargs):
-        def _chunk(c):
-            if isinstance(c, dict):
-                chunks = [{} for _ in range(args[0] if args else 1)]
-                for k, v in c.items():
-                    if isinstance(v, torch.Tensor):
-                        for i, chunk_v in enumerate(v.chunk(*args, **kwargs)):
-                            chunks[i][k] = chunk_v
-                    else:
-                        for i in range(len(chunks)):
-                            chunks[i][k] = v
-                return [DictWithShape(ch, shape=getattr(c, 'shape', None)) for ch in chunks]
-            elif isinstance(c, torch.Tensor):
-                return c.chunk(*args, **kwargs)
-            return [c]
-        
-        in_mid_chunks = _chunk(self.in_mid_cond)
-        out_chunks = _chunk(self.out_cond)
-        return [LayeredConditioning(i, o) for i, o in zip(in_mid_chunks, out_chunks)]
 
 
 def align_token_ids(token_ids_list, pad_id):
@@ -533,9 +425,12 @@ def get_learned_conditioning(model, prompts: SdConditioning | list[str], steps, 
         encoded_list = []
         for i in range(len(texts_to_encode)):
             if isinstance(encoded_conds, dict):
-                encoded_list.append({k: v[i] for k, v in encoded_conds.items()})
+                encoded_list.append({k: v[i] if isinstance(v, torch.Tensor) else v[i] for k, v in encoded_conds.items()})
             else:
-                encoded_list.append(encoded_conds[i])
+                if isinstance(encoded_conds, LayeredConditioning) and isinstance(encoded_conds.in_mid_cond, torch.Tensor):
+                    encoded_list.append(encoded_conds[i])
+                else:
+                    encoded_list.append(encoded_conds[i] if isinstance(encoded_conds, torch.Tensor) else encoded_conds[i])
                 
         cond_dict = dict(zip(texts_to_encode, encoded_list))
         
@@ -548,8 +443,13 @@ def get_learned_conditioning(model, prompts: SdConditioning | list[str], steps, 
                 if hasattr(model, "forge_objects"):
                     tokenizers = getattr(model.forge_objects.clip.tokenizer, "__dict__", {})
                 
-                # We'll use the first available tokenizer to build the mask
-                tokenizer_key = next((k for k in tokenizers.keys() if not k.startswith("__")), "default")
+                # We'll use the tokenizer corresponding to the sequence-based crossattn tensor (T5 if available, otherwise first)
+                if "t5xxl" in tokenizers:
+                    tokenizer_key = "t5xxl"
+                elif "umt5xxl" in tokenizers:
+                    tokenizer_key = "umt5xxl"
+                else:
+                    tokenizer_key = next((k for k in tokenizers.keys() if not k.startswith("__")), "default")
                 
                 def get_metadata(n):
                     if isinstance(n, LatentBlendNode):
@@ -584,14 +484,27 @@ def get_learned_conditioning(model, prompts: SdConditioning | list[str], steps, 
                 baseline_text, raw_mask = get_metadata(node)
                 baseline_obj = cond_dict.get(prealigned_objects.get(baseline_text), None)
                 
-                # Convert raw_mask to a tensor [Batch, Seq, 1]
-                seq_len = baseline_obj["crossattn"].shape[1] if isinstance(baseline_obj, dict) else baseline_obj.shape[0]
+                # Robustly find a tensor to get sequence length from
+                tensor_for_shape = baseline_obj
+                while not isinstance(tensor_for_shape, torch.Tensor):
+                    if isinstance(tensor_for_shape, dict):
+                        tensor_for_shape = tensor_for_shape.get("crossattn", next(iter(tensor_for_shape.values())))
+                    elif hasattr(tensor_for_shape, "in_mid_cond"):
+                        tensor_for_shape = tensor_for_shape.in_mid_cond
+                    else:
+                        break
+                        
+                seq_len = tensor_for_shape.shape[1] if tensor_for_shape.ndim >= 3 else tensor_for_shape.shape[0]
                 full_mask = torch.zeros((1, seq_len, 1), dtype=torch.bool)
                 
-                # Correct index mapping accounting for BOS/EOS tokens at every 77th position (chunk size 75)
-                # Formula: tensor_idx = 1 + i + 2 * (i // 75)
+                # If it's a legacy model (SD1.5, SDXL), apply index mapping accounting for BOS/EOS tokens at every 77th position.
+                # Otherwise (Flux, Anima, Wan), map tokens 1-to-1.
+                is_legacy = getattr(model, "is_webui_legacy_model", lambda: True)()
                 for i, is_unique in enumerate(raw_mask):
-                    idx = 1 + i + 2 * (i // 75)
+                    if is_legacy:
+                        idx = 1 + i + 2 * (i // 75)
+                    else:
+                        idx = i
                     if idx < seq_len:
                         full_mask[0, idx, 0] = is_unique
 
@@ -622,13 +535,8 @@ def get_learned_conditioning(model, prompts: SdConditioning | list[str], steps, 
                     final_items.append((obj, w, p))
                 final_items.sort(key=lambda x: str(x[0]))
                 
-                # Surgical Blending
-                from backend.text_processing.blending import surgical_delta_blend_conds
-                
-                logger.info(f"Prompt Blend: Surgically grafting {len(final_items)} aligned deltas onto baseline.")
-                
-                variants = [cond_dict[obj] for obj, w, p in final_items]
-                weights = [w for obj, w, p in final_items]
+                variants = [cond_dict[item[0]] for item in final_items]
+                weights = [item[1] for item in final_items]
                 
                 return surgical_delta_blend_conds(baseline_obj, variants, weights, full_mask, alpha=0.0)
             else:
@@ -712,30 +620,19 @@ def get_multicond_learned_conditioning(model, prompts, steps, hires_steps=None, 
     return MulticondLearnedConditioning(shape=(len(prompts),), batch=res)
 
 
-class DictWithShape(dict):
-    def __init__(self, x, shape=None):
-        super().__init__()
-        self.update(x)
-
-    @property
-    def shape(self):
-        return self["crossattn"].shape
-
-    def to(self, *args, **kwargs):
-        for k in self.keys():
-            if isinstance(self[k], torch.Tensor):
-                self[k] = self[k].to(*args, **kwargs)
-        return self
-
-    def advanced_indexing(self, item):
-        result = {}
-        for k in self.keys():
-            if isinstance(self[k], torch.Tensor):
-                result[k] = self[k][item]
-        return DictWithShape(result)
 
 
-from backend.text_processing.blending import n_way_blend, blend_layered_conds, pad_tensors
+
+class LatentBlendNode(str):
+    def __new__(cls, items):
+        # We still use the longest string for compatibility with length-checks in SD
+        longest = str(max((item[0] for item in items), key=lambda x: len(str(x))))
+        obj = str.__new__(cls, longest)
+        obj.items = items
+        return obj
+
+    def __repr__(self):
+        return f"[LatentBlendNode: {str(self)}]"
 
 
 def _pad_seq(t1, t2):
@@ -767,10 +664,15 @@ def n_way_blend_conds(conds, weights, alpha=1.0):
     if total_weight <= 0.001:
         return conds[0]
         
+    any_layered = any(isinstance(c, LayeredConditioning) for c in conds)
+    if not any_layered:
+        # Standard model or recursive layer pass - apply provided alpha policy
+        return blend_layered_conds(conds, weights, alpha)
+
+    # Top-level Layered Blending: Dual-Alpha Routing
     in_mid_inputs = [c.in_mid_cond if isinstance(c, LayeredConditioning) else c for c in conds]
     out_inputs = [c.out_cond if isinstance(c, LayeredConditioning) else c for c in conds]
 
-    # Dual-Alpha Routing for Layered Conditioning
     comp_alpha = alpha if alpha < 0.5 else 0.8
     style_alpha = alpha if alpha < 0.5 else 0.0
     
@@ -780,12 +682,12 @@ def n_way_blend_conds(conds, weights, alpha=1.0):
     )
 
 
-def blend_conds(cond1, cond2, weight):
-    return n_way_blend_conds([cond1, cond2], [1.0 - weight, weight])
+def blend_conds(cond1, cond2, weight, alpha=1.0):
+    return n_way_blend_conds([cond1, cond2], [1.0 - weight, weight], alpha=alpha)
 
 
 
-def get_continuous_cond(schedules, step_float):
+def get_continuous_cond(schedules, step_float, alpha=1.0):
     if len(schedules) == 1:
         return schedules[0].cond
     
@@ -806,7 +708,7 @@ def get_continuous_cond(schedules, step_float):
         cond2 = schedules[next_idx].cond
         
         w = math.sin(math.pi / 2.0 * (step_float - idx)) ** 2
-        return blend_conds(cond1, cond2, w)
+        return blend_conds(cond1, cond2, w, alpha=alpha)
     else:
         # Sigmoid Hand-off Edit sequence
         current_cond = schedules[0].cond
@@ -815,18 +717,20 @@ def get_continuous_cond(schedules, step_float):
             swap_step = schedules[i-1].end_at_step
             # c = 2.0 creates a ~4 step blend window
             w = torch.sigmoid(torch.tensor(2.0 * (step_float - swap_step))).item()
-            current_cond = blend_conds(current_cond, cond_next, w)
+            current_cond = blend_conds(current_cond, cond_next, w, alpha=alpha)
         return current_cond
 
 
-def reconstruct_cond_batch(c: list[list[ScheduledPromptConditioning]], current_step, step_float=None):
+def reconstruct_cond_batch(c: list[list[ScheduledPromptConditioning]], current_step, step_float=None, alpha=1.0):
     if step_float is None:
         step_float = float(current_step)
 
     param = c[0][0].cond
     if isinstance(param, LayeredConditioning):
-        in_mid_batch = reconstruct_cond_batch([[ScheduledPromptConditioning(s.end_at_step, s.cond.in_mid_cond) for s in sched] for sched in c], current_step, step_float)
-        out_batch = reconstruct_cond_batch([[ScheduledPromptConditioning(s.end_at_step, s.cond.out_cond) for s in sched] for sched in c], current_step, step_float)
+        comp_alpha = alpha if alpha < 0.5 else 0.8
+        style_alpha = alpha if alpha < 0.5 else 0.0
+        in_mid_batch = reconstruct_cond_batch([[ScheduledPromptConditioning(s.end_at_step, s.cond.in_mid_cond) for s in sched] for sched in c], current_step, step_float, alpha=comp_alpha)
+        out_batch = reconstruct_cond_batch([[ScheduledPromptConditioning(s.end_at_step, s.cond.out_cond) for s in sched] for sched in c], current_step, step_float, alpha=style_alpha)
         return LayeredConditioning(in_mid_batch, out_batch)
 
     is_dict = isinstance(param, dict)
@@ -839,7 +743,7 @@ def reconstruct_cond_batch(c: list[list[ScheduledPromptConditioning]], current_s
         res = torch.zeros((len(c),) + param.shape, device=param.device, dtype=param.dtype)
 
     for i, cond_schedule in enumerate(c):
-        cond_val = get_continuous_cond(cond_schedule, step_float)
+        cond_val = get_continuous_cond(cond_schedule, step_float, alpha=alpha)
 
         if is_dict:
             for k, param_val in cond_val.items():
@@ -866,7 +770,7 @@ def stack_conds(tensors):
     return result
 
 
-def reconstruct_multicond_batch(c: MulticondLearnedConditioning, current_step, step_float=None):
+def reconstruct_multicond_batch(c: MulticondLearnedConditioning, current_step, step_float=None, alpha=1.0):
     if step_float is None:
         step_float = float(current_step)
 
@@ -891,8 +795,11 @@ def reconstruct_multicond_batch(c: MulticondLearnedConditioning, current_step, s
         m_in_mid = MulticondLearnedConditioning(c.shape, batch_in_mid)
         m_out = MulticondLearnedConditioning(c.shape, batch_out)
         
-        conds_list, stacked_in_mid = reconstruct_multicond_batch(m_in_mid, current_step, step_float)
-        _, stacked_out = reconstruct_multicond_batch(m_out, current_step, step_float)
+        comp_alpha = alpha if alpha < 0.5 else 0.8
+        style_alpha = alpha if alpha < 0.5 else 0.0
+        
+        conds_list, stacked_in_mid = reconstruct_multicond_batch(m_in_mid, current_step, step_float, alpha=comp_alpha)
+        _, stacked_out = reconstruct_multicond_batch(m_out, current_step, step_float, alpha=style_alpha)
         
         return conds_list, LayeredConditioning(stacked_in_mid, stacked_out)
 
@@ -904,7 +811,7 @@ def reconstruct_multicond_batch(c: MulticondLearnedConditioning, current_step, s
 
         for composable_prompt in composable_prompts:
             conds_for_batch.append((len(tensors), composable_prompt.weight))
-            tensors.append(get_continuous_cond(composable_prompt.schedules, step_float))
+            tensors.append(get_continuous_cond(composable_prompt.schedules, step_float, alpha=alpha))
 
         conds_list.append(conds_for_batch)
 

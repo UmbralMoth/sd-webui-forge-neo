@@ -626,15 +626,23 @@ class MiniTrainDIT(nn.Module):
         if x_B_T_H_W_D.dtype == torch.float16:
             x_B_T_H_W_D = x_B_T_H_W_D.float()
 
-        for block in self.blocks:
+        for i, block in enumerate(self.blocks):
+            block_context = crossattn_emb
+            if hasattr(crossattn_emb, "in_mid_cond"):
+                if i < len(self.blocks) // 2:
+                    block_context = crossattn_emb.in_mid_cond
+                else:
+                    block_context = crossattn_emb.out_cond
+
             x_B_T_H_W_D = block(
                 x_B_T_H_W_D,
                 t_embedding_B_T_D,
-                crossattn_emb,
+                block_context,
                 **block_kwargs,
             )
 
-        x_B_T_H_W_O = self.final_layer(x_B_T_H_W_D.to(crossattn_emb.dtype), t_embedding_B_T_D, adaln_lora_B_T_3D=adaln_lora_B_T_3D)
+        final_context = crossattn_emb.out_cond if hasattr(crossattn_emb, "out_cond") else crossattn_emb
+        x_B_T_H_W_O = self.final_layer(x_B_T_H_W_D.to(final_context.dtype), t_embedding_B_T_D, adaln_lora_B_T_3D=adaln_lora_B_T_3D)
         x_B_C_Tt_Hp_Wp = self.unpatchify(x_B_T_H_W_O)[:, :, : orig_shape[-3], : orig_shape[-2], : orig_shape[-1]]
         return x_B_C_Tt_Hp_Wp
 

@@ -199,6 +199,17 @@ class StableDiffusionXLRF(StableDiffusionXL):
         self.use_shift = True
         self.is_flow = True
 
+    @torch.inference_mode()
+    def encode_first_stage(self, x):
+        sample = self.forge_objects.vae.encode(x.movedim(1, -1) * 0.5 + 0.5)
+        sample = self.model_config.latent_format.process_in(sample)
+        return sample.to(x)
+
+    @torch.inference_mode()
+    def decode_first_stage(self, x):
+        sample = self.model_config.latent_format.process_out(x)
+        return self.forge_objects.vae.decode(sample).movedim(-1, 1) * 2.0 - 1.0
+
     def inpaint_model(self):
         return False
 

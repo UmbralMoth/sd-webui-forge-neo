@@ -77,7 +77,7 @@ class Qwen3TextProcessingEngine:
             else:
                 tokens = None
                 if hasattr(line, "aligned_tokens_dict") and line.aligned_tokens_dict is not None:
-                    tokens = line.aligned_tokens_dict.get("qwen", None)
+                    tokens = line.aligned_tokens_dict.get("qwen3", None) or line.aligned_tokens_dict.get("qwen", None)
                 
                 if tokens is not None:
                     chunk = PromptChunk()

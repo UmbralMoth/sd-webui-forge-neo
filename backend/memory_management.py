@@ -497,11 +497,41 @@ class LoadedModel:
 
     def model_unload(self, memory_to_free=None, unpatch_weights=True):
         if memory_to_free is not None:
-            if memory_to_free < self.model.loaded_size():
+            if self.model is not None and memory_to_free < self.model.loaded_size():
                 freed = self.model.partially_unload(self.model.offload_device, memory_to_free)
                 if freed >= memory_to_free:
                     return False
-        self.model.detach(unpatch_weights)
+        
+        # Check total system RAM to avoid swap storms
+        if self.model is not None and str(self.model.offload_device) == "cpu":
+            # Avoid importing total_ram globally if it causes circular deps, though it's in the same file here.
+            # We can use the global total_ram directly since we are inside memory_management.py
+            model_size_gb = self.model.model_size() / (1024 * 1024 * 1024)
+            ram_gb = total_ram / 1024
+            
+            # We allow offloading a single model up to 25% of total system RAM
+            max_offload_gb = max(2.0, ram_gb * 0.25)
+            
+            if model_size_gb > max_offload_gb:
+                logger.warning(f"Refusing to offload {self.model.model.__class__.__name__} ({model_size_gb:.2f} GB) to RAM. Total RAM ({ram_gb:.1f} GB) is too small. Forcing VRAM retention to prevent system lockup.")
+                # By returning False, we force PyTorch to trigger an OOM if VRAM is actually full.
+                # This gracefully triggers fallbacks (like Tiled VAE) instead of locking up the OS.
+                return False
+
+        if self.model is not None:
+            self.model.detach(unpatch_weights)
+        else:
+            rm = self.real_model() if self.real_model is not None else None
+            if rm is not None:
+                try:
+                    rm.to(cpu)
+                except Exception:
+                    pass
+                if hasattr(rm, "model_loaded_weight_memory"):
+                    rm.model_loaded_weight_memory = 0
+                if hasattr(rm, "model_offload_buffer_memory"):
+                    rm.model_offload_buffer_memory = 0
+
         if self.model_finalizer is not None:
             self.model_finalizer.detach()
         self.model_finalizer = None
@@ -590,8 +620,11 @@ def free_memory(memory_required: float, device: torch.device, keep_loaded: list[
     for i in range(len(current_loaded_models) - 1, -1, -1):
         shift_model = current_loaded_models[i]
         if shift_model.device == device:
-            if shift_model not in keep_loaded and not shift_model.is_dead():
-                can_unload.append((-shift_model.model_offloaded_memory(), sys.getrefcount(shift_model.model), shift_model.model_memory(), i))
+            if shift_model not in keep_loaded:
+                if shift_model.is_dead():
+                    can_unload.append((-1, 0, shift_model.model_memory(), i))
+                else:
+                    can_unload.append((-shift_model.model_offloaded_memory(), sys.getrefcount(shift_model.model), shift_model.model_memory(), i))
                 shift_model.currently_used = False
 
     for x in sorted(can_unload):
@@ -738,48 +771,38 @@ def loaded_models(only_currently_used: bool = False) -> list["LoadedModel"]:
 
 
 def cleanup_models_gc(*, target: list["ModelPatcher"] = []):
-    _gc: bool = False
     _del: list[int] = []
 
+    seen_real_models = set()
+    
+    # We want to keep at most ONE dead model per nn.Module in the tracker, 
+    # so that free_memory can unload it if VRAM is tight, but we don't leak list entries.
     for i in range(len(current_loaded_models)):
         cur = current_loaded_models[i]
+        
+        rm = cur.real_model() if cur.real_model is not None else None
+        
         if not cur.is_dead():
+            if rm is not None:
+                seen_real_models.add(rm)
             continue
-        # Model's patcher has been GC'd — check if any target shares the real model
-        if cur.real_model is not None and any(mdl.model is cur.real_model() for mdl in target):
-            _del.append(i)
-            break
-
-        if cur.real_model is not None:
-            try:
-                name = cur.real_model().__class__.__name__
-            except Exception:
-                name = "<unknown>"
+            
+        if rm is None:
+            _del.append(i) # completely dead, no real model
+        elif rm in seen_real_models:
+            _del.append(i) # we already have an alive patcher or a prior dead entry for this rm
         else:
-            name = "<freed>"
-        logger.info("Potential memory leak detected with model {}...".format(name))
-        _gc = True
-
-    if not _gc and len(_del) == 0:
-        return
+            # First time seeing this real_model, and it's dead. 
+            # Keep it as a zombie so free_memory can unload it if needed!
+            seen_real_models.add(rm)
 
     for i in reversed(_del):
         m = current_loaded_models.pop(i)
         del m
 
-    gc.collect()
-    soft_empty_cache()
-
-    for mdl in current_loaded_models:
-        if mdl.is_dead():
-            if mdl.real_model is not None:
-                try:
-                    name = mdl.real_model().__class__.__name__
-                except Exception:
-                    name = "<unknown>"
-            else:
-                name = "<freed>"
-            logger.warning("Memory Leak with model {} !".format(name))
+    if len(_del) > 0:
+        gc.collect()
+        soft_empty_cache()
 
 
 def cleanup_models():
@@ -1382,6 +1405,73 @@ def soft_empty_cache(force=False):
     signal_empty_cache = False
 
 
+from enum import Enum
+
+class ExecutionPhase(Enum):
+    IDLE = 0
+    TEXT_ENCODING = 1
+    SAMPLING = 2
+    DECODING = 3
+
+current_execution_phase = ExecutionPhase.IDLE
+
+def get_model_category(model_patcher) -> str:
+    from backend.patcher.unet import UnetPatcher
+    if isinstance(model_patcher, UnetPatcher):
+        return "unet"
+    
+    model_name = type(model_patcher.model).__name__
+    
+    if (model_name in ("JointTextEncoder", "CLIPTextModel", "T5EncoderModel", "CLIPTextModelWithProjection", "UMT5EncoderModel")
+            or "Text" in model_name or "T5" in model_name or "CLIP" in model_name):
+        return "clip"
+        
+    if "Autoencoder" in model_name or "VAE" in model_name or "Decoder" in model_name or "Encoder" in model_name:
+        return "vae"
+        
+    return "other"
+
+def set_execution_phase(new_phase: ExecutionPhase):
+    global current_execution_phase
+    if new_phase == current_execution_phase:
+        return
+    
+    logger.info(f"Transitioning execution phase: {current_execution_phase.name} -> {new_phase.name}")
+    current_execution_phase = new_phase
+    
+    try:
+        from modules import shared
+        strict_isolation = getattr(shared.opts, "forge_strict_phase_isolation", False)
+    except Exception:
+        strict_isolation = False
+
+    if not strict_isolation:
+        # Trust the system to figure out what to unload and what to load via free_memory()
+        return
+
+    keep_categories = []
+    if new_phase == ExecutionPhase.TEXT_ENCODING:
+        keep_categories = ["clip"]
+    elif new_phase == ExecutionPhase.SAMPLING:
+        keep_categories = ["unet", "other"]
+    elif new_phase == ExecutionPhase.DECODING:
+        keep_categories = ["vae"]
+    elif new_phase == ExecutionPhase.IDLE:
+        keep_categories = []
+        
+    unloaded_any = False
+    for i in range(len(current_loaded_models) - 1, -1, -1):
+        loaded_model = current_loaded_models[i]
+        category = get_model_category(loaded_model.model)
+        if category not in keep_categories:
+            logger.info(f"Phase {new_phase.name}: Strict offloading model {loaded_model.model.model.__class__.__name__} ({category})")
+            if loaded_model.model_unload():
+                current_loaded_models.pop(i)
+                unloaded_any = True
+            
+    if unloaded_any:
+        soft_empty_cache()
+
 def unload_model(model: "ModelPatcher") -> bool:
     index = None
     for i, p in enumerate(current_loaded_models):
@@ -1391,7 +1481,9 @@ def unload_model(model: "ModelPatcher") -> bool:
 
     if index is not None:
         mdl = current_loaded_models.pop(index)
+        mdl.model_unload()
         del mdl
+        soft_empty_cache()
         return True
 
     return False

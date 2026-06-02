@@ -145,6 +145,16 @@ def compile_conditions(cond):
 
     if hasattr(cond, "in_mid_cond") and hasattr(cond, "out_cond"):
         # LayeredConditioning support
+        
+        if isinstance(cond.in_mid_cond, torch.Tensor):
+            result = dict(
+                cross_attn=cond,
+                model_conds=dict(
+                    c_crossattn=ConditionCrossAttn(cond),
+                ),
+            )
+            return [result]
+
         cross_attn = cond["crossattn"]
         pooled_output = cond["vector"]
 

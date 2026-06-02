@@ -96,7 +96,7 @@ class GemmaTextProcessingEngine:
             else:
                 tokens = None
                 if hasattr(line, "aligned_tokens_dict") and line.aligned_tokens_dict is not None:
-                    tokens = line.aligned_tokens_dict.get("gemma", None)
+                    tokens = line.aligned_tokens_dict.get("gemma2", None) or line.aligned_tokens_dict.get("gemma", None)
 
                 if tokens is not None:
                     template = opts.neta_template_negative if texts.is_negative_prompt else opts.neta_template_positive

@@ -182,6 +182,7 @@ def connect_paste_params_buttons():
                 *["Prompt", "Negative prompt", "Steps", "Face restoration"],
                 *(["Seed"] if shared.opts.send_seed else []),
                 *(["CFG scale"] if shared.opts.send_cfg else []),
+                *(["Distilled CFG Scale"] if shared.opts.send_cfg else []),
                 *binding.paste_field_names,
             ]
 
@@ -400,6 +401,9 @@ def parse_generation_parameters(x: str, skip_fields: list[str] | None = None):
 
     if "Shift" in res:
         res["Distilled CFG Scale"] = res.pop("Shift")
+
+    if "Hires Shift" in res:
+        res["Hires Distilled CFG Scale"] = res.pop("Hires Shift")
 
     infotext_versions.backcompat(res)
 

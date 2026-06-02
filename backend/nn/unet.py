@@ -153,7 +153,7 @@ class CrossAttention(nn.Module):
         is_clip_chunked = seq_len > 77 and seq_len % 77 == 0 and (k.shape[-1] == 768 or k.shape[-1] == 2048)
         
         if is_clip_chunked:
-            from backend.text_processing.blending import n_way_blend
+            from backend.text_processing.blending import blend_chunk_attention
             chunks = seq_len // 77
             chunk_outs = []
             for i in range(chunks):
@@ -161,9 +161,8 @@ class CrossAttention(nn.Module):
                 v_chunk = v[:, i*77:(i+1)*77, :]
                 chunk_outs.append(attention_function(q, k_chunk, v_chunk, self.heads, mask))
             
-            # Fuse the independent attention results using shared renormalization math
-            # alpha=0.0 ensures a 'clean' arithmetic average of the signals.
-            out = n_way_blend(chunk_outs, weights=[1.0]*chunks, alpha=0.0)
+            # Fuse the independent attention results using norm-weighted renormalization
+            out = blend_chunk_attention(chunk_outs)
         else:
             out = attention_function(q, k, v, self.heads, mask)
             

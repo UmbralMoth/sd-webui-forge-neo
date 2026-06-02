@@ -370,39 +370,118 @@ def phi_scheduler(n, sigma_min, sigma_max, device):
     return sigmas
 
 
-def flow_match_euler_discrete_scheduler(n, width, height, sigma_min, sigma_max, inner_model, device, ):
+def calculate_shift(
+    image_seq_len,
+    base_seq_len: int = 256,
+    max_seq_len: int = 4096,
+    base_shift: float = 0.5,
+    max_shift: float = 1.15,
+):
+    m = (max_shift - base_shift) / (max_seq_len - base_seq_len)
+    b = base_shift - m * base_seq_len
+    mu = image_seq_len * m + b
+    return mu
+
+
+def scale_shift_by_resolution(base_shift: float, seq_len: float) -> float:
+    # Scale base_shift dynamically based on sequence length,
+    # following the same ratio as FLUX (0.5 at 256 seq_len, 1.15 at 4096 seq_len)
+    if seq_len <= 256:
+        return base_shift * (0.5 / 1.15)
+    
+    # Linear interpolation between (256, base_shift * (0.5/1.15)) and (4096, base_shift)
+    t = (seq_len - 256) / (4096 - 256)
+    ratio = (0.5 / 1.15) + (1.0 - (0.5 / 1.15)) * t
+    return base_shift * ratio
+
+
+def flow_match_euler_discrete_scheduler(n, width, height, sigma_min, sigma_max, inner_model, device):
     from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
         FlowMatchEulerDiscreteScheduler,
     )
 
     unet = inner_model.inner_model.forge_objects.unet
+    predictor = unet.model.predictor
 
-    use_dynamic_shifting = getattr(shared.opts, "use_dynamic_shifting", False)
+    # 1. Automatic Detection or Manual Configuration override
+    custom_settings = getattr(shared.opts, "flow_match_custom_settings", False)
+
+    if not custom_settings:
+        # Automatic Detection Mode
+        pred_type_name = type(predictor).__name__
+        
+        # Default fallbacks
+        use_dynamic_shifting = False
+        time_shift_type = "linear"
+        base_shift = 1.0
+
+        is_flux = pred_type_name == "PredictionFlux" or hasattr(predictor, "mu")
+        
+        if is_flux:
+            time_shift_type = "exponential"
+            pred_mu = getattr(predictor, "mu", 1.0)
+            if pred_mu == 1.0:
+                # Schnell (static shift of 1.0, no dynamic resolution scaling)
+                use_dynamic_shifting = False
+                shift = 1.0
+            else:
+                # Dev / Play / Klein (exponential dynamic resolution-dependent shifting)
+                use_dynamic_shifting = True
+                seq_len = width * height / (16 * 16)
+                base_shift = 1.15
+                shift = scale_shift_by_resolution(base_shift, seq_len)
+        else:
+            # Anima, Wan, Lumina, SDXL RF, etc.
+            # Use linear dynamic resolution-dependent shifting by default
+            time_shift_type = "linear"
+            use_dynamic_shifting = False
+            
+            # Fetch base shift from predictor (which is updated dynamically by model/user settings)
+            base_shift = getattr(predictor, "shift", getattr(predictor, "mu", 3.0))
+            
+            seq_len = width * height / (16 * 16)
+            shift = scale_shift_by_resolution(base_shift, seq_len)
+
+        invert_sigmas = False
+        use_karras_sigmas = False
+        use_exponential_sigmas = False
+        use_beta_sigmas = False
+        stochastic_sampling = False
+
+    else:
+        # Manual Configuration Mode
+        use_dynamic_shifting = getattr(shared.opts, "use_dynamic_shifting", False)
+        time_shift_type = getattr(shared.opts, "flow_match_time_shift_type", "exponential")
+        shift = getattr(shared.opts, "flow_match_shift", 1.0)
+        invert_sigmas = getattr(shared.opts, "invert_sigmas", False)
+        use_karras_sigmas = getattr(shared.opts, "use_karras_sigmas", False)
+        use_exponential_sigmas = getattr(shared.opts, "use_exponential_sigmas", False)
+        use_beta_sigmas = getattr(shared.opts, "use_beta_sigmas", False)
+        stochastic_sampling = getattr(shared.opts, "stochastic_sampling", False)
+        
+        if use_dynamic_shifting:
+            seq_len = width * height / (16 * 16)
+            shift = compute_empirical_mu(round(seq_len), n)
 
     config = {
         "num_train_timesteps": 1000,
-        "shift": getattr(unet.model.predictor, "shift", 1.0),
+        "shift": shift,
         "use_dynamic_shifting": use_dynamic_shifting,
-        "invert_sigmas": getattr(shared.opts, "invert_sigmas", False),
+        "invert_sigmas": invert_sigmas,
         "shift_terminal": None,
-        "use_karras_sigmas": getattr(shared.opts, "use_karras_sigmas", False),
-        "use_exponential_sigmas": getattr(shared.opts, "use_exponential_sigmas", False),
-        "use_beta_sigmas": getattr(shared.opts, "use_beta_sigmas", False),
-        "time_shift_type": "exponential",
-        "stochastic_sampling": getattr(shared.opts, "stochastic_sampling", False),
+        "use_karras_sigmas": use_karras_sigmas,
+        "use_exponential_sigmas": use_exponential_sigmas,
+        "use_beta_sigmas": use_beta_sigmas,
+        "time_shift_type": time_shift_type,
+        "stochastic_sampling": stochastic_sampling,
     }
 
     scheduler = FlowMatchEulerDiscreteScheduler.from_config(config)
-    
-    mu = 0.0
-    if use_dynamic_shifting:
-        seq_len = width * height / (16 * 16)
-        mu = compute_empirical_mu(round(seq_len), n)
-        
-    scheduler.set_timesteps(n, device=device, mu=mu)
+    scheduler.set_timesteps(n, device=device, mu=shift if use_dynamic_shifting else None)
     sigmas = scheduler.sigmas
 
     return torch.FloatTensor(sigmas).to(device)
+
 
 
 def generalized_time_snr_shift(t: torch.Tensor, mu: float, sigma: float) -> float:

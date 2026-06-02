@@ -176,11 +176,15 @@ class TAEHV(nn.Module):
         return x.view(B, T, C, H, W)
 
     def decode(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim == 4:
+            x = x.unsqueeze(2)
+
         x = x.movedim(2, 1)
         x = self.apply_model_with_memblocks(self.decoder, x)
         if self.patch_size > 1:
             x = F.pixel_shuffle(x, self.patch_size)
-        return x[:, self.frames_to_trim :]
+        res = x[:, self.frames_to_trim :]
+        return res
 
 
 class TAEHVDecoder(nn.Module):
@@ -193,7 +197,8 @@ class TAEHVDecoder(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         z = self.decoder.decode(x)
-        return z.squeeze(1)
+        res = z.squeeze(1)
+        return res
 
 
 def download_model(model_path: os.PathLike, model_url: str):
@@ -204,12 +209,16 @@ def download_model(model_path: os.PathLike, model_url: str):
 
 
 def decoder_model():
-    latent_format: "LatentFormat" = shared.sd_model.model_config.latent_format
-    model_name: str = latent_format.taesd_decoder_name
+    try:
+        latent_format: "LatentFormat" = shared.sd_model.model_config.latent_format
+    except Exception:
+        return None
+
+    model_name: str = getattr(latent_format, "taesd_decoder_name", None)
     if model_name is None:
         return None
     else:
-        _video = model_name in ["taew2_1"]
+        _video = model_name in ["taew2_1", "taehv"]
         model_name = model_name + ".pth"
 
     loaded_model = sd_vae_taesd_models.get(model_name)

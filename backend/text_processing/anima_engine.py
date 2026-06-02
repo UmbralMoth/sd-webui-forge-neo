@@ -89,15 +89,15 @@ class AnimaTextProcessingEngine:
                 tokens_qwen = None
                 tokens_t5 = None
                 if hasattr(line, "aligned_tokens_dict") and line.aligned_tokens_dict is not None:
-                    tokens_qwen = line.aligned_tokens_dict.get("qwen", None)
-                    tokens_t5 = line.aligned_tokens_dict.get("t5", None)
+                    tokens_qwen = line.aligned_tokens_dict.get("qwen3_06b", None) or line.aligned_tokens_dict.get("qwen", None)
+                    tokens_t5 = line.aligned_tokens_dict.get("t5xxl", None) or line.aligned_tokens_dict.get("t5", None)
 
                 if tokens_qwen is not None and tokens_t5 is not None:
                     chunk = PromptChunk()
-                    chunk.qwen_tokens = [self.id_pad] + tokens_qwen
-                    chunk.qwen_multipliers = [1.0] * (len(tokens_qwen) + 1)
+                    chunk.qwen_tokens = tokens_qwen if tokens_qwen else [self.id_pad]
+                    chunk.qwen_multipliers = [1.0] * len(chunk.qwen_tokens)
                     chunk.t5_tokens = tokens_t5 + [self.id_end]
-                    chunk.t5_multipliers = [1.0] * (len(tokens_t5) + 1)
+                    chunk.t5_multipliers = [1.0] * len(chunk.t5_tokens)
                     chunks = [chunk]
                 else:
                     chunks: list[PromptChunk] = self.tokenize_line(line)
@@ -154,7 +154,9 @@ class AnimaTextProcessingEngine:
         if cross_attn.shape[1] < 512:
             cross_attn = torch.nn.functional.pad(cross_attn, (0, 0, 0, 512 - cross_attn.shape[1]))
 
-        return cross_attn.to(torch.float32)
+        cross_attn = cross_attn.to(torch.float32)
+        from backend.text_processing.blending import LayeredConditioning
+        return LayeredConditioning(cross_attn, cross_attn)
 
     def process_embeds(self, batch_tokens):
         device = memory_management.text_encoder_device()

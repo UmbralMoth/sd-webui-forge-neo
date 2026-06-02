@@ -40,3 +40,13 @@ torchsde==0.2.6
 tqdm==4.67.3
 transformers==4.56.2
 torch
+
+# PiD (Pixel Diffusion Decoder) dependencies
+hydra-core==1.3.2
+omegaconf==2.3.0
+loguru==0.7.3
+ninja==1.13.0
+pynvml==13.0.1
+nvidia-ml-py==13.595.45
+boto3==1.43.14
+botocore==1.43.14

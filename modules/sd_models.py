@@ -10,7 +10,8 @@ from backend import memory_management
 from backend.args import dynamic_args
 from backend.loader import forge_loader
 from modules import cache, devices, errors, extra_networks, hashes, modelloader, patches, paths, processing, script_callbacks, sd_unet, sd_vae, shared  # noqa
-from modules.prompt_parser import DictWithShape, SdConditioning  # noqa
+from backend.text_processing.blending import DictWithShape
+from modules.prompt_parser import SdConditioning  # noqa
 from modules.shared import cmd_opts, opts
 from modules.timer import Timer
 

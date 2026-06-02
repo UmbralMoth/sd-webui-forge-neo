@@ -328,6 +328,7 @@ options_templates.update(
             "token_merging_stride": OptionInfo(2, "Token Merging - Stride", gr.Slider, {"minimum": 1, "maximum": 8, "step": 1}).info("higher = faster"),
             "token_merging_downsample": OptionInfo(1, "Token Merging - Max Downsample", gr.Slider, {"minimum": 1, "maximum": 4, "step": 1}).info("higher = faster"),
             "token_merging_no_rand": OptionInfo(False, "Token Merging - No Random").info("reduce randomness by always fusing the same regions"),
+            "forge_strict_phase_isolation": OptionInfo(False, "Strict Phase-Based VRAM Isolation", gr.Checkbox).info("Force-offload all models from VRAM immediately when their phase ends. When disabled, only massive models (> 3.0 GB) are offloaded aggressively, leaving standard models (SDXL, SD 1.5) cached in VRAM for maximum speed."),
         },
     )
 )
@@ -566,12 +567,15 @@ options_templates.update(
             "sd_noise_schedule": OptionInfo("Default", "Noise schedule for sampling", gr.Radio, {"choices": ("Default", "Zero Terminal SNR")}, infotext="Noise Schedule"),
             "beta_dist_alpha": OptionInfo(0.6, "Beta scheduler - alpha", gr.Slider, {"minimum": 0.01, "maximum": 2.0, "step": 0.01}, infotext="Beta scheduler alpha"),
             "beta_dist_beta": OptionInfo(0.6, "Beta scheduler - beta", gr.Slider, {"minimum": 0.01, "maximum": 2.0, "step": 0.01}, infotext="Beta scheduler beta"),
-            "use_dynamic_shifting": OptionInfo(False, "use_dynamic_shifting"),
-            "invert_sigmas": OptionInfo(False, "invert_sigmas"),
-            "use_karras_sigmas": OptionInfo(False, "use_karras_sigmas"),
-            "use_exponential_sigmas": OptionInfo(False, "use_exponential_sigmas"),
-            "use_beta_sigmas": OptionInfo(False, "use_beta_sigmas"),
-            "stochastic_sampling": OptionInfo(False, "stochastic_sampling"),
+            "flow_match_custom_settings": OptionInfo(False, "FlowMatch: Manual custom configuration").info("Enable to override automatic scheduler parameters with the settings below"),
+            "use_dynamic_shifting": OptionInfo(False, "FlowMatch: Use dynamic resolution-dependent shifting").info("Calculate shift dynamically based on image size (uses empirical scaling formula in manual mode)"),
+            "flow_match_time_shift_type": OptionInfo("exponential", "FlowMatch: Time shift type", gr.Dropdown, {"choices": ["exponential", "linear"]}),
+            "flow_match_shift": OptionInfo(1.0, "FlowMatch: Shift parameter", gr.Number).info("Static shift value when dynamic shifting is disabled"),
+            "invert_sigmas": OptionInfo(False, "FlowMatch: Invert sigmas").info("Required for some models like Mochi"),
+            "use_karras_sigmas": OptionInfo(False, "FlowMatch: Use Karras sigmas distribution"),
+            "use_exponential_sigmas": OptionInfo(False, "FlowMatch: Use exponential sigmas distribution"),
+            "use_beta_sigmas": OptionInfo(False, "FlowMatch: Use beta sigmas distribution"),
+            "stochastic_sampling": OptionInfo(False, "FlowMatch: Enable stochastic sampling").info("Euler-ancestral style stochastic sampling"),
         },
     )
 )

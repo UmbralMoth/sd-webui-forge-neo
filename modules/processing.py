@@ -857,6 +857,7 @@ def process_images(p: StableDiffusionProcessing) -> Processed:
             res = process_images_inner(p)
 
     finally:
+        memory_management.set_execution_phase(memory_management.ExecutionPhase.IDLE)
         # restore original options
         if p.override_settings_restore_afterwards:
             set_config(stored_opts, save_config=False)
@@ -982,6 +983,7 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
             if p.scripts is not None:
                 p.scripts.process_batch(p, batch_number=n, prompts=p.prompts, seeds=p.seeds, subseeds=p.subseeds)
 
+            memory_management.set_execution_phase(memory_management.ExecutionPhase.TEXT_ENCODING)
             p.setup_conds()
 
             p.extra_generation_params.update(p.sd_model.extra_generation_params)
@@ -1007,6 +1009,7 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
                 sigmas_backup = p.sd_model.forge_objects.unet.model.predictor.sigmas
                 p.sd_model.forge_objects.unet.model.predictor.set_sigmas(rescale_zero_terminal_snr_sigmas(p.sd_model.forge_objects.unet.model.predictor.sigmas))
 
+            memory_management.set_execution_phase(memory_management.ExecutionPhase.SAMPLING)
             samples_ddim = p.sample(conditioning=p.c, unconditional_conditioning=p.uc, seeds=p.seeds, subseeds=p.subseeds, subseed_strength=p.subseed_strength, prompts=p.prompts)
 
             for x_sample in samples_ddim:
@@ -1027,6 +1030,7 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
 
                 if opts.sd_vae_decode_method != "Full":
                     p.extra_generation_params["VAE Decoder"] = opts.sd_vae_decode_method
+                memory_management.set_execution_phase(memory_management.ExecutionPhase.DECODING)
                 x_samples_ddim = decode_latent_batch(p.sd_model, samples_ddim, target_device=devices.cpu, check_for_nans=True)
 
             x_samples_ddim = torch.stack(x_samples_ddim).float()
@@ -1467,6 +1471,8 @@ class StableDiffusionProcessingTxt2Img(StableDiffusionProcessing):
 
         if self.sd_model.use_distilled_cfg_scale:
             self.extra_generation_params["Hires Distilled CFG Scale"] = self.hr_distilled_cfg
+        if self.sd_model.use_shift:
+            self.extra_generation_params["Hires Shift"] = self.hr_distilled_cfg
 
         return self.sample_hr_pass(samples, decoded_samples, seeds, subseeds, subseed_strength, prompts)
 
