@@ -1,6 +1,6 @@
 import importlib
 import logging
-import os.path
+import os
 from functools import partial
 from typing import Callable
 
@@ -34,6 +34,7 @@ from backend.utils import (
     load_torch_file,
     read_arbitrary_config,
 )
+import huggingface_guess
 from modules_forge.packages.comfy.utils import convert_diffusers_mmdit
 
 possible_models = [StableDiffusion, StableDiffusionXLRefiner, Mugen, StableDiffusionXLRF, StableDiffusionXL, Chroma, Flux, Flux2, Wan, QwenImage, Lumina2, ZImage, Anima]
@@ -44,7 +45,7 @@ setup_logger(logger)
 HF = os.path.join(os.path.dirname(__file__), "huggingface")
 
 
-def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_path, state_dict):
+def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_path, state_dict, additional_state_dicts=None):
     config_path = os.path.join(repo_path, component_name)
 
     if component_name in ["feature_extractor", "safety_checker"]:
@@ -187,7 +188,10 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
             if config["hidden_size"] == 4096:
                 from backend.nn.llm.llama import Qwen3_8B as QTE
             elif config["hidden_size"] == 2560:
-                from backend.nn.llm.llama import Qwen3_4B as QTE
+                if any("conv1d" in k for k in state_dict.keys()):
+                    from backend.nn.llm.llama import Qwen3_5_4B as QTE
+                else:
+                    from backend.nn.llm.llama import Qwen3_4B as QTE
             else:
                 from backend.nn.llm.llama import Qwen3_06B as QTE
 
@@ -215,8 +219,39 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
                 with no_init_weights():
                     with using_forge_operations(device=memory_management.cpu, dtype=storage_dtype, manual_cast_enabled=True, bnb_dtype=quant_config):
                         model = QTE(config)
+            # Normalize state dict keys to ensure they match model's expected "model." prefix and handle Qwen3.5 prefixes
+            normalized_sd = {}
+            for k, v in state_dict.items():
+                new_k = k
+                for prefix in ["qwen3_5_4b.", "qwen3_06b.", "qwen3_4b.", "qwen3_8b."]:
+                    if new_k.startswith(prefix):
+                        new_k = new_k[len(prefix):]
+                        break
+                if not new_k.startswith("model.") and not new_k.startswith("llm_adapter.") and not new_k.startswith("lm_head."):
+                    new_k = f"model.{new_k}"
+                normalized_sd[new_k] = v
+            state_dict = normalized_sd
 
-            load_state_dict(model, state_dict, log_name=cls_name, ignore_start="lm_head.")
+            load_state_dict(model, state_dict, log_name=cls_name, ignore_start=["lm_head."])
+
+            if hasattr(model, "preprocess_text_embeds") and hasattr(model, "model") and hasattr(model.model, "load_extra_params"):
+                # Try to find calibration files in common locations
+                possible_dirs = [repo_path]
+                
+                # Check additional modules folder (where the split LLM resides)
+                for asd in (additional_state_dicts or []):
+                    if isinstance(asd, str):
+                        possible_dirs.append(os.path.dirname(asd))
+                
+                # Common fallback locations
+                possible_dirs.extend(["models/text_encoder", "models/Stable-diffusion"])
+                
+                for d in possible_dirs:
+                    if d and os.path.exists(os.path.join(d, "calibration_params.safetensors")):
+                        # Pass the actual file in that directory so it can find its neighbors
+                        model.model.load_extra_params(os.path.join(d, "calibration_params.safetensors"))
+                        break
+
             return model
         if cls_name in ["T5EncoderModel", "UMT5EncoderModel"]:
             assert isinstance(state_dict, dict) and len(state_dict) > 16, "You do not have T5 state dict!"
@@ -353,6 +388,7 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
                     storage_dtype = override_dtype
                 else:
                     storage_dtype = memory_management.unet_dtype(device=load_device, model_params=state_dict_parameters, supported_dtypes=guess.supported_inference_dtypes, weight_dtype=state_dict_dtype)
+                
                 if storage_dtype == state_dict_dtype:
                     logger.info(f"Using Default Model Data Type: {storage_dtype}")
                 else:
@@ -632,12 +668,36 @@ def replace_state_dict(sd: dict[str, torch.Tensor], asd: dict[str, torch.Tensor]
         for k, v in asd.items():
             sd[f"{text_encoder_key_prefix}qwen25_7b.{k}"] = v
 
-    elif "model.layers.0.post_attention_layernorm.weight" in asd:
-        assert "model.layers.0.self_attn.q_norm.weight" in asd
-        weight: torch.Tensor = asd["model.layers.0.post_attention_layernorm.weight"]
+    #   qwen / cosmos text encoders
+    q_key = None
+    if "model.layers.0.post_attention_layernorm.weight" in asd:
+        q_key = "model.layers.0.post_attention_layernorm.weight"
+    elif "layers.0.post_attention_layernorm.weight" in asd:
+        q_key = "layers.0.post_attention_layernorm.weight"
+
+    if q_key:
+        weight: torch.Tensor = asd[q_key]
         size: str = "06b" if weight.shape[0] == 1024 else ("4b" if weight.shape[0] == 2560 else "8b")
+        
+        # Check for Qwen 3.5 4B (hybrid architecture)
+        is_qwen35 = size == "4b" and any("conv1d" in k for k in asd.keys())
+        
+        pref_to_strip = q_key.replace("layers.0.post_attention_layernorm.weight", "")
+
         for k, v in asd.items():
-            sd[f"{text_encoder_key_prefix}qwen3_{size}.transformer.{k}"] = v
+            clean_k = k[len(pref_to_strip):] if k.startswith(pref_to_strip) else k
+            
+            if clean_k.startswith("llm_adapter."):
+                final_k = clean_k
+            elif not clean_k.startswith("model."):
+                final_k = f"model.{clean_k}"
+            else:
+                final_k = clean_k
+
+            if is_qwen35:
+                sd[f"{text_encoder_key_prefix}qwen3_5_4b.{final_k}"] = v
+            else:
+                sd[f"{text_encoder_key_prefix}qwen3_{size}.{final_k}"] = v
 
     if "visual.blocks.0.attn.proj.weight" in asd:
         for k, v in asd.items():
@@ -654,17 +714,19 @@ def preprocess_state_dict(sd: dict[str, torch.Tensor]) -> dict[str, torch.Tensor
 
 
 def process_anima(dit: dict[str, torch.Tensor], enc: dict[str, torch.Tensor]):
-    # move LLMAdapter from transformer to text_encoder
+    # move LLMAdapter or Qwen3.5 from transformer to text_encoder
 
     keys = list(dit.keys())
     for k in keys:
-        if k.startswith("llm_adapter"):
+        if k.startswith("llm_adapter") or k.startswith("qwen3_5_4b"):
             enc[k] = dit.pop(k)
+
+    # If keys in enc start with qwen3_5_4b., we should strip it so load_state_dict can map correctly
+    # but only if they don't already match the model structure.
+    # Actually, the best way is to let try_filter_state_dict handle it.
 
 
 def _load_unet(path: os.PathLike):
-    import huggingface_guess
-
     sd, metadata = load_torch_file(path, return_metadata=True)
     _prefix = huggingface_guess.unet_prefix_from_state_dict(sd)
     sd, metadata = convert_quantization(sd, metadata, _prefix)
@@ -675,8 +737,6 @@ def _load_unet(path: os.PathLike):
 
 
 def _load_diffuser(path: os.PathLike):
-    import huggingface_guess
-
     sd, metadata = load_torch_file(path, return_metadata=True)
     _prefix = huggingface_guess.unet_prefix_from_state_dict(sd)
     sd, metadata = convert_quantization(sd, metadata, _prefix)
@@ -712,8 +772,18 @@ def split_state_dict(path: os.PathLike, additional_state_dicts: list[os.PathLike
         for asd in additional_state_dicts:
             _asd, _meta = load_torch_file(asd, return_metadata=True)
             _asd, _ = convert_quantization(_asd, _meta)
-            sd = replace_state_dict(sd, _asd, guess, asd)
+            if guess is not None:
+                sd = replace_state_dict(sd, _asd, guess, asd)
+            else:
+                # Merge anyway if we don't have a guess yet
+                for k, v in _asd.items():
+                    sd[k] = v
             del _asd
+        
+        # Re-guess after merging additional modules to handle split models correctly
+        new_guess = huggingface_guess.guess(sd)
+        if new_guess is not None:
+            guess = new_guess
 
     guess.clip_target = guess.clip_target(sd)
     guess.model_type = guess.model_type(sd)
@@ -734,12 +804,20 @@ def split_state_dict(path: os.PathLike, additional_state_dicts: list[os.PathLike
     sd = guess.process_clip_state_dict(sd)
 
     for k, v in guess.clip_target.items():
-        state_dict[v] = try_filter_state_dict(sd, [k + "."])
-
-    state_dict["ignore"] = sd
+        # Check both the filtered SD and the already populated state_dict
+        _filtered = try_filter_state_dict(sd, [k + "."])
+        if len(_filtered) > 0:
+            state_dict[v] = _filtered
+        elif v in state_dict:
+            # If process_anima already moved keys like qwen3_5_4b.model..., filter them now
+            state_dict[v] = try_filter_state_dict(state_dict[v], [k + "."])
 
     if "Anima" in guess.huggingface_repo:
-        process_anima(state_dict["transformer"], state_dict["text_encoder"])
+        if "text_encoder" not in state_dict:
+            state_dict["text_encoder"] = {}
+        process_anima(state_dict[guess.unet_target], state_dict["text_encoder"])
+
+    state_dict["ignore"] = sd
 
     print_dict = {k: len(v) for k, v in state_dict.items()}
     logger.debug(f"StateDict Keys: {print_dict}")
@@ -779,7 +857,7 @@ def forge_loader(sd: os.PathLike, additional_state_dicts: list[os.PathLike] = No
         if isinstance(v, list) and len(v) == 2:
             lib_name, cls_name = v
             component_sd = state_dicts.pop(component_name, None)
-            component = load_huggingface_component(estimated_config, component_name, lib_name, cls_name, local_path, component_sd)
+            component = load_huggingface_component(estimated_config, component_name, lib_name, cls_name, local_path, component_sd, additional_state_dicts=additional_state_dicts)
             if component_sd is not None:
                 del component_sd
             if component is not None:

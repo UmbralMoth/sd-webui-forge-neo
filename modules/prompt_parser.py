@@ -443,13 +443,25 @@ def get_learned_conditioning(model, prompts: SdConditioning | list[str], steps, 
                 if hasattr(model, "forge_objects"):
                     tokenizers = getattr(model.forge_objects.clip.tokenizer, "__dict__", {})
                 
-                # We'll use the tokenizer corresponding to the sequence-based crossattn tensor (T5 if available, otherwise first)
-                if "t5xxl" in tokenizers:
-                    tokenizer_key = "t5xxl"
-                elif "umt5xxl" in tokenizers:
-                    tokenizer_key = "umt5xxl"
+                # We'll use the tokenizer corresponding to the sequence-based crossattn tensor
+                # For Qwen 3.5 4B (which bypasses T5/LLM adapter), we must use the qwen3_5_4b tokenizer.
+                if hasattr(model, "forge_objects") and model.forge_objects is not None and hasattr(model.forge_objects, "clip") and model.forge_objects.clip is not None:
+                    cond_stage = model.forge_objects.clip.cond_stage_model
+                    if "qwen3_5_4b" in cond_stage and "qwen3_5_4b" in tokenizers:
+                        tokenizer_key = "qwen3_5_4b"
+                    elif "t5xxl" in tokenizers:
+                        tokenizer_key = "t5xxl"
+                    elif "umt5xxl" in tokenizers:
+                        tokenizer_key = "umt5xxl"
+                    else:
+                        tokenizer_key = next((k for k in tokenizers.keys() if not k.startswith("__")), "default")
                 else:
-                    tokenizer_key = next((k for k in tokenizers.keys() if not k.startswith("__")), "default")
+                    if "t5xxl" in tokenizers:
+                        tokenizer_key = "t5xxl"
+                    elif "umt5xxl" in tokenizers:
+                        tokenizer_key = "umt5xxl"
+                    else:
+                        tokenizer_key = next((k for k in tokenizers.keys() if not k.startswith("__")), "default")
                 
                 def get_metadata(n):
                     if isinstance(n, LatentBlendNode):
@@ -461,12 +473,29 @@ def get_learned_conditioning(model, prompts: SdConditioning | list[str], steps, 
                         # Recursively find the baseline text and sub-masks
                         base_text, sub_mask = get_metadata(base_child)
                         
-                        # Get the aligned token IDs for this node to determine slot range
-                        ids = aligned_token_ids_map.get((str(n), tokenizer_key), [])
-                        ids_base = aligned_token_ids_map.get((str(base_text), tokenizer_key), [])
+                        ids_base = aligned_token_ids_map.get((base_text, tokenizer_key), [])
                         
-                        # A slot index is any index where the variant IDs differ from baseline IDs
-                        node_mask = [i != j for i, j in zip(ids, ids_base)]
+                        # A slot index is any index where any variant's token IDs differ from the baseline's token IDs
+                        node_mask = []
+                        for child, _ in n.items:
+                            child_text, _ = get_metadata(child)
+                            if child_text == base_text:
+                                continue
+                            ids_child = aligned_token_ids_map.get((child_text, tokenizer_key), [])
+                            temp_mask = [i != j for i, j in zip(ids_child, ids_base)]
+                            if not node_mask:
+                                node_mask = temp_mask
+                            else:
+                                mlen = max(len(node_mask), len(temp_mask))
+                                merged = []
+                                for idx in range(mlen):
+                                    v1 = node_mask[idx] if idx < len(node_mask) else False
+                                    v2 = temp_mask[idx] if idx < len(temp_mask) else False
+                                    merged.append(v1 or v2)
+                                node_mask = merged
+                                
+                        if not node_mask:
+                            node_mask = [False] * len(ids_base)
                         
                         # Merge sub_mask into node_mask (OR logic)
                         if not sub_mask:

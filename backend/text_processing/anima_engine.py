@@ -22,12 +22,16 @@ class AnimaTextProcessingEngine:
     def __init__(self, text_encoder, qwen_tokenizer, t5_tokenizer, unet=None):
         super().__init__()
 
-        self.text_encoder: "Qwen3_06B" = text_encoder
+        self.text_encoder = text_encoder
         self.qwen_tokenizer = qwen_tokenizer
         self.t5_tokenizer = t5_tokenizer
 
-        self.id_pad = 151643
-        self.id_end = 1
+        is_qwen35 = False
+        if hasattr(text_encoder, "model") and "Qwen35HybridModel" in type(text_encoder.model).__name__:
+            is_qwen35 = True
+
+        self.id_pad = qwen_tokenizer.pad_token_id if hasattr(qwen_tokenizer, "pad_token_id") and qwen_tokenizer.pad_token_id is not None else 151643
+        self.id_end = t5_tokenizer.eos_token_id if hasattr(t5_tokenizer, "eos_token_id") and t5_tokenizer.eos_token_id is not None else 1
 
     def tokenize(self, texts):
         return (
@@ -55,12 +59,12 @@ class AnimaTextProcessingEngine:
             chunks.append(chunk)
             chunk = PromptChunk()
 
-        for tokens in qwen_tokenized:
+        for tokens, (text, weight) in zip(qwen_tokenized, parsed):
             position = 0
             while position < len(tokens):
                 token = tokens[position]
                 chunk.qwen_tokens.append(token)
-                chunk.qwen_multipliers.append(1.0)
+                chunk.qwen_multipliers.append(weight)
                 position += 1
 
         for tokens, (text, weight) in zip(t5_tokenized, parsed):
@@ -89,7 +93,7 @@ class AnimaTextProcessingEngine:
                 tokens_qwen = None
                 tokens_t5 = None
                 if hasattr(line, "aligned_tokens_dict") and line.aligned_tokens_dict is not None:
-                    tokens_qwen = line.aligned_tokens_dict.get("qwen3_06b", None) or line.aligned_tokens_dict.get("qwen", None)
+                    tokens_qwen = line.aligned_tokens_dict.get("qwen3_5_4b", None) or line.aligned_tokens_dict.get("qwen3_06b", None) or line.aligned_tokens_dict.get("qwen", None)
                     tokens_t5 = line.aligned_tokens_dict.get("t5xxl", None) or line.aligned_tokens_dict.get("t5", None)
 
                 if tokens_qwen is not None and tokens_t5 is not None:
@@ -149,14 +153,25 @@ class AnimaTextProcessingEngine:
             source_attention_mask=qwen_masks.to(device=device),
         )
         if t5_weights is not None:
-            cross_attn *= t5_weights.unsqueeze(-1).to(cross_attn)
+            if cross_attn.shape[1] == t5_weights.shape[1]:
+                 cross_attn = cross_attn * t5_weights.unsqueeze(-1).to(cross_attn)
+
+        # Select the mask that matches the cross_attn sequence length
+        # 0.6B model + Adapter outputs T5-length sequence.
+        # 4B hybrid model outputs Qwen-length sequence.
+        if cross_attn.shape[1] == qwen_masks.shape[1]:
+            final_masks = qwen_masks
+        else:
+            final_masks = t5_masks
 
         if cross_attn.shape[1] < 512:
             cross_attn = torch.nn.functional.pad(cross_attn, (0, 0, 0, 512 - cross_attn.shape[1]))
+            final_masks = torch.nn.functional.pad(final_masks, (0, 512 - final_masks.shape[1]))
+        elif cross_attn.shape[1] > 512:
+            cross_attn = cross_attn[:, :512, :]
+            final_masks = final_masks[:, :512]
 
-        cross_attn = cross_attn.to(torch.float32)
-        from backend.text_processing.blending import LayeredConditioning
-        return LayeredConditioning(cross_attn, cross_attn)
+        return cross_attn.to(torch.float32), final_masks.to(device=cross_attn.device)
 
     def process_embeds(self, batch_tokens):
         device = memory_management.text_encoder_device()

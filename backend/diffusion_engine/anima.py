@@ -11,12 +11,15 @@ from backend.text_processing.anima_engine import AnimaTextProcessingEngine
 
 
 class Anima(ForgeDiffusionEngine):
-    matched_guesses = [model_list.Anima]
+    matched_guesses = [model_list.Anima, model_list.AnimaQwen35]
 
     def __init__(self, estimated_config, huggingface_components):
         super().__init__(estimated_config, huggingface_components)
 
-        clip = CLIP(model_dict={"qwen3_06b": huggingface_components["text_encoder"]}, tokenizer_dict={"qwen3_06b": huggingface_components["tokenizer"], "t5xxl": huggingface_components["tokenizer_2"]})
+        if "qwen3_5_4b" in huggingface_components:
+            clip = CLIP(model_dict={"qwen3_5_4b": huggingface_components["qwen3_5_4b"]}, tokenizer_dict={"qwen3_5_4b": huggingface_components["tokenizer"], "t5xxl": huggingface_components["tokenizer_2"]})
+        else:
+            clip = CLIP(model_dict={"qwen3_06b": huggingface_components["text_encoder"]}, tokenizer_dict={"qwen3_06b": huggingface_components["tokenizer"], "t5xxl": huggingface_components["tokenizer_2"]})
 
         vae = VAE(model=huggingface_components["vae"], is_wan=True)
         vae.first_stage_model.latent_format = self.model_config.latent_format
@@ -25,11 +28,18 @@ class Anima(ForgeDiffusionEngine):
 
         unet = UnetPatcher.from_model(model=huggingface_components["transformer"], diffusers_scheduler=None, k_predictor=k_predictor, config=estimated_config)
 
-        self.text_processing_engine_anima = AnimaTextProcessingEngine(
-            text_encoder=clip.cond_stage_model.qwen3_06b,
-            qwen_tokenizer=clip.tokenizer.qwen3_06b,
-            t5_tokenizer=clip.tokenizer.t5xxl,
-        )
+        if "qwen3_5_4b" in huggingface_components:
+            self.text_processing_engine_anima = AnimaTextProcessingEngine(
+                text_encoder=clip.cond_stage_model.qwen3_5_4b,
+                qwen_tokenizer=clip.tokenizer.qwen3_5_4b,
+                t5_tokenizer=clip.tokenizer.t5xxl,
+            )
+        else:
+            self.text_processing_engine_anima = AnimaTextProcessingEngine(
+                text_encoder=clip.cond_stage_model.qwen3_06b,
+                qwen_tokenizer=clip.tokenizer.qwen3_06b,
+                t5_tokenizer=clip.tokenizer.t5xxl,
+            )
 
         self.forge_objects = ForgeObjects(unet=unet, clip=clip, vae=vae, clipvision=None)
         self.forge_objects_original = self.forge_objects.shallow_copy()

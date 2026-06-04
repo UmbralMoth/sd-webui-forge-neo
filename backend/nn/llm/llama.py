@@ -489,6 +489,35 @@ class Llama2_(nn.Module):
             return x, intermediate
 
 
+from backend.nn.llm.qwen_3_5_4b import Qwen35HybridModel
+from backend.nn.anima import LLMAdapter
+
+
+class Qwen3_5_4B(nn.Module):
+    def __init__(self, config_dict=None):
+        super().__init__()
+        self.model = Qwen35HybridModel(config_dict)
+        self.llm_adapter = LLMAdapter()
+
+    def get_input_embeddings(self):
+        return self.model.get_input_embeddings()
+
+    def set_input_embeddings(self, embeddings):
+        self.model.set_input_embeddings(embeddings)
+
+    def forward(self, *args, **kwargs):
+        return self.model(*args, **kwargs)
+
+    def preprocess_text_embeds(self, text_embeds, text_ids, target_attention_mask=None, source_attention_mask=None):
+        if text_ids is not None:
+             return self.llm_adapter(text_embeds, text_ids, target_attention_mask=target_attention_mask, source_attention_mask=source_attention_mask)
+        return text_embeds
+
+    def load_extra_params(self, *args, **kwargs):
+        if hasattr(self.model, "load_extra_params"):
+            return self.model.load_extra_params(*args, **kwargs)
+
+
 class BaseLlama:
     def get_input_embeddings(self):
         return self.model.embed_tokens

@@ -509,8 +509,8 @@ class LoadedModel:
             model_size_gb = self.model.model_size() / (1024 * 1024 * 1024)
             ram_gb = total_ram / 1024
             
-            # We allow offloading a single model up to 25% of total system RAM
-            max_offload_gb = max(2.0, ram_gb * 0.25)
+            # We allow offloading a single model up to 60% of total system RAM
+            max_offload_gb = max(2.0, ram_gb * 0.60)
             
             if model_size_gb > max_offload_gb:
                 logger.warning(f"Refusing to offload {self.model.model.__class__.__name__} ({model_size_gb:.2f} GB) to RAM. Total RAM ({ram_gb:.1f} GB) is too small. Forcing VRAM retention to prevent system lockup.")

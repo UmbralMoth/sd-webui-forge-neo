@@ -8,9 +8,11 @@ def load_state_dict(model, sd, ignore_errors=[], log_name=None, ignore_start=Non
     missing = [x for x in missing if x not in ignore_errors]
     unexpected = [x for x in unexpected if x not in ignore_errors]
 
-    if isinstance(ignore_start, str):
-        missing = [x for x in missing if not x.startswith(ignore_start)]
-        unexpected = [x for x in unexpected if not x.startswith(ignore_start)]
+    if ignore_start is not None:
+        if isinstance(ignore_start, str):
+            ignore_start = [ignore_start]
+        missing = [x for x in missing if not any(x.startswith(s) for s in ignore_start)]
+        unexpected = [x for x in unexpected if not any(x.startswith(s) for s in ignore_start)]
 
     log_name = log_name or type(model).__name__
     if len(missing) > 0:
