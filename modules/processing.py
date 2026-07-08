@@ -602,6 +602,13 @@ class StableDiffusionProcessing:
                 neg_dir_perp = v_neg_raw - proj_neg_on_pos
                 uncond_perp = base_pred_f32 + neg_dir_perp
                 epsilon_guided_tmg = base_pred_f32 + (cond_pred_f32 - uncond_perp) * cond_scale
+                # DEBUG: print override output magnitude
+                if anima_edit_dbg:
+                    print(f"  override abs.mean: {epsilon_guided_tmg.float().abs().mean().item():.4f}")
+                    print(f"  override abs.max:  {epsilon_guided_tmg.float().abs().max().item():.4f}")
+                    # What standard CFG would give (for comparison)
+                    standard = (1 - cond_scale) * uncond_pred + cond_scale * cond_pred
+                    print(f"  standard CFG abs.mean: {standard.float().abs().mean().item():.4f}")
                 # Skip the normal assembly branch below by jumping to fade.
                 skip_tmg_assembly = True
             else:
