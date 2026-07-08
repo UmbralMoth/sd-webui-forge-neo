@@ -529,16 +529,36 @@ class StableDiffusionProcessing:
                 w_pos = torch.clamp(max_g * (1.0 - p_pos_clamped), min=min_g, max=max_g)
                 w_neg = torch.clamp(max_g * p_neg_clamped, min=min_g, max=max_g)
 
-            # Anima 2B Edit: the Edit LoRA was trained where the CFG
-            # direction is (cond - uncond) with total weight 1 + cfg.
-            # TMG's per-component amplification (1 + s_base + w_pos + w_neg)
-            # blows up the output beyond the LoRA's training range and
-            # causes noise. Match the TraSCE pattern instead: compute
-            # the math between base, pos, neg (perp projection), then
-            # apply a single cfg-scaled CFG direction using base as the
-            # uncond baseline. Result: base + cfg * (cond - perp_uncond),
-            # equivalent to (1-cfg)*base + cfg*cond for orthogonal
-            # concepts.
+            # Anima 2B Edit: the Edit LoRA's edit effect lives in the base
+            # pass output (base = ref + edit). The original TMG formula
+            # amplifies four components independently:
+            #   epsilon = empty + s_base * v_base
+            #                + w_pos * v_pos_aligned - w_neg * v_neg_aligned
+            # with s_base = w_pos = w_neg = cfg. This duplicates the base
+            # contribution: the base appears in s_base*v_base (the edit
+            # direction) and the w_pos*cond - w_neg*uncond term also
+            # contains a base component after expanding (since both cond
+            # and uncond include base). The net effect is total
+            # amplification 1 + 3*cfg which exceeds the LoRA's training
+            # range (1 + cfg for standard CFG) and blows up the output
+            # to noise.
+            #
+            # The perp projection between v_pos (cond - base) and v_neg
+            # (uncond - base) is between orthogonal concepts (quality vs
+            # neg) in base-relative space. The edit is in v_base itself,
+            # outside the projection. So the perp projection does NOT
+            # help avoid the edit overamplification. We need a structural
+            # change: collapse the formula to a single cfg amplification
+            # using base as the uncond baseline. The result is equivalent
+            # to standard CFG with base as the uncond (i.e. the base
+            # contributes once, the cond direction contributes once).
+            #
+            # Result: base + cfg * (cond - perp_uncond), where perp_uncond
+            # is computed in base-relative space. Algebraically this
+            # equals (1-cfg)*base + cfg*cond - cfg*v_neg_perp. For
+            # orthogonal concepts (v_pos ⊥ v_neg), v_neg_perp = v_neg
+            # and the result is ref + edit + cfg*quality - cfg*neg --
+            # the same total weight (1 + cfg) as standard CFG.
             anima_edit_active = bool(getattr(args_module.dynamic_args, "anima_edit", False))
             if anima_edit_active:
                 # Recompute uncond_perp using base as the uncond baseline
