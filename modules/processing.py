@@ -465,8 +465,8 @@ class StableDiffusionProcessing:
             empty_pred_raw = args["empty_denoised"] # C_empty ("") or C_base (fallback)
             base_pred_raw = args.get("base_denoised", None) # C_base
 
-            # DEBUG: dump model output magnitudes when Anima Edit is on
-            anima_edit_dbg = bool(getattr(args_module.dynamic_args, "anima_edit", False))
+            # DEBUG: dump model output magnitudes when Anima Edit debug is enabled
+            anima_edit_dbg = bool(getattr(args_module.dynamic_args, "anima_edit_debug", False))
             if anima_edit_dbg:
                 def _stats(t, name):
                     if t is None:

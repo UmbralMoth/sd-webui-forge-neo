@@ -62,6 +62,7 @@ class Anima(ForgeDiffusionEngine):
         from modules.shared import opts as _opts
         edit_mode_on = bool(getattr(_opts, "anima_edit_mode", False))
         dynamic_args.anima_edit = edit_mode_on
+        dynamic_args.anima_edit_debug = bool(getattr(_opts, "anima_edit_debug", False))
 
         if edit_mode_on and not getattr(prompt, "is_negative_prompt", False):
             # Build the ref list once per positive prompt conditioning call.

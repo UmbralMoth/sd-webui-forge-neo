@@ -179,6 +179,8 @@ class dynamic_args(metaclass=_DynamicArgsMeta):
     """Wan 2.2"""
     anima_edit: bool = False
     """Anima 2B Edit (LoRA mode: temporal-concat reference latents)"""
+    anima_edit_debug: bool = False
+    """Anima 2B Edit: dump TMG model output magnitudes for debugging"""
     ref_latents: list["torch.Tensor"] = []
     """Reference Latent(s) for Flux Kontext / Qwen-Image-Edit / Flux.2 Klein / Anima Edit"""
     concat_latent: "torch.Tensor" = None
