@@ -469,23 +469,33 @@ class StableDiffusionProcessing:
             anima_edit_dbg = bool(getattr(args_module.dynamic_args, "anima_edit", False))
             if anima_edit_dbg:
                 def _stats(t, name):
+                    if t is None:
+                        return f"{name}: None"
                     return f"{name}: mean={t.float().abs().mean().item():.4f} max={t.float().abs().max().item():.4f}"
                 print(f"[Anima TMG DEBUG]")
                 print(f"  {_stats(empty_pred_raw, 'empty')}")
                 print(f"  {_stats(base_pred_raw, 'base')}")
                 print(f"  {_stats(cond_pred, 'cond')}")
                 print(f"  {_stats(uncond_pred, 'uncond')}")
+                # For 4-conditioning (TMG with base), show the diffs.
+                # For 3-conditioning (TraSCE no base), show pos_dir/neg_dir
+                # relative to empty.
                 if base_pred_raw is not None and empty_pred_raw is not None:
                     v_base_dbg = base_pred_raw - empty_pred_raw
                     v_pos_dbg = cond_pred - base_pred_raw
                     v_neg_dbg = uncond_pred - base_pred_raw
-                    print(f"  v_base abs.mean: {v_base_dbg.float().abs().mean().item():.4f}")
-                    print(f"  v_pos  abs.mean: {v_pos_dbg.float().abs().mean().item():.4f}")
-                    print(f"  v_neg  abs.mean: {v_neg_dbg.float().abs().mean().item():.4f}")
-                    # Check orthogonality
+                    print(f"  v_base (base-empty)  abs.mean: {v_base_dbg.float().abs().mean().item():.4f}")
+                    print(f"  v_pos  (cond-base)  abs.mean: {v_pos_dbg.float().abs().mean().item():.4f}")
+                    print(f"  v_neg  (uncond-base) abs.mean: {v_neg_dbg.float().abs().mean().item():.4f}")
                     dot_pn = (v_pos_dbg * v_neg_dbg).sum()
-                    dot_pp = (v_pos_dbg * v_pos_dbg).sum()
                     print(f"  cos(v_pos, v_neg) = {(dot_pn / (v_pos_dbg.norm() * v_neg_dbg.norm() + 1e-8)).item():.4f}")
+                elif empty_pred_raw is not None:
+                    pos_dir_dbg = cond_pred - empty_pred_raw
+                    neg_dir_dbg = uncond_pred - empty_pred_raw
+                    print(f"  pos_dir (cond-empty)  abs.mean: {pos_dir_dbg.float().abs().mean().item():.4f}")
+                    print(f"  neg_dir (uncond-empty) abs.mean: {neg_dir_dbg.float().abs().mean().item():.4f}")
+                    dot_pn = (pos_dir_dbg * neg_dir_dbg).sum()
+                    print(f"  cos(pos_dir, neg_dir) = {(dot_pn / (pos_dir_dbg.norm() * neg_dir_dbg.norm() + 1e-8)).item():.4f}")
 
             if empty_pred_raw is None:
                 # 3-conditioning fallback if empty_pred is missing
