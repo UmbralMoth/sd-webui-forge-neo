@@ -531,34 +531,35 @@ class StableDiffusionProcessing:
 
             # Anima 2B Edit: the Edit LoRA's edit effect lives in the base
             # pass output (base = ref + edit). The original TMG formula
-            # amplifies four components independently:
-            #   epsilon = empty + s_base * v_base
-            #                + w_pos * v_pos_aligned - w_neg * v_neg_aligned
-            # with s_base = w_pos = w_neg = cfg. This duplicates the base
-            # contribution: the base appears in s_base*v_base (the edit
-            # direction) and the w_pos*cond - w_neg*uncond term also
-            # contains a base component after expanding (since both cond
-            # and uncond include base). The net effect is total
-            # amplification 1 + 3*cfg which exceeds the LoRA's training
-            # range (1 + cfg for standard CFG) and blows up the output
-            # to noise.
+            # amplifies the base separately via s_base = cfg:
+            #   epsilon = empty + s_base * v_base + w_pos * v_pos - w_neg * v_neg
+            # The s_base*v_base term adds cfg*edit ON TOP of the edit
+            # contribution that's already in cond and uncond. Expanding:
+            #   = (1-cfg)*empty + cfg*base + w_pos*(cond-base) - w_neg*(uncond-base)
+            #   = (1-cfg)*ref + cfg*(ref+edit) + w_pos*quality - w_neg*neg
+            # With w_pos = w_neg = cfg, this is:
+            #   = ref + edit + cfg*quality - cfg*neg
+            # But the edit term has been scaled cfg times by s_base*v_base,
+            # not just (1-cfg)/(1) times as in standard CFG. For Anima
+            # Edit this means the edit appears at 1x baseline (natural
+            # from cond/uncond) + 3x extra from s_base = 4x total.
             #
-            # The perp projection between v_pos (cond - base) and v_neg
-            # (uncond - base) is between orthogonal concepts (quality vs
-            # neg) in base-relative space. The edit is in v_base itself,
-            # outside the projection. So the perp projection does NOT
-            # help avoid the edit overamplification. We need a structural
-            # change: collapse the formula to a single cfg amplification
-            # using base as the uncond baseline. The result is equivalent
-            # to standard CFG with base as the uncond (i.e. the base
-            # contributes once, the cond direction contributes once).
+            # The perp projection (line 501) operates on v_pos and v_neg
+            # in base-relative space. Since v_pos = cond - base = quality
+            # and v_neg = uncond - base = neg, these don't contain the
+            # edit. The perp can't strip the edit overlap because the
+            # edit is in v_base itself, outside the projection.
             #
-            # Result: base + cfg * (cond - perp_uncond), where perp_uncond
-            # is computed in base-relative space. Algebraically this
-            # equals (1-cfg)*base + cfg*cond - cfg*v_neg_perp. For
-            # orthogonal concepts (v_pos ⊥ v_neg), v_neg_perp = v_neg
-            # and the result is ref + edit + cfg*quality - cfg*neg --
-            # the same total weight (1 + cfg) as standard CFG.
+            # The fix: do the perp projection on the v_pos/v_neg in
+            # base-relative space (as TMG does), but DON'T use s_base
+            # for separate base amplification. Instead, use base as the
+            # uncond baseline and apply a single cfg amplification:
+            #   epsilon = base + cfg * (cond - perp_uncond)
+            #   = (1-cfg)*base + cfg*cond - cfg*v_neg_perp
+            # For orthogonal v_pos/v_neg, this is ref + edit + cfg*quality
+            # - cfg*neg -- matching standard CFG with the edit at its
+            # natural 1x baseline (no extra amplification). The perp
+            # projection naturally strips the quality-neg overlap (if any).
             anima_edit_active = bool(getattr(args_module.dynamic_args, "anima_edit", False))
             if anima_edit_active:
                 # Recompute uncond_perp using base as the uncond baseline
