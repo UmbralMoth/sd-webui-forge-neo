@@ -461,10 +461,32 @@ class StableDiffusionProcessing:
             uncond_pred = args["uncond_raw"]      # Epsilon negative (C_base + C_neg)
             cond_scale = args["cond_scale"]       # Maximum CFG budget
             x_orig = args["input"]
-            
+
             empty_pred_raw = args["empty_denoised"] # C_empty ("") or C_base (fallback)
             base_pred_raw = args.get("base_denoised", None) # C_base
-            
+
+            # DEBUG: dump model output magnitudes when Anima Edit is on
+            anima_edit_dbg = bool(getattr(args_module.dynamic_args, "anima_edit", False))
+            if anima_edit_dbg:
+                def _stats(t, name):
+                    return f"{name}: mean={t.float().abs().mean().item():.4f} max={t.float().abs().max().item():.4f}"
+                print(f"[Anima TMG DEBUG]")
+                print(f"  {_stats(empty_pred_raw, 'empty')}")
+                print(f"  {_stats(base_pred_raw, 'base')}")
+                print(f"  {_stats(cond_pred, 'cond')}")
+                print(f"  {_stats(uncond_pred, 'uncond')}")
+                if base_pred_raw is not None and empty_pred_raw is not None:
+                    v_base_dbg = base_pred_raw - empty_pred_raw
+                    v_pos_dbg = cond_pred - base_pred_raw
+                    v_neg_dbg = uncond_pred - base_pred_raw
+                    print(f"  v_base abs.mean: {v_base_dbg.float().abs().mean().item():.4f}")
+                    print(f"  v_pos  abs.mean: {v_pos_dbg.float().abs().mean().item():.4f}")
+                    print(f"  v_neg  abs.mean: {v_neg_dbg.float().abs().mean().item():.4f}")
+                    # Check orthogonality
+                    dot_pn = (v_pos_dbg * v_neg_dbg).sum()
+                    dot_pp = (v_pos_dbg * v_pos_dbg).sum()
+                    print(f"  cos(v_pos, v_neg) = {(dot_pn / (v_pos_dbg.norm() * v_neg_dbg.norm() + 1e-8)).item():.4f}")
+
             if empty_pred_raw is None:
                 # 3-conditioning fallback if empty_pred is missing
                 empty_pred_raw = base_pred_raw if base_pred_raw is not None else cond_pred
