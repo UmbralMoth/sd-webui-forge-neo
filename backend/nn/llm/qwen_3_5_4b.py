@@ -57,7 +57,7 @@ class SSMBlock(nn.Module):
         )
 
         self.out_proj = nn.Linear(d_gate, hidden_size, bias=False)
-        self.norm = RMSNorm(norm_dim)
+        self.norm = nn.RMSNorm(norm_dim)
 
         self.A_log = nn.Parameter(torch.zeros(n_groups))
         self.dt_bias = nn.Parameter(torch.zeros(n_groups))
@@ -138,8 +138,8 @@ class GatedSelfAttention(nn.Module):
         self.v_proj = nn.Linear(hidden_size, num_kv_heads * head_dim, bias=False)
         self.o_proj = nn.Linear(self.inner_dim, hidden_size, bias=False)
 
-        self.q_norm = RMSNorm(head_dim)
-        self.k_norm = RMSNorm(head_dim)
+        self.q_norm = nn.RMSNorm(head_dim)
+        self.k_norm = nn.RMSNorm(head_dim)
 
     def forward(self, hidden_states, attention_mask=None, freqs_cis=None):
         B, L, _ = hidden_states.shape
@@ -198,7 +198,7 @@ class HybridBlock(nn.Module):
         super().__init__()
         self.use_ssm = use_ssm
         self.has_mlp = has_mlp
-        self.input_layernorm = RMSNorm(hidden_size)
+        self.input_layernorm = nn.RMSNorm(hidden_size)
 
         if use_ssm:
             self.linear_attn = SSMBlock(hidden_size=hidden_size)
@@ -206,7 +206,7 @@ class HybridBlock(nn.Module):
             self.self_attn = GatedSelfAttention(hidden_size=hidden_size)
 
         if has_mlp:
-            self.post_attention_layernorm = RMSNorm(hidden_size)
+            self.post_attention_layernorm = nn.RMSNorm(hidden_size)
             self.mlp = MLP(hidden_size=hidden_size, intermediate_size=intermediate_size)
 
     def forward(self, x, attention_mask=None, freqs_cis=None):

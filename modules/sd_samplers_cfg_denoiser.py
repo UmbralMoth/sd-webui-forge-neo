@@ -99,6 +99,11 @@ class CFGDenoiser(torch.nn.Module):
         elif "cond_empty" in self.sampler.sampler_extra_args:
              del self.sampler.sampler_extra_args["cond_empty"]
 
+        if getattr(self.p, 'tmg_base_c', None) is not None:
+             self.sampler.sampler_extra_args["cond_base"] = self.p.tmg_base_c
+        elif "cond_base" in self.sampler.sampler_extra_args:
+             del self.sampler.sampler_extra_args["cond_base"]
+
     def pad_cond_uncond(self, *args, **kwargs):
         raise NotImplementedError
 
@@ -193,10 +198,13 @@ class CFGDenoiser(torch.nn.Module):
                 self.p.extra_generation_params["CFG Anneal"] = True
 
         extra_model_options = kwargs.get("model_options", {})
+
         # TraSCE: reconstruct empty_c for the current step (handles prompt-edit schedules)
         # and forward it into model_options for sampling_function to compile and apply.
         if "cond_empty" in self.sampler.sampler_extra_args:
             extra_model_options["cond_empty"] = prompt_parser.reconstruct_cond_batch(self.sampler.sampler_extra_args["cond_empty"], self.step, step_float=step_float)
+        if "cond_base" in self.sampler.sampler_extra_args:
+            extra_model_options["cond_base"] = prompt_parser.reconstruct_cond_batch(self.sampler.sampler_extra_args["cond_base"], self.step, step_float=step_float)
         denoised, cond_pred, uncond_pred = sampling_function(self, denoiser_params=denoiser_params, cond_scale=cond_scale, cond_composition=cond_composition, extra_model_options=extra_model_options)
 
         if self.need_last_noise_uncond:

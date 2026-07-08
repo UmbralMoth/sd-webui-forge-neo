@@ -4,6 +4,7 @@ function update_txt2img_tokens(...args) {
     // Called from Gradio
     update_token_counter("txt2img_token_button");
     update_token_counter("txt2img_negative_token_button");
+    update_token_counter("txt2img_tmg_base_token_button");
     if (args.length == 2) {
         return args[0];
     }
@@ -14,6 +15,7 @@ function update_img2img_tokens(...args) {
     // Called from Gradio
     update_token_counter("img2img_token_button");
     update_token_counter("img2img_negative_token_button");
+    update_token_counter("img2img_tmg_base_token_button");
     if (args.length == 2) {
         return args[0];
     }
@@ -32,6 +34,7 @@ function recalculate_prompts_txt2img() {
     // Called from Gradio
     recalculatePromptTokens("txt2img_prompt");
     recalculatePromptTokens("txt2img_neg_prompt");
+    recalculatePromptTokens("txt2img_tmg_base_prompt");
     return Array.from(arguments);
 }
 
@@ -39,13 +42,20 @@ function recalculate_prompts_img2img() {
     // Called from Gradio
     recalculatePromptTokens("img2img_prompt");
     recalculatePromptTokens("img2img_neg_prompt");
+    recalculatePromptTokens("img2img_tmg_base_prompt");
     return Array.from(arguments);
 }
 
 function setupTokenCounting(id, id_counter, id_button) {
     let prompt = gradioApp().getElementById(id);
     let counter = gradioApp().getElementById(id_counter);
+    if (!prompt || !counter) {
+        return;
+    }
     let textarea = gradioApp().querySelector(`#${id} > label > textarea`);
+    if (!textarea) {
+        return;
+    }
 
     if (counter.parentElement == prompt.parentElement) {
         return;
@@ -65,6 +75,9 @@ function setupTokenCounting(id, id_counter, id_button) {
 
 function toggleTokenCountingVisibility(id, id_counter, id_button) {
     let counter = gradioApp().getElementById(id_counter);
+    if (!counter) {
+        return;
+    }
 
     counter.style.display = opts.disable_token_counters ? "none" : "block";
     counter.classList.toggle(
@@ -80,11 +93,21 @@ function runCodeForTokenCounters(fun) {
         "txt2img_negative_token_counter",
         "txt2img_negative_token_button",
     );
+    fun(
+        "txt2img_tmg_base_prompt",
+        "txt2img_tmg_base_token_counter",
+        "txt2img_tmg_base_token_button",
+    );
     fun("img2img_prompt", "img2img_token_counter", "img2img_token_button");
     fun(
         "img2img_neg_prompt",
         "img2img_negative_token_counter",
         "img2img_negative_token_button",
+    );
+    fun(
+        "img2img_tmg_base_prompt",
+        "img2img_tmg_base_token_counter",
+        "img2img_tmg_base_token_button",
     );
 }
 

@@ -177,8 +177,10 @@ class dynamic_args(metaclass=_DynamicArgsMeta):
     """Flux.2 Klein"""
     wan: bool = False
     """Wan 2.2"""
+    anima_edit: bool = False
+    """Anima 2B Edit (LoRA mode: temporal-concat reference latents)"""
     ref_latents: list["torch.Tensor"] = []
-    """Reference Latent(s) for Flux Kontext / Qwen-Image-Edit / Flux.2 Klein"""
+    """Reference Latent(s) for Flux Kontext / Qwen-Image-Edit / Flux.2 Klein / Anima Edit"""
     concat_latent: "torch.Tensor" = None
     """Input Latent for Wan 2.2 I2V"""
     is_referencing: bool = False

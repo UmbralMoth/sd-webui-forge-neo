@@ -447,7 +447,7 @@ def get_learned_conditioning(model, prompts: SdConditioning | list[str], steps, 
                 # For Qwen 3.5 4B (which bypasses T5/LLM adapter), we must use the qwen3_5_4b tokenizer.
                 if hasattr(model, "forge_objects") and model.forge_objects is not None and hasattr(model.forge_objects, "clip") and model.forge_objects.clip is not None:
                     cond_stage = model.forge_objects.clip.cond_stage_model
-                    if "qwen3_5_4b" in cond_stage and "qwen3_5_4b" in tokenizers:
+                    if (hasattr(cond_stage, "qwen3_5_4b") or (isinstance(cond_stage, dict) and "qwen3_5_4b" in cond_stage)) and "qwen3_5_4b" in tokenizers:
                         tokenizer_key = "qwen3_5_4b"
                     elif "t5xxl" in tokenizers:
                         tokenizer_key = "t5xxl"

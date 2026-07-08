@@ -2,6 +2,7 @@ import torch
 from huggingface_guess import model_list
 
 from backend import memory_management
+from backend.args import dynamic_args
 from backend.diffusion_engine.base import ForgeDiffusionEngine, ForgeObjects
 from backend.modules.k_prediction import PredictionDiscreteFlow
 from backend.patcher.clip import CLIP
@@ -55,6 +56,28 @@ class Anima(ForgeDiffusionEngine):
         shift = getattr(prompt, "distilled_cfg_scale", 3.0)
         self.forge_objects.unet.model.predictor.set_parameters(shift=shift)
         memory_management.logger.debug(f"Shift: {shift}")
+
+        # Re-read the option at sampling time so toggling [Anima] Enable Edit LoRA Mode
+        # in Quicksettings takes effect without reloading the model.
+        from modules.shared import opts as _opts
+        edit_mode_on = bool(getattr(_opts, "anima_edit_mode", False))
+        dynamic_args.anima_edit = edit_mode_on
+
+        if edit_mode_on and not getattr(prompt, "is_negative_prompt", False):
+            # Build the ref list once per positive prompt conditioning call.
+            # If refs are already populated (from a previous encode_first_stage
+            # or earlier in this session), keep them. Otherwise, build from
+            # ini_latent (img2img) and self.ref_latents (ImageStitch).
+            if not dynamic_args.ref_latents:
+                refs = list(self.ref_latents)
+                if self.ini_latent is not None:
+                    refs.insert(0, self.ini_latent)
+                if refs:
+                    dynamic_args.ref_latents = refs
+        elif not edit_mode_on:
+            # Edit mode disabled - clear stale refs.
+            dynamic_args.ref_latents.clear()
+
         return self.text_processing_engine_anima(prompt)
 
     @torch.inference_mode()
@@ -72,6 +95,15 @@ class Anima(ForgeDiffusionEngine):
             sample = self.forge_objects.vae.encode(y.movedim(1, -1) * 0.5 + 0.5)
             sample = self.forge_objects.vae.first_stage_model.process_in(sample)
             samples.append(sample)
+
+        if dynamic_args.anima_edit:
+            if dynamic_args.is_referencing:
+                # ImageStitch ref image: accumulate for later use.
+                for s in samples:
+                    self.ref_latents.append(s.cpu())
+            else:
+                # img2img init image: capture as the primary ref.
+                self.ini_latent = samples[0].cpu()
 
         return torch.cat(samples).to(x)
 

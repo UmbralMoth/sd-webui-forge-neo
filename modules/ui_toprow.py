@@ -26,6 +26,8 @@ class Toprow:
     token_button = None
     negative_token_counter = None
     negative_token_button = None
+    tmg_base_token_counter = None
+    tmg_base_token_button = None
 
     ui_styles = None
 
@@ -83,6 +85,12 @@ class Toprow:
 
     def create_prompts(self):
         with gr.Column(elem_id=f"{self.id_part}_prompt_container", elem_classes=self._container_class(), scale=6):
+            if getattr(shared.opts, "tmg_enable", False):
+                with gr.Row(elem_id=f"{self.id_part}_tmg_base_prompt_row", elem_classes=["prompt-row"]):
+                    self.tmg_base_prompt = gr.Textbox(label="Baseline Prompt", elem_id=f"{self.id_part}_tmg_base_prompt", show_label=False, lines=3, placeholder="Baseline Prompt (Subject) - BLUE\n(Ctrl+Enter to Generate ; Alt+Enter to Skip ; Esc to Interrupt)", elem_classes=["prompt", "prompt-baseline"])
+            else:
+                self.tmg_base_prompt = gr.State("")
+
             with gr.Row(elem_id=f"{self.id_part}_prompt_row", elem_classes=["prompt-row"]):
                 self.prompt = gr.Textbox(label="Prompt", elem_id=f"{self.id_part}_prompt", show_label=False, lines=3, placeholder="Prompt\n(Ctrl+Enter to Generate ; Alt+Enter to Skip ; Esc to Interrupt)", elem_classes=["prompt", "prompt-positive"])
                 self.prompt_img = gr.File(elem_id=f"{self.id_part}_prompt_image", file_count="single", type="binary", visible=False)
@@ -135,6 +143,13 @@ class Toprow:
             self.token_button = gr.Button(visible=False, elem_id=f"{self.id_part}_token_button")
             self.negative_token_counter = gr.HTML(value="<span>0/75</span>", elem_id=f"{self.id_part}_negative_token_counter", elem_classes=["token-counter"], visible=False)
             self.negative_token_button = gr.Button(visible=False, elem_id=f"{self.id_part}_negative_token_button")
+
+            if getattr(shared.opts, "tmg_enable", False):
+                self.tmg_base_token_counter = gr.HTML(value="<span>0/75</span>", elem_id=f"{self.id_part}_tmg_base_token_counter", elem_classes=["token-counter"], visible=False)
+                self.tmg_base_token_button = gr.Button(visible=False, elem_id=f"{self.id_part}_tmg_base_token_button")
+            else:
+                self.tmg_base_token_counter = gr.State("")
+                self.tmg_base_token_button = gr.State("")
             self.clear_prompt_button.click(
                 fn=lambda *x: x,
                 _js="confirm_clear_prompt",

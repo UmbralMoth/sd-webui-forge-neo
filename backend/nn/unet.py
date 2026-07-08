@@ -140,12 +140,10 @@ class CrossAttention(nn.Module):
     def forward(self, x, context=None, value=None, mask=None, transformer_options={}):
         q = self.to_q(x)
         context = default(context, x)
+        val = default(value, context)
+        
         k = self.to_k(context)
-        if value is not None:
-            v = self.to_v(value)
-            del value
-        else:
-            v = self.to_v(context)
+        v = self.to_v(val)
             
         # Independent Chunk Attention with Renormalization (ICA-R)
         # Prevents style-erasure in long prompts by isolating attention passes.

@@ -33,11 +33,53 @@ class AnimaTextProcessingEngine:
         self.id_pad = qwen_tokenizer.pad_token_id if hasattr(qwen_tokenizer, "pad_token_id") and qwen_tokenizer.pad_token_id is not None else 151643
         self.id_end = t5_tokenizer.eos_token_id if hasattr(t5_tokenizer, "eos_token_id") and t5_tokenizer.eos_token_id is not None else 1
 
+        self.golden_vectors = {}
+        if is_qwen35:
+            self._load_golden_vectors()
+
+    def _load_golden_vectors(self):
+        import safetensors.torch as st
+        from modules.shared import cmd_opts
+        import os
+        
+        for fname in ["meta_embeddings_06b.safetensors", "artist_embeddings_06b.safetensors"]:
+            path = os.path.join(cmd_opts.embeddings_dir, fname)
+            if os.path.exists(path):
+                try:
+                    data = st.load_file(path, device="cpu")
+                    self.golden_vectors.update(data)
+                except Exception as e:
+                    print(f"[Anima] Failed to load {fname}: {e}")
+
     def tokenize(self, texts):
-        return (
-            self.qwen_tokenizer(texts, truncation=False, add_special_tokens=False)["input_ids"],
-            self.t5_tokenizer(texts, truncation=False, add_special_tokens=False)["input_ids"],
-        )
+        qwen_batch = []
+        t5_batch = []
+        
+        for text in texts:
+            qwen_tokens = []
+            t5_tokens = []
+            
+            parts = text.split(',')
+            for i, p in enumerate(parts):
+                p_stripped = p.strip()
+                if p_stripped and p_stripped in self.golden_vectors:
+                    # Inject golden vector into Qwen stream
+                    qwen_tokens.append({'type': 'anima_golden', 'vector': self.golden_vectors[p_stripped]})
+                    # T5 processes the raw text
+                    t5_tokens.extend(self.t5_tokenizer(p, truncation=False, add_special_tokens=False)["input_ids"])
+                else:
+                    if p:
+                        qwen_tokens.extend(self.qwen_tokenizer(p, truncation=False, add_special_tokens=False)["input_ids"])
+                        t5_tokens.extend(self.t5_tokenizer(p, truncation=False, add_special_tokens=False)["input_ids"])
+                
+                if i < len(parts) - 1:
+                    qwen_tokens.extend(self.qwen_tokenizer(",", truncation=False, add_special_tokens=False)["input_ids"])
+                    t5_tokens.extend(self.t5_tokenizer(",", truncation=False, add_special_tokens=False)["input_ids"])
+            
+            qwen_batch.append(qwen_tokens)
+            t5_batch.append(t5_tokens)
+            
+        return qwen_batch, t5_batch
 
     def tokenize_line(self, line):
         parsed = parsing.parse_prompt_attention(line, self.emphasis.name)
@@ -157,8 +199,6 @@ class AnimaTextProcessingEngine:
                  cross_attn = cross_attn * t5_weights.unsqueeze(-1).to(cross_attn)
 
         # Select the mask that matches the cross_attn sequence length
-        # 0.6B model + Adapter outputs T5-length sequence.
-        # 4B hybrid model outputs Qwen-length sequence.
         if cross_attn.shape[1] == qwen_masks.shape[1]:
             final_masks = qwen_masks
         else:
@@ -167,11 +207,13 @@ class AnimaTextProcessingEngine:
         if cross_attn.shape[1] < 512:
             cross_attn = torch.nn.functional.pad(cross_attn, (0, 0, 0, 512 - cross_attn.shape[1]))
             final_masks = torch.nn.functional.pad(final_masks, (0, 512 - final_masks.shape[1]))
-        elif cross_attn.shape[1] > 512:
-            cross_attn = cross_attn[:, :512, :]
-            final_masks = final_masks[:, :512]
 
-        return cross_attn.to(torch.float32), final_masks.to(device=cross_attn.device)
+        from backend.text_processing.blending import DictWithShape
+        return DictWithShape({
+            "crossattn": cross_attn.to(torch.float32),
+            "crossattn_mask": final_masks.unsqueeze(-1).to(device=cross_attn.device, dtype=torch.float32),
+            "vector": torch.zeros((cross_attn.shape[0], 1), dtype=torch.float32, device=cross_attn.device)
+        }, shape=cross_attn.shape)
 
     def process_embeds(self, batch_tokens):
         device = memory_management.text_encoder_device()

@@ -806,6 +806,11 @@ table.popup-table .link {
 }
 
 /* Prompt Colors */
+.prompt-baseline textarea {
+  border: 1px solid rgba(132, 180, 225, 0.4) !important;
+  background-color: rgba(132, 180, 225, 0.05) !important;
+}
+
 .prompt-positive textarea {
   border: 1px solid rgba(132, 225, 132, 0.4) !important;
   background-color: rgba(132, 225, 132, 0.05) !important;

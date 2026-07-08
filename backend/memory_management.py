@@ -495,7 +495,7 @@ class LoadedModel:
             return True
         return False
 
-    def model_unload(self, memory_to_free=None, unpatch_weights=True):
+    def model_unload(self, memory_to_free=None, unpatch_weights=True, force=False):
         if memory_to_free is not None:
             if self.model is not None and memory_to_free < self.model.loaded_size():
                 freed = self.model.partially_unload(self.model.offload_device, memory_to_free)
@@ -503,7 +503,7 @@ class LoadedModel:
                     return False
         
         # Check total system RAM to avoid swap storms
-        if self.model is not None and str(self.model.offload_device) == "cpu":
+        if not force and self.model is not None and str(self.model.offload_device) == "cpu":
             # Avoid importing total_ram globally if it causes circular deps, though it's in the same file here.
             # We can use the global total_ram directly since we are inside memory_management.py
             model_size_gb = self.model.model_size() / (1024 * 1024 * 1024)
@@ -606,7 +606,7 @@ def minimum_inference_memory() -> float:
     return (1024 * 1024 * 1024) * 0.8 + extra_reserved_memory()
 
 
-def free_memory(memory_required: float, device: torch.device, keep_loaded: list["LoadedModel"] = []):
+def free_memory(memory_required: float, device: torch.device, keep_loaded: list["LoadedModel"] = [], force: bool = False):
     if torch.cuda.is_available():
         torch.cuda.synchronize()
     elif torch.xpu.is_available():
@@ -636,7 +636,7 @@ def free_memory(memory_required: float, device: torch.device, keep_loaded: list[
                 break
             memory_to_free = memory_required - free_mem
         logger.debug(f"Unloading {current_loaded_models[i].model.model.__class__.__name__}")
-        if current_loaded_models[i].model_unload(memory_to_free):
+        if current_loaded_models[i].model_unload(memory_to_free, force=force):
             unloaded_model.append(i)
 
     for i in sorted(unloaded_model, reverse=True):
@@ -1481,7 +1481,7 @@ def unload_model(model: "ModelPatcher") -> bool:
 
     if index is not None:
         mdl = current_loaded_models.pop(index)
-        mdl.model_unload()
+        mdl.model_unload(force=True)
         del mdl
         soft_empty_cache()
         return True
@@ -1490,7 +1490,7 @@ def unload_model(model: "ModelPatcher") -> bool:
 
 
 def unload_all_models():
-    free_memory(1e30, get_torch_device())
+    free_memory(1e30, get_torch_device(), force=True)
 
 
 # region Streams

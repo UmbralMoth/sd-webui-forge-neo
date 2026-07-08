@@ -6,7 +6,7 @@
 # References: https://github.com/nvidia-cosmos/cosmos-predict2
 
 import math
-from typing import Callable, Optional
+from typing import Callable, Optional, Union
 
 import torch
 import torch.nn.functional as F
@@ -15,6 +15,7 @@ from einops.layers.torch import Rearrange
 from torch import nn
 from torchvision import transforms
 
+from backend.args import dynamic_args
 from backend.attention import attention_function
 from backend.utils import pad_to_patch_size
 
@@ -588,12 +589,27 @@ class MiniTrainDIT(nn.Module):
         )
         return x_B_C_Tt_Hp_Wp
 
-    def forward(self, x: torch.Tensor, timesteps: torch.Tensor, context: torch.Tensor, fps: Optional[torch.Tensor] = None, padding_mask: Optional[torch.Tensor] = None, **kwargs):
+    def forward(self, x: torch.Tensor, timesteps: torch.Tensor, context: torch.Tensor, fps: Optional[torch.Tensor] = None, padding_mask: Optional[torch.Tensor] = None, ref_latents=None, **kwargs):
+        orig_t = x.shape[2]
         orig_shape = list(x.shape)
         x = pad_to_patch_size(x, (self.patch_temporal, self.patch_spatial, self.patch_spatial))
+
+        if ref_latents is None:
+            ref_latents = dynamic_args.ref_latents
+        if ref_latents:
+            for ref in ref_latents:
+                if ref.ndim == 4:
+                    ref = ref.unsqueeze(2)
+                # Expand the ref along the batch dim so it matches x (which can be
+                # B=2 for cond+uncond CFG, B=3 for cond+uncond+empty_c TraSCE,
+                # B=4 with TraSCE+TMG base, etc).
+                if ref.shape[0] == 1 and x.shape[0] != 1:
+                    ref = ref.expand(x.shape[0], *ref.shape[1:]).contiguous()
+                x = torch.cat([x, ref.to(dtype=x.dtype, device=x.device)], dim=2)
+
         x_B_C_T_H_W = x
         timesteps_B_T = timesteps
-        
+
         crossattn_emb = context
 
         x_B_T_H_W_D, rope_emb_L_1_1_D, extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D = self.prepare_embedded_sequence(
@@ -613,11 +629,15 @@ class MiniTrainDIT(nn.Module):
         if extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D is not None:
             assert x_B_T_H_W_D.shape == extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D.shape
 
+        c_mask = kwargs.get("y_mask", kwargs.get("crossattn_mask", None))
+        if c_mask is not None and c_mask.ndim == 3:
+            c_mask = c_mask.squeeze(-1)
+
         block_kwargs = {
             "rope_emb_L_1_1_D": rope_emb_L_1_1_D.unsqueeze(1).unsqueeze(0),
             "adaln_lora_B_T_3D": adaln_lora_B_T_3D,
             "extra_per_block_pos_emb": extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D,
-            "mask": kwargs.get("y_mask", kwargs.get("crossattn_mask", None)),
+            "mask": c_mask,
             "transformer_options": kwargs.get("transformer_options", {}),
         }
 
@@ -643,9 +663,11 @@ class MiniTrainDIT(nn.Module):
 
         final_context = crossattn_emb.out_cond if hasattr(crossattn_emb, "out_cond") else crossattn_emb
         x_B_T_H_W_O = self.final_layer(x_B_T_H_W_D.to(final_context.dtype), t_embedding_B_T_D, adaln_lora_B_T_3D=adaln_lora_B_T_3D)
-        x_B_C_Tt_Hp_Wp = self.unpatchify(x_B_T_H_W_O)[:, :, : orig_shape[-3], : orig_shape[-2], : orig_shape[-1]]
+        x_B_C_Tt_Hp_Wp = self.unpatchify(x_B_T_H_W_O)[:, :, :orig_t, : orig_shape[-2], : orig_shape[-1]]
         return x_B_C_Tt_Hp_Wp
 
+
+# --- Refactored LLMAdapter Components ---
 
 def rotate_half(x):
     x1 = x[..., : x.shape[-1] // 2]
@@ -660,157 +682,152 @@ def apply_rotary_pos_emb(x, cos, sin, unsqueeze_dim=1):
     return x_embed
 
 
-class RotaryEmbedding(nn.Module):
-    def __init__(self, head_dim):
+class AnimaRotaryEmbedding(nn.Module):
+    def __init__(self, head_dim, theta=10000.0):
         super().__init__()
-        self.rope_theta = 10000
-        inv_freq = 1.0 / (self.rope_theta ** (torch.arange(0, head_dim, 2, dtype=torch.int64).to(dtype=torch.float) / head_dim))
+        self.theta = theta
+        inv_freq = 1.0 / (self.theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
     @torch.no_grad()
     def forward(self, x, position_ids):
-        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
-        position_ids_expanded = position_ids[:, None, :].float()
+        # Ensure high precision for freq calculation
+        inv_freq = self.inv_freq.to(device=x.device, dtype=torch.float32)
+        position_ids = position_ids.to(device=x.device, dtype=torch.float32)
+        
+        # [B, L] -> [B, L, head_dim/2]
+        freqs = torch.einsum("bi,j->bij", position_ids, inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        
+        cos = emb.cos().to(x.dtype)
+        sin = emb.sin().to(x.dtype)
+        return cos, sin
 
-        device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
-        with torch.autocast(device_type=device_type, enabled=False):  # Force float32
-            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
-            emb = torch.cat((freqs, freqs), dim=-1)
-            cos = emb.cos()
-            sin = emb.sin()
 
-        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
-
-
-class Attention(nn.Module):
-    def __init__(self, query_dim, context_dim, n_heads, head_dim):
+class AnimaAttention(nn.Module):
+    def __init__(self, query_dim, context_dim, n_heads, head_dim, v_norm=False):
         super().__init__()
-
         inner_dim = head_dim * n_heads
         self.n_heads = n_heads
         self.head_dim = head_dim
-        self.query_dim = query_dim
-        self.context_dim = context_dim
-
+        
         self.q_proj = nn.Linear(query_dim, inner_dim, bias=False)
-        self.q_norm = nn.RMSNorm(self.head_dim, eps=1e-6)
-
         self.k_proj = nn.Linear(context_dim, inner_dim, bias=False)
-        self.k_norm = nn.RMSNorm(self.head_dim, eps=1e-6)
-
         self.v_proj = nn.Linear(context_dim, inner_dim, bias=False)
-
         self.o_proj = nn.Linear(inner_dim, query_dim, bias=False)
+        
+        self.q_norm = nn.RMSNorm(head_dim, eps=1e-6)
+        self.k_norm = nn.RMSNorm(head_dim, eps=1e-6)
+        self.v_norm = nn.RMSNorm(head_dim, eps=1e-6) if v_norm else nn.Identity()
 
-    def forward(self, x, mask=None, context=None, position_embeddings=None, position_embeddings_context=None):
+    def forward(self, x, context=None, mask=None, pos_emb=None, pos_emb_context=None):
         context = x if context is None else context
-        input_shape = x.shape[:-1]
-        q_shape = (*input_shape, self.n_heads, self.head_dim)
-        context_shape = context.shape[:-1]
-        kv_shape = (*context_shape, self.n_heads, self.head_dim)
-
-        query_states = self.q_norm(self.q_proj(x).view(q_shape)).transpose(1, 2)
-        key_states = self.k_norm(self.k_proj(context).view(kv_shape)).transpose(1, 2)
-        value_states = self.v_proj(context).view(kv_shape).transpose(1, 2)
-
-        if position_embeddings is not None:
-            assert position_embeddings_context is not None
-            cos, sin = position_embeddings
-            query_states = apply_rotary_pos_emb(query_states, cos, sin)
-            cos, sin = position_embeddings_context
-            key_states = apply_rotary_pos_emb(key_states, cos, sin)
-
-        attn_output = F.scaled_dot_product_attention(query_states, key_states, value_states, attn_mask=mask)
-
-        attn_output = attn_output.transpose(1, 2).reshape(*input_shape, -1).contiguous()
-        attn_output = self.o_proj(attn_output)
-        return attn_output
-
-    def init_weights(self):
-        torch.nn.init.zeros_(self.o_proj.weight)
+        b, l, _ = x.shape
+        b_c, l_c, _ = context.shape
+        
+        q = self.q_proj(x).view(b, l, self.n_heads, self.head_dim)
+        k = self.k_proj(context).view(b_c, l_c, self.n_heads, self.head_dim)
+        v = self.v_proj(context).view(b_c, l_c, self.n_heads, self.head_dim)
+        
+        q = self.q_norm(q).transpose(1, 2)
+        k = self.k_norm(k).transpose(1, 2)
+        v = self.v_norm(v).transpose(1, 2)
+        
+        if pos_emb is not None:
+            cos, sin = pos_emb
+            q = apply_rotary_pos_emb(q, cos, sin)
+        if pos_emb_context is not None:
+            cos_c, sin_c = pos_emb_context
+            k = apply_rotary_pos_emb(k, cos_c, sin_c)
+            
+        # [B, H, L, D]
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+        out = out.transpose(1, 2).reshape(b, l, -1)
+        return self.o_proj(out)
 
 
-class TransformerBlock(nn.Module):
-    def __init__(self, source_dim, model_dim, num_heads=16, mlp_ratio=4.0, use_self_attn=False, layer_norm=False):
+class AnimaTransformerBlock(nn.Module):
+    def __init__(self, source_dim, model_dim, num_heads=16, mlp_ratio=4.0, use_self_attn=True, layer_norm=False, v_norm=False):
         super().__init__()
         self.use_self_attn = use_self_attn
-
-        if self.use_self_attn:
-            self.norm_self_attn = nn.LayerNorm(model_dim) if layer_norm else nn.RMSNorm(model_dim, eps=1e-6)
-            self.self_attn = Attention(
-                query_dim=model_dim,
-                context_dim=model_dim,
-                n_heads=num_heads,
-                head_dim=model_dim // num_heads,
-            )
-
-        self.norm_cross_attn = nn.LayerNorm(model_dim) if layer_norm else nn.RMSNorm(model_dim, eps=1e-6)
-        self.cross_attn = Attention(
-            query_dim=model_dim,
-            context_dim=source_dim,
-            n_heads=num_heads,
-            head_dim=model_dim // num_heads,
+        norm_cls = nn.LayerNorm if layer_norm else nn.RMSNorm
+        
+        if use_self_attn:
+            self.norm_self_attn = norm_cls(model_dim, eps=1e-6)
+            self.self_attn = AnimaAttention(model_dim, model_dim, num_heads, model_dim // num_heads, v_norm=v_norm)
+            
+        self.norm_cross_attn = norm_cls(model_dim, eps=1e-6)
+        self.cross_attn = AnimaAttention(model_dim, source_dim, num_heads, model_dim // num_heads, v_norm=v_norm)
+        
+        self.norm_mlp = norm_cls(model_dim, eps=1e-6)
+        self.mlp = nn.Sequential(
+            nn.Linear(model_dim, int(model_dim * mlp_ratio), bias=False),
+            nn.GELU(),
+            nn.Linear(int(model_dim * mlp_ratio), model_dim, bias=False)
         )
 
-        self.norm_mlp = nn.LayerNorm(model_dim) if layer_norm else nn.RMSNorm(model_dim, eps=1e-6)
-        self.mlp = nn.Sequential(nn.Linear(model_dim, int(model_dim * mlp_ratio)), nn.GELU(), nn.Linear(int(model_dim * mlp_ratio), model_dim))
-
-    def forward(self, x, context, target_attention_mask=None, source_attention_mask=None, position_embeddings=None, position_embeddings_context=None):
+    def forward(self, x, context, mask_self=None, mask_cross=None, pos_emb=None, pos_emb_context=None):
         if self.use_self_attn:
-            normed = self.norm_self_attn(x)
-            attn_out = self.self_attn(normed, mask=target_attention_mask, position_embeddings=position_embeddings, position_embeddings_context=position_embeddings)
-            x = x + attn_out
-
-        normed = self.norm_cross_attn(x)
-        attn_out = self.cross_attn(normed, mask=source_attention_mask, context=context, position_embeddings=position_embeddings, position_embeddings_context=position_embeddings_context)
-        x = x + attn_out
-
+            x = x + self.self_attn(self.norm_self_attn(x), mask=mask_self, pos_emb=pos_emb, pos_emb_context=pos_emb)
+            
+        x = x + self.cross_attn(self.norm_cross_attn(x), context=context, mask=mask_cross, pos_emb=pos_emb, pos_emb_context=pos_emb_context)
         x = x + self.mlp(self.norm_mlp(x))
         return x
 
-    def init_weights(self):
-        torch.nn.init.zeros_(self.mlp[2].weight)
-        self.cross_attn.init_weights()
-
 
 class LLMAdapter(nn.Module):
-    def __init__(self, source_dim=1024, target_dim=1024, model_dim=1024, num_layers=6, num_heads=16, use_self_attn=True, layer_norm=False):
+    """
+    Overhauled LLMAdapter: Uses consistent RoPE, and improved normalization.
+    Forge Neo monkey-patches nn.Linear/RMSNorm automatically.
+    """
+    def __init__(self, source_dim=1024, target_dim=1024, model_dim=1024, num_layers=6, num_heads=16, 
+                 use_self_attn=True, layer_norm=False, v_norm=False, theta=10000.0):
         super().__init__()
-
+        
         self.embed = nn.Embedding(32128, target_dim)
-        if model_dim != target_dim:
-            self.in_proj = nn.Linear(target_dim, model_dim)
-        else:
-            self.in_proj = nn.Identity()
-        self.rotary_emb = RotaryEmbedding(model_dim // num_heads)
-        self.blocks = nn.ModuleList([TransformerBlock(source_dim, model_dim, num_heads=num_heads, use_self_attn=use_self_attn, layer_norm=layer_norm) for _ in range(num_layers)])
+        self.in_proj = nn.Linear(target_dim, model_dim) if model_dim != target_dim else nn.Identity()
+        
+        self.rope = AnimaRotaryEmbedding(model_dim // num_heads, theta=theta)
+        
+        self.blocks = nn.ModuleList([
+            AnimaTransformerBlock(
+                source_dim, model_dim, num_heads=num_heads, 
+                use_self_attn=use_self_attn, layer_norm=layer_norm, v_norm=v_norm
+            ) for _ in range(num_layers)
+        ])
+        
         self.out_proj = nn.Linear(model_dim, target_dim)
         self.norm = nn.RMSNorm(target_dim, eps=1e-6)
 
     def forward(self, source_hidden_states, target_input_ids, target_attention_mask=None, source_attention_mask=None, target_weights=None):
-        out_dtype = source_hidden_states.dtype
-        if target_attention_mask is not None:
-            target_attention_mask = target_attention_mask.to(torch.bool)
-            if target_attention_mask.ndim == 2:
-                target_attention_mask = target_attention_mask.unsqueeze(1).unsqueeze(1)
+        # Standardize mask shapes for SDPA [B, 1, 1, L] or [B, 1, L, L]
+        def prepare_mask(mask, target_len, source_len):
+            if mask is None: return None
+            mask = mask.to(torch.bool)
+            if mask.ndim == 2:
+                # [B, L] -> [B, 1, 1, L]
+                return mask.unsqueeze(1).unsqueeze(2)
+            return mask
 
-        if source_attention_mask is not None:
-            source_attention_mask = source_attention_mask.to(torch.bool)
-            if source_attention_mask.ndim == 2:
-                source_attention_mask = source_attention_mask.unsqueeze(1).unsqueeze(1)
-
-        x = self.in_proj(self.embed(target_input_ids)).to(out_dtype)
+        m_self = prepare_mask(target_attention_mask, target_input_ids.shape[1], target_input_ids.shape[1])
+        m_cross = prepare_mask(source_attention_mask, target_input_ids.shape[1], source_hidden_states.shape[1])
+        
+        # Embed target tokens
+        x = self.in_proj(self.embed(target_input_ids))
         if target_weights is not None:
             x = x * target_weights.unsqueeze(-1).to(x)
-
-        context = source_hidden_states
-        position_ids = torch.arange(x.shape[1], device=x.device).unsqueeze(0)
-        position_ids_context = torch.arange(context.shape[1], device=x.device).unsqueeze(0)
-        position_embeddings = self.rotary_emb(x, position_ids)
-        position_embeddings_context = self.rotary_emb(x, position_ids_context)
+            
+        # Compute RoPE once
+        p_ids = torch.arange(x.shape[1], device=x.device).unsqueeze(0)
+        p_ids_c = torch.arange(source_hidden_states.shape[1], device=x.device).unsqueeze(0)
+        
+        pos_emb = self.rope(x, p_ids)
+        pos_emb_c = self.rope(source_hidden_states, p_ids_c)
+        
         for block in self.blocks:
-            x = block(x, context, target_attention_mask=target_attention_mask, source_attention_mask=source_attention_mask, position_embeddings=position_embeddings, position_embeddings_context=position_embeddings_context)
-        return self.norm(self.out_proj(x)).to(out_dtype)
+            x = block(x, context=source_hidden_states, mask_self=m_self, mask_cross=m_cross, pos_emb=pos_emb, pos_emb_context=pos_emb_c)
+            
+        return self.norm(self.out_proj(x))
 
 
 class Anima(MiniTrainDIT):

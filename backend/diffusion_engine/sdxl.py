@@ -157,7 +157,18 @@ class StableDiffusionXLRF(StableDiffusionXL):
 
         clip = CLIP(model_dict={"clip_l": huggingface_components["text_encoder"], "clip_g": huggingface_components["text_encoder_2"]}, tokenizer_dict={"clip_l": huggingface_components["tokenizer"], "clip_g": huggingface_components["tokenizer_2"]})
 
+        # is_mugen=True sets 16x upscale_ratio and 32 latent_channels (the model's
+        # packed channels). The VAE handles its own internal scaling (Flux2-style,
+        # identity for Flux2 or model-stored for custom VAEs like Andromeda).
+        # Spatial-to-channel packing is configured below to convert the model's
+        # 32-channel full-res latents to/from the VAE's 128-channel half-res
+        # latents (Flux2 packs 2x2 spatial blocks into the channel dimension).
         vae = VAE(model=huggingface_components["vae"], is_mugen=True)
+        if hasattr(estimated_config, "packed_vae_latent_channels") and estimated_config.packed_vae_latent_channels is not None:
+            vae.set_packed_latents(
+                packed_channels=estimated_config.packed_vae_latent_channels,
+                spatial_factor=getattr(estimated_config, "packed_vae_spatial_factor", 2),
+            )
 
         k_predictor = PredictionDiscreteFlow(estimated_config)
 
@@ -201,12 +212,21 @@ class StableDiffusionXLRF(StableDiffusionXL):
 
     @torch.inference_mode()
     def encode_first_stage(self, x):
+        # Match ComfyUI's behavior: the latent format's process_in is applied
+        # (which is identity for SDXL_Flux2). The VAE's process_in is NOT
+        # called here because the model expects latents at the VAE's natural
+        # (un-rescaled) distribution, which is what the VAE.encode produces
+        # directly. The VAE's internal packing (mugen flag) and BatchNorm
+        # produce a 32-channel latent at the expected distribution.
         sample = self.forge_objects.vae.encode(x.movedim(1, -1) * 0.5 + 0.5)
         sample = self.model_config.latent_format.process_in(sample)
         return sample.to(x)
 
     @torch.inference_mode()
     def decode_first_stage(self, x):
+        # Match ComfyUI's behavior: the latent format's process_out is applied
+        # (which is identity for SDXL_Flux2). The model's output latent is at
+        # the VAE's natural distribution; no rescaling needed before decode.
         sample = self.model_config.latent_format.process_out(x)
         return self.forge_objects.vae.decode(sample).movedim(-1, 1) * 2.0 - 1.0
 

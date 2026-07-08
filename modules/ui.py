@@ -245,7 +245,14 @@ def create_ui():
                     elif category == "cfg":
                         with gr.Row():
                             distilled_cfg_scale = gr.Slider(minimum=1.0, maximum=24.0, step=0.5, label="Distilled CFG Scale", value=3.0, elem_id="txt2img_distilled_cfg_scale", scale=4)
-                            cfg_scale = gr.Slider(minimum=1.0, maximum=24.0, step=0.5, label="CFG Scale", value=6.0, elem_id="txt2img_cfg_scale", scale=4)
+                            if getattr(shared.opts, "tmg_enable", False):
+                                tmg_max_guidance = gr.Slider(minimum=1.0, maximum=24.0, step=0.5, label="Max Guidance", value=6.0, elem_id="txt2img_tmg_max_guidance", scale=2)
+                                tmg_min_guidance = gr.Slider(minimum=0.0, maximum=12.0, step=0.5, label="Min Guidance", value=1.0, elem_id="txt2img_tmg_min_guidance", scale=2)
+                                cfg_scale = tmg_max_guidance
+                            else:
+                                cfg_scale = gr.Slider(minimum=1.0, maximum=24.0, step=0.5, label="CFG Scale", value=6.0, elem_id="txt2img_cfg_scale", scale=4)
+                                tmg_max_guidance = gr.State(6.0)
+                                tmg_min_guidance = gr.State(1.0)
                             scripts.scripts_txt2img.setup_ui_for_section(category)
 
                     elif category == "accordions":
@@ -347,10 +354,12 @@ def create_ui():
                 dummy_component,
                 toprow.prompt,
                 toprow.negative_prompt,
+                toprow.tmg_base_prompt,
                 toprow.ui_styles.dropdown,
                 batch_count,
                 batch_size,
                 cfg_scale,
+                tmg_min_guidance,
                 distilled_cfg_scale,
                 height,
                 width,
@@ -429,7 +438,9 @@ def create_ui():
             txt2img_paste_fields = [
                 PasteField(toprow.prompt, "Prompt", api="prompt"),
                 PasteField(toprow.negative_prompt, "Negative prompt", api="negative_prompt"),
+                PasteField(toprow.tmg_base_prompt, "TMG Base", api="tmg_base_prompt"),
                 PasteField(cfg_scale, "CFG scale", api="cfg_scale"),
+                PasteField(tmg_min_guidance, "TMG Min Guidance", api="tmg_min_guidance"),
                 PasteField(distilled_cfg_scale, "Distilled CFG Scale", api="distilled_cfg_scale"),
                 PasteField(width, "Size-1", api="width"),
                 PasteField(height, "Size-2", api="height"),
@@ -470,6 +481,10 @@ def create_ui():
             toprow.ui_styles.dropdown.change(fn=wrap_queued_call(update_negative_prompt_token_counter), inputs=[toprow.negative_prompt, steps, toprow.ui_styles.dropdown], outputs=[toprow.negative_token_counter])
             toprow.token_button.click(fn=wrap_queued_call(update_token_counter), inputs=[toprow.prompt, steps, toprow.ui_styles.dropdown], outputs=[toprow.token_counter])
             toprow.negative_token_button.click(fn=wrap_queued_call(update_negative_prompt_token_counter), inputs=[toprow.negative_prompt, steps, toprow.ui_styles.dropdown], outputs=[toprow.negative_token_counter])
+
+            if getattr(shared.opts, "tmg_enable", False):
+                toprow.ui_styles.dropdown.change(fn=wrap_queued_call(update_token_counter), inputs=[toprow.tmg_base_prompt, steps, toprow.ui_styles.dropdown], outputs=[toprow.tmg_base_token_counter])
+                toprow.tmg_base_token_button.click(fn=wrap_queued_call(update_token_counter), inputs=[toprow.tmg_base_prompt, steps, toprow.ui_styles.dropdown], outputs=[toprow.tmg_base_token_counter])
 
         extra_networks_ui = ui_extra_networks.create_ui(txt2img_interface, [txt2img_generation_tab], "txt2img")
         ui_extra_networks.setup_ui(extra_networks_ui, output_panel.gallery)
@@ -640,7 +655,14 @@ def create_ui():
                     elif category == "cfg":
                         with gr.Row():
                             distilled_cfg_scale = gr.Slider(minimum=0.0, maximum=24.0, step=0.5, label="Distilled CFG Scale", value=3.0, elem_id="img2img_distilled_cfg_scale", scale=4)
-                            cfg_scale = gr.Slider(minimum=1.0, maximum=24.0, step=0.5, label="CFG Scale", value=6.0, elem_id="img2img_cfg_scale", scale=4)
+                            if getattr(shared.opts, "tmg_enable", False):
+                                tmg_max_guidance = gr.Slider(minimum=1.0, maximum=24.0, step=0.5, label="Max Guidance", value=6.0, elem_id="img2img_tmg_max_guidance", scale=2)
+                                tmg_min_guidance = gr.Slider(minimum=0.0, maximum=12.0, step=0.5, label="Min Guidance", value=1.0, elem_id="img2img_tmg_min_guidance", scale=2)
+                                cfg_scale = tmg_max_guidance
+                            else:
+                                cfg_scale = gr.Slider(minimum=1.0, maximum=24.0, step=0.5, label="CFG Scale", value=6.0, elem_id="img2img_cfg_scale", scale=4)
+                                tmg_max_guidance = gr.State(6.0)
+                                tmg_min_guidance = gr.State(1.0)
                             image_cfg_scale = gr.Slider(minimum=0, maximum=3.0, step=0.05, label="Image CFG Scale", value=1.5, elem_id="img2img_image_cfg_scale", visible=False)
                             scripts.scripts_img2img.setup_ui_for_section(category)
 
@@ -703,6 +725,7 @@ def create_ui():
                 img2img_selected_tab,
                 toprow.prompt,
                 toprow.negative_prompt,
+                toprow.tmg_base_prompt,
                 toprow.ui_styles.dropdown,
                 init_img.background,
                 sketch.background,
@@ -719,6 +742,7 @@ def create_ui():
                 batch_count,
                 batch_size,
                 cfg_scale,
+                tmg_min_guidance,
                 distilled_cfg_scale,
                 image_cfg_scale,
                 denoising_strength,
@@ -788,7 +812,11 @@ def create_ui():
             toprow.token_button.click(fn=update_token_counter, inputs=[toprow.prompt, steps, toprow.ui_styles.dropdown], outputs=[toprow.token_counter])
             toprow.negative_token_button.click(fn=wrap_queued_call(update_negative_prompt_token_counter), inputs=[toprow.negative_prompt, steps, toprow.ui_styles.dropdown], outputs=[toprow.negative_token_counter])
 
-            img2img_paste_fields = [(toprow.prompt, "Prompt"), (toprow.negative_prompt, "Negative prompt"), (cfg_scale, "CFG scale"), (distilled_cfg_scale, "Distilled CFG Scale"), (image_cfg_scale, "Image CFG scale"), (width, "Size-1"), (height, "Size-2"), (batch_size, "Batch size"), (toprow.ui_styles.dropdown, lambda d: d["Styles array"] if isinstance(d.get("Styles array"), list) else gr.skip()), (denoising_strength, "Denoising strength"), (mask_blur, "Mask blur"), (inpainting_mask_invert, "Mask mode"), (inpainting_fill, "Masked content"), (inpaint_full_res, "Inpaint area"), (inpaint_full_res_padding, "Masked area padding"), *scripts.scripts_img2img.infotext_fields]
+            if getattr(shared.opts, "tmg_enable", False):
+                toprow.ui_styles.dropdown.change(fn=wrap_queued_call(update_token_counter), inputs=[toprow.tmg_base_prompt, steps, toprow.ui_styles.dropdown], outputs=[toprow.tmg_base_token_counter])
+                toprow.tmg_base_token_button.click(fn=wrap_queued_call(update_token_counter), inputs=[toprow.tmg_base_prompt, steps, toprow.ui_styles.dropdown], outputs=[toprow.tmg_base_token_counter])
+
+            img2img_paste_fields = [(toprow.prompt, "Prompt"), (toprow.negative_prompt, "Negative prompt"), (toprow.tmg_base_prompt, "TMG Base"), (cfg_scale, "CFG scale"), (tmg_min_guidance, "TMG Min Guidance"), (distilled_cfg_scale, "Distilled CFG Scale"), (image_cfg_scale, "Image CFG scale"), (width, "Size-1"), (height, "Size-2"), (batch_size, "Batch size"), (toprow.ui_styles.dropdown, lambda d: d["Styles array"] if isinstance(d.get("Styles array"), list) else gr.skip()), (denoising_strength, "Denoising strength"), (mask_blur, "Mask blur"), (inpainting_mask_invert, "Mask mode"), (inpainting_fill, "Masked content"), (inpaint_full_res, "Inpaint area"), (inpaint_full_res_padding, "Masked area padding"), *scripts.scripts_img2img.infotext_fields]
             parameters_copypaste.add_paste_fields("img2img", init_img.background, img2img_paste_fields, override_settings)
             parameters_copypaste.add_paste_fields("inpaint", init_img_with_mask.background, img2img_paste_fields, override_settings)
             parameters_copypaste.register_paste_params_button(

@@ -166,6 +166,62 @@ class VAE:
         self.patcher = ModelPatcher(self.first_stage_model, load_device=self.device, offload_device=offload_device)
         self.is_wan = is_wan
 
+        # Spatial-to-channel packing for hybrid models (e.g. SDXL UNet with Flux2 VAE):
+        # the model uses packed_channels channels at full spatial resolution, but the
+        # VAE internally uses self.latent_channels (e.g. 128 for Flux2) at half spatial
+        # resolution. _to_vae_latent/_from_vae_latent convert between the two.
+        # Defaults: no packing. Use VAE.set_packed_latents() to enable.
+        self.packed_latent_channels = None
+        self.packed_latent_spatial_factor = 2
+
+    def set_packed_latents(self, packed_channels, spatial_factor=2):
+        """Configure spatial-to-channel packing. Call this when a hybrid model
+        uses fewer latent channels than the VAE expects (e.g. SDXL UNet with
+        32 input channels + Flux2 VAE with 128 internal channels)."""
+        self.packed_latent_channels = packed_channels
+        self.packed_latent_spatial_factor = spatial_factor
+
+    def _to_vae_latent(self, latent):
+        """Pack a (B, packed_channels, H, W) latent into (B, self.latent_channels, H/sf, W/sf)
+        by rearranging 2x2 spatial blocks into the channel dimension."""
+        packed_channels = self.packed_latent_channels
+        sf = self.packed_latent_spatial_factor
+        if packed_channels is None:
+            return latent
+        if latent.shape[1] != packed_channels:
+            return latent
+        if packed_channels * (sf ** 2) != self.latent_channels or latent.ndim < 4:
+            return latent
+        h = latent.shape[-2]
+        w = latent.shape[-1]
+        if h % sf != 0 or w % sf != 0:
+            pad_h = (sf - (h % sf)) % sf
+            pad_w = (sf - (w % sf)) % sf
+            latent = torch.nn.functional.pad(latent, (0, pad_w, 0, pad_h))
+            h = latent.shape[-2]
+            w = latent.shape[-1]
+        latent = latent.reshape(latent.shape[0], packed_channels, h // sf, sf, w // sf, sf)
+        latent = latent.permute(0, 1, 3, 5, 2, 4).reshape(latent.shape[0], self.latent_channels, h // sf, w // sf)
+        return latent
+
+    def _from_vae_latent(self, latent):
+        """Unpack a (B, self.latent_channels, H, W) VAE latent into
+        (B, packed_channels, H*sf, W*sf) by rearranging the channel dimension
+        back into 2x2 spatial blocks."""
+        packed_channels = self.packed_latent_channels
+        sf = self.packed_latent_spatial_factor
+        if packed_channels is None:
+            return latent
+        if latent.shape[1] != self.latent_channels:
+            return latent
+        if packed_channels * (sf ** 2) != self.latent_channels or latent.ndim < 4:
+            return latent
+        h = latent.shape[-2]
+        w = latent.shape[-1]
+        latent = latent.reshape(latent.shape[0], packed_channels, sf, sf, h, w)
+        latent = latent.permute(0, 1, 4, 2, 5, 3).reshape(latent.shape[0], packed_channels, h * sf, w * sf)
+        return latent
+
     def clone(self):
         n = VAE(no_init=True)
         n.patcher = self.patcher.clone()
@@ -178,52 +234,67 @@ class VAE:
         n.vae_dtype = self.vae_dtype
         n.output_device = self.output_device
         n.is_wan = self.is_wan
+        n.packed_latent_channels = self.packed_latent_channels
+        n.packed_latent_spatial_factor = self.packed_latent_spatial_factor
         return n
 
     def decode_tiled_(self, samples, tile_x=64, tile_y=64, overlap=16):
+        # Pack model-channel latents into VAE-channel latents (no-op if no packing config).
+        vae_samples = self._to_vae_latent(samples)
         decode_fn = lambda a: self.first_stage_model.decode(a.to(self.vae_dtype).to(self.device)).float()
-        output = self.process_output((tiled_scale(samples, decode_fn, tile_x // 2, tile_y * 2, overlap, upscale_amount=self.upscale_ratio, output_device=self.output_device) + tiled_scale(samples, decode_fn, tile_x * 2, tile_y // 2, overlap, upscale_amount=self.upscale_ratio, output_device=self.output_device) + tiled_scale(samples, decode_fn, tile_x, tile_y, overlap, upscale_amount=self.upscale_ratio, output_device=self.output_device)) / 3.0)
+        output = self.process_output((tiled_scale(vae_samples, decode_fn, tile_x // 2, tile_y * 2, overlap, upscale_amount=self.upscale_ratio, output_device=self.output_device) + tiled_scale(vae_samples, decode_fn, tile_x * 2, tile_y // 2, overlap, upscale_amount=self.upscale_ratio, output_device=self.output_device) + tiled_scale(vae_samples, decode_fn, tile_x, tile_y, overlap, upscale_amount=self.upscale_ratio, output_device=self.output_device)) / 3.0)
         return output
 
     def decode_tiled_3d(self, samples, tile_t=999, tile_x=32, tile_y=32, overlap=(1, 8, 8)):
+        vae_samples = self._to_vae_latent(samples)
         decode_fn = lambda a: self.first_stage_model.decode(a.to(self.vae_dtype).to(self.device)).float()
-        return self.process_output(tiled_scale_multidim(samples, decode_fn, tile=(tile_t, tile_x, tile_y), overlap=overlap, upscale_amount=self.upscale_ratio, out_channels=self.output_channels, index_formulas=self.upscale_index_formula, output_device=self.output_device))
+        return self.process_output(tiled_scale_multidim(vae_samples, decode_fn, tile=(tile_t, tile_x, tile_y), overlap=overlap, upscale_amount=self.upscale_ratio, out_channels=self.output_channels, index_formulas=self.upscale_index_formula, output_device=self.output_device))
 
     def encode_tiled_(self, pixel_samples, tile_x=512, tile_y=512, overlap=64):
         encode_fn = lambda a: self.first_stage_model.encode((self.process_input(a)).to(self.vae_dtype).to(self.device)).float()
-        samples = tiled_scale(pixel_samples, encode_fn, tile_x, tile_y, overlap, upscale_amount=(1 / self.downscale_ratio), out_channels=self.latent_channels, output_device=self.output_device)
-        samples += tiled_scale(pixel_samples, encode_fn, tile_x * 2, tile_y // 2, overlap, upscale_amount=(1 / self.downscale_ratio), out_channels=self.latent_channels, output_device=self.output_device)
-        samples += tiled_scale(pixel_samples, encode_fn, tile_x // 2, tile_y * 2, overlap, upscale_amount=(1 / self.downscale_ratio), out_channels=self.latent_channels, output_device=self.output_device)
-        samples /= 3.0
-        return samples
+        vae_samples = tiled_scale(pixel_samples, encode_fn, tile_x, tile_y, overlap, upscale_amount=(1 / self.downscale_ratio), out_channels=self.latent_channels, output_device=self.output_device)
+        vae_samples += tiled_scale(pixel_samples, encode_fn, tile_x * 2, tile_y // 2, overlap, upscale_amount=(1 / self.downscale_ratio), out_channels=self.latent_channels, output_device=self.output_device)
+        vae_samples += tiled_scale(pixel_samples, encode_fn, tile_x // 2, tile_y * 2, overlap, upscale_amount=(1 / self.downscale_ratio), out_channels=self.latent_channels, output_device=self.output_device)
+        vae_samples /= 3.0
+        # Unpack VAE-channel latents into model-channel latents (no-op if no packing config).
+        return self._from_vae_latent(vae_samples)
 
-    def encode_tiled_3d(self, samples, tile_t=9999, tile_x=512, tile_y=512, overlap=(1, 64, 64)):
+    def encode_tiled_3d(self, samples, tile_t=9999, tile_x=512, tile_y=512, overlap=(1, 8, 8)):
         encode_fn = lambda a: self.first_stage_model.encode((self.process_input(a)).to(self.vae_dtype).to(self.device)).float()
-        return tiled_scale_multidim(samples, encode_fn, tile=(tile_t, tile_x, tile_y), overlap=overlap, upscale_amount=self.downscale_ratio, out_channels=self.latent_channels, downscale=True, index_formulas=self.downscale_index_formula, output_device=self.output_device)
+        vae_samples = tiled_scale_multidim(samples, encode_fn, tile=(tile_t, tile_x, tile_y), overlap=overlap, upscale_amount=self.downscale_ratio, out_channels=self.latent_channels, downscale=True, index_formulas=self.downscale_index_formula, output_device=self.output_device)
+        return self._from_vae_latent(vae_samples)
 
     def decode(self, samples_in: torch.Tensor):
         if memory_management.VAE_ALWAYS_TILED:
             return self.decode_tiled(samples_in).to(self.output_device)
 
+        # Pack model-channel latents into VAE-channel latents (no-op if no packing config).
+        vae_samples_in = self._to_vae_latent(samples_in)
+
         pixel_samples = None
         _tile = False
 
-        try:
-            memory_used = self.memory_used_decode(samples_in.shape, self.vae_dtype)
-            memory_management.load_models_gpu([self.patcher], memory_required=memory_used)
-            free_memory = memory_management.get_free_memory(self.device)
-            batch_number = int(free_memory / memory_used)
-            batch_number = max(1, batch_number)
-
-            for x in range(0, samples_in.shape[0], batch_number):
-                samples = samples_in[x : x + batch_number].to(device=self.device, dtype=self.vae_dtype)
-                out = self.process_output(self.first_stage_model.decode(samples).to(device=self.output_device, dtype=torch.float32, copy=True))
-                if pixel_samples is None:
-                    pixel_samples = torch.empty((samples_in.shape[0],) + tuple(out.shape[1:]), device=self.output_device)
-                pixel_samples[x : x + batch_number] = out
-        except memory_management.OOM_EXCEPTION:
-            print("Warning: Encountered Out of Memory during VAE decoding; Retrying with Tiled VAE Decoding...")
+        memory_used = self.memory_used_decode(vae_samples_in.shape, self.vae_dtype)
+        max_vram = memory_management.maximum_vram_for_weights()
+        if memory_used > max_vram:
+            memory_management.logger.info(f"Predicted VAE decode memory {memory_used / 2**20:.1f} MB exceeds max VRAM {max_vram / 2**20:.1f} MB. Using Tiled VAE Decoding.")
             _tile = True
+        else:
+            try:
+                memory_management.load_models_gpu([self.patcher], memory_required=memory_used)
+                free_memory = memory_management.get_free_memory(self.device)
+                batch_number = int(free_memory / memory_used)
+                batch_number = max(1, batch_number)
+
+                for x in range(0, vae_samples_in.shape[0], batch_number):
+                    samples = vae_samples_in[x : x + batch_number].to(device=self.device, dtype=self.vae_dtype)
+                    out = self.process_output(self.first_stage_model.decode(samples).to(device=self.output_device, dtype=torch.float32, copy=True))
+                    if pixel_samples is None:
+                        pixel_samples = torch.empty((vae_samples_in.shape[0],) + tuple(out.shape[1:]), device=self.output_device)
+                    pixel_samples[x : x + batch_number] = out
+            except memory_management.OOM_EXCEPTION:
+                print("Warning: Encountered Out of Memory during VAE decoding; Retrying with Tiled VAE Decoding...")
+                _tile = True
 
         if _tile:
             memory_management.soft_empty_cache()
@@ -233,7 +304,10 @@ class VAE:
         return pixel_samples
 
     def decode_tiled(self, samples: torch.Tensor, tile_x: int = 64, tile_y: int = 64, overlap: int = 16):
-        memory_used = self.memory_used_decode(samples.shape, self.vae_dtype)
+        tile_shape = list(samples.shape)
+        tile_shape[2] = min(tile_shape[2], tile_y)
+        tile_shape[3] = min(tile_shape[3], tile_x)
+        memory_used = self.memory_used_decode(tile_shape, self.vae_dtype)
         memory_management.load_models_gpu([self.patcher], memory_required=memory_used)
 
         args = {
@@ -258,23 +332,32 @@ class VAE:
         if self.is_wan and _samples.ndim < 5:
             _samples = _samples.movedim(1, 0).unsqueeze(0)
 
-        try:
-            memory_used = self.memory_used_encode(_samples.shape, self.vae_dtype)
-            memory_management.load_models_gpu([self.patcher], memory_required=memory_used)
-            free_memory = memory_management.get_free_memory(self.device)
-            batch_number = int(free_memory / max(1, memory_used))
-            batch_number = max(1, batch_number)
-            samples = None
-            for x in range(0, _samples.shape[0], batch_number):
-                pixels_in = self.process_input(_samples[x : x + batch_number]).to(self.vae_dtype).to(self.device)
-                out = self.first_stage_model.encode(pixels_in).to(self.output_device).float()
-                if samples is None:
-                    samples = torch.empty((_samples.shape[0],) + tuple(out.shape[1:]), device=self.output_device)
-                samples[x : x + batch_number] = out
-            _tile = False
-        except memory_management.OOM_EXCEPTION:
-            print("Warning: Encountered Out of Memory during VAE Encoding; Retrying with Tiled VAE Encoding...")
+        memory_used = self.memory_used_encode(_samples.shape, self.vae_dtype)
+        max_vram = memory_management.maximum_vram_for_weights()
+        _tile = False
+
+        if memory_used > max_vram:
+            memory_management.logger.info(f"Predicted VAE encode memory {memory_used / 2**20:.1f} MB exceeds max VRAM {max_vram / 2**20:.1f} MB. Using Tiled VAE Encoding.")
             _tile = True
+        else:
+            try:
+                memory_used = self.memory_used_encode(_samples.shape, self.vae_dtype)
+                memory_management.load_models_gpu([self.patcher], memory_required=memory_used)
+                free_memory = memory_management.get_free_memory(self.device)
+                batch_number = int(free_memory / max(1, memory_used))
+                batch_number = max(1, batch_number)
+                samples = None
+                for x in range(0, _samples.shape[0], batch_number):
+                    pixels_in = self.process_input(_samples[x : x + batch_number]).to(self.vae_dtype).to(self.device)
+                    out = self.first_stage_model.encode(pixels_in).to(self.output_device).float()
+                    # Unpack VAE-channel latents into model-channel latents (no-op if no packing config).
+                    out = self._from_vae_latent(out)
+                    if samples is None:
+                        samples = torch.empty((_samples.shape[0],) + tuple(out.shape[1:]), device=self.output_device)
+                    samples[x : x + batch_number] = out
+            except memory_management.OOM_EXCEPTION:
+                print("Warning: Encountered Out of Memory during VAE Encoding; Retrying with Tiled VAE Encoding...")
+                _tile = True
 
         if _tile:
             memory_management.soft_empty_cache()
@@ -287,7 +370,15 @@ class VAE:
         if self.is_wan:
             pixel_samples = pixel_samples.movedim(1, 0).unsqueeze(0)
 
-        memory_used = self.memory_used_encode(pixel_samples.shape, self.vae_dtype)
+        tile_shape = list(pixel_samples.shape)
+        if len(tile_shape) == 4:
+            tile_shape[2] = min(tile_shape[2], tile_y)
+            tile_shape[3] = min(tile_shape[3], tile_x)
+        elif len(tile_shape) == 5:
+            tile_shape[3] = min(tile_shape[3], tile_y)
+            tile_shape[4] = min(tile_shape[4], tile_x)
+
+        memory_used = self.memory_used_encode(tile_shape, self.vae_dtype)
         memory_management.load_models_gpu([self.patcher], memory_required=memory_used)
 
         args = {

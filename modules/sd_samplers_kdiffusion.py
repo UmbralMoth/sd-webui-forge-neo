@@ -80,13 +80,19 @@ class KDiffusionSampler(sd_samplers_common.Sampler):
 
     def get_sigmas(self, p, steps):
         discard_next_to_last_sigma = self.config is not None and self.config.options.get("discard_next_to_last_sigma", False)
-        
-        # Intelligent Router: Hardcode destructive discard for specific samplers, but disable it on Flow architectures
+
+        # Discard the penultimate sigma for samplers that need it to avoid a final
+        # NaN-producing step at sigma=0. ComfyUI v0.24.0's canonical set is
+        # ('dpm_2', 'dpm_2_ancestral', 'uni_pc', 'uni_pc_bh2'). Forge's historical
+        # list was larger; the 3M SDE entries were an older k_diffusion workaround
+        # that is no longer needed. We additionally skip the discard on flow
+        # architectures, where the warped schedule can produce a duplicate
+        # non-zero penultimate sigma that meaningfully shifts the trajectory.
         if self.funcname in ["sample_dpmpp_3m_sde", "sample_dpmpp_3m_sde_ctrlz", "sample_dpm_2", "sample_unipc"]:
             is_flow = getattr(shared.sd_model, 'is_flow', False) or getattr(shared.sd_model, 'is_anima', False)
             if not is_flow:
                 discard_next_to_last_sigma = True
-                
+
         if opts.always_discard_next_to_last_sigma and not discard_next_to_last_sigma:
             discard_next_to_last_sigma = True
             
@@ -169,14 +175,36 @@ class KDiffusionSampler(sd_samplers_common.Sampler):
 
         x = x.to(noise)
 
-        xi = self.model_wrap.predictor.noise_scaling(sigma_sched[0], noise, x, max_denoise=False)
+        predictor = self.model_wrap.predictor
+        is_flow = predictor.prediction_type == "const"
+
+        # sigma_sched[0] is the first sigma in the sliced schedule. For all predictors
+        # (EDM/eps AND flow/const), this is the noise level at which the sampler will
+        # start. We use this directly so the initial mix xi is consistent with the
+        # first sampler step. For flow/const, noise_scaling(sigma, noise, latent, False)
+        # computes xi = sigma*noise + (1-sigma)*latent, which is the correct flow
+        # interpolation at the schedule's starting noise level.
+        # (Note: for shifted flow schedules, sigma_sched[0] != denoise_strength --
+        # this is intentional, as the schedule's start position corresponds to the
+        # model's noise level at the chosen denoise step, not the literal interp.)
+        noise_sigma = sigma_sched[0]
+
+        xi = predictor.noise_scaling(noise_sigma, noise, x, max_denoise=False)
 
         if opts.img2img_extra_noise > 0:
             p.extra_generation_params["Extra noise"] = opts.img2img_extra_noise
             extra_noise_params = ExtraNoiseParams(noise, x, xi)
             extra_noise_callback(extra_noise_params)
             noise = extra_noise_params.noise
-            xi += noise * opts.img2img_extra_noise
+            # For EDM/eps (xi = latent + sigma*noise), extra noise is equivalent to
+            # bumping sigma by extra_noise, so add it as-is.
+            # For flow/const (xi = sigma*noise + (1-sigma)*latent), the equivalent is
+            # to add (1-sigma)*noise*extra_noise -- it increases the noise weight at
+            # the expense of the latent weight, matching the EDM semantics.
+            if is_flow:
+                xi += noise * opts.img2img_extra_noise * (1.0 - noise_sigma)
+            else:
+                xi += noise * opts.img2img_extra_noise
 
         extra_params_kwargs = self.initialize(p)
         parameters = inspect.signature(self.func).parameters
@@ -212,6 +240,8 @@ class KDiffusionSampler(sd_samplers_common.Sampler):
         if getattr(p, 'empty_c', None) is not None:
             # TraSCE: pass empty conditioning for the Direction = Empty + CFG*(Pos - Neg) formula.
             self.sampler_extra_args["cond_empty"] = p.empty_c
+        if getattr(p, 'tmg_base_c', None) is not None:
+            self.sampler_extra_args["cond_base"] = p.tmg_base_c
 
         p.sd_model.forge_objects.unet.model_options["transformer_options"]["sampling_sigmas"] = sigmas
 
@@ -219,6 +249,8 @@ class KDiffusionSampler(sd_samplers_common.Sampler):
             t_enc + 1,
             lambda: self.func(self.model_wrap_cfg, xi, extra_args=self.sampler_extra_args, disable=False, callback=self.callback_state, **extra_params_kwargs),
         )
+
+        samples = predictor.inverse_noise_scaling(sigma_sched[-1], samples)
 
         self.add_infotext(p)
 
@@ -271,6 +303,8 @@ class KDiffusionSampler(sd_samplers_common.Sampler):
             # TraSCE: pass empty conditioning into extra_args so CFGDenoiser can apply
             # Direction = Empty + CFG*(Pos - Neg) instead of the legacy Neg + CFG*(Pos - Neg).
             self.sampler_extra_args["cond_empty"] = p.empty_c
+        if getattr(p, 'tmg_base_c', None) is not None:
+            self.sampler_extra_args["cond_base"] = p.tmg_base_c
 
         p.sd_model.forge_objects.unet.model_options["transformer_options"]["sampling_sigmas"] = sigmas
 
@@ -278,6 +312,8 @@ class KDiffusionSampler(sd_samplers_common.Sampler):
             steps,
             lambda: self.func(self.model_wrap_cfg, x, extra_args=self.sampler_extra_args, disable=False, callback=self.callback_state, **extra_params_kwargs),
         )
+
+        samples = self.model_wrap.predictor.inverse_noise_scaling(sigmas[-1], samples)
 
         self.add_infotext(p)
 

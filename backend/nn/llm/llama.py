@@ -513,6 +513,12 @@ class Qwen3_5_4B(nn.Module):
              return self.llm_adapter(text_embeds, text_ids, target_attention_mask=target_attention_mask, source_attention_mask=source_attention_mask)
         return text_embeds
 
+    def preprocess_embed(self, embed, device):
+        if isinstance(embed, dict) and embed.get("type") == "anima_golden":
+            vec = embed["vector"].to(device, dtype=torch.float32)
+            return vec, None
+        return None, None
+
     def load_extra_params(self, *args, **kwargs):
         if hasattr(self.model, "load_extra_params"):
             return self.model.load_extra_params(*args, **kwargs)
@@ -527,6 +533,13 @@ class BaseLlama:
 
     def forward(self, input_ids, *args, **kwargs):
         return self.model(input_ids, *args, **kwargs)
+
+    def preprocess_embed(self, embed, device):
+        if isinstance(embed, dict) and embed.get("type") == "anima_golden":
+            vec = embed["vector"].to(device, dtype=torch.float32)
+            return vec, None
+        return None, None
+
 
 
 class Qwen3_06B(BaseLlama, nn.Module):

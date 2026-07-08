@@ -183,6 +183,8 @@ def connect_paste_params_buttons():
                 *(["Seed"] if shared.opts.send_seed else []),
                 *(["CFG scale"] if shared.opts.send_cfg else []),
                 *(["Distilled CFG Scale"] if shared.opts.send_cfg else []),
+                "TMG Base",
+                "TMG Min Guidance",
                 *binding.paste_field_names,
             ]
 

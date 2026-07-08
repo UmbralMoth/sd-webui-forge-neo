@@ -164,9 +164,14 @@ def calc_cond_uncond_batch(model, cond, uncond, x_in, timestep, model_options):
     out_empty = torch.zeros_like(x_in) if cond_empty is not None else None
     out_empty_count = torch.ones_like(x_in) * 1e-37 if cond_empty is not None else None
 
+    cond_base = model_options.get("cond_base", None)
+    out_base = torch.zeros_like(x_in) if cond_base is not None else None
+    out_base_count = torch.ones_like(x_in) * 1e-37 if cond_base is not None else None
+
     COND = 0
     UNCOND = 1
     EMPTY = 2
+    BASE = 3
 
     to_run = []
     for x in cond:
@@ -190,6 +195,14 @@ def calc_cond_uncond_batch(model, cond, uncond, x_in, timestep, model_options):
                 continue
 
             to_run += [(p, EMPTY)]
+
+    if cond_base is not None:
+        for x in cond_base:
+            p = get_area_and_mult(x, x_in, timestep)
+            if p is None:
+                continue
+
+            to_run += [(p, BASE)]
 
     while len(to_run) > 0:
         first = to_run[0]
@@ -296,6 +309,9 @@ def calc_cond_uncond_batch(model, cond, uncond, x_in, timestep, model_options):
             elif cond_or_uncond[o] == EMPTY:
                 out_empty[:, :, area[o][2] : area[o][0] + area[o][2], area[o][3] : area[o][1] + area[o][3]] += output[o] * mult[o]
                 out_empty_count[:, :, area[o][2] : area[o][0] + area[o][2], area[o][3] : area[o][1] + area[o][3]] += mult[o]
+            elif cond_or_uncond[o] == BASE:
+                out_base[:, :, area[o][2] : area[o][0] + area[o][2], area[o][3] : area[o][1] + area[o][3]] += output[o] * mult[o]
+                out_base_count[:, :, area[o][2] : area[o][0] + area[o][2], area[o][3] : area[o][1] + area[o][3]] += mult[o]
         del mult
 
     out_cond /= out_count
@@ -303,12 +319,17 @@ def calc_cond_uncond_batch(model, cond, uncond, x_in, timestep, model_options):
     out_uncond /= out_uncond_count
     del out_uncond_count
 
+    ret = [out_cond, out_uncond]
     if cond_empty is not None:
         out_empty /= out_empty_count
         del out_empty_count
-        return out_cond, out_uncond, out_empty
+        ret.append(out_empty)
+    if cond_base is not None:
+        out_base /= out_base_count
+        del out_base_count
+        ret.append(out_base)
 
-    return out_cond, out_uncond
+    return tuple(ret)
 
 
 def sampling_function_inner(model, x, timestep, uncond, cond, cond_scale, model_options={}, seed=None, return_full=False):
@@ -324,14 +345,20 @@ def sampling_function_inner(model, x, timestep, uncond, cond, cond_scale, model_
 
     calc_res = calc_cond_uncond_batch(model, cond, uncond_, x, timestep, model_options)
     cond_pred, uncond_pred = calc_res[0], calc_res[1]
-    empty_pred = calc_res[2] if len(calc_res) == 3 else None
+    empty_pred = None
+    base_pred = None
+    if len(calc_res) == 3:
+        empty_pred = calc_res[2]
+    elif len(calc_res) == 4:
+        empty_pred = calc_res[2]
+        base_pred = calc_res[3]
 
     if "sampler_cfg_function" in model_options:
         # TraSCE + CFG++ / custom samplers: substitute empty_pred as the uncond baseline
         # so the sampler's internal direction is: Empty + CFG*(Pos - Neg) rather than Neg + CFG*(Pos - Neg).
         # empty_denoised is also exposed so custom samplers can use it explicitly.
         _uncond_for_cfg = empty_pred if empty_pred is not None else uncond_pred
-        args = {"cond": x - cond_pred, "uncond": x - _uncond_for_cfg, "cond_scale": cond_scale, "timestep": timestep, "input": x, "sigma": timestep, "cond_denoised": cond_pred, "uncond_denoised": _uncond_for_cfg, "empty_denoised": empty_pred, "uncond_raw": uncond_pred, "model": model, "model_options": model_options}
+        args = {"cond": x - cond_pred, "uncond": x - _uncond_for_cfg, "cond_scale": cond_scale, "timestep": timestep, "input": x, "sigma": timestep, "cond_denoised": cond_pred, "uncond_denoised": _uncond_for_cfg, "empty_denoised": empty_pred, "base_denoised": base_pred, "uncond_raw": uncond_pred, "model": model, "model_options": model_options}
         cfg_result = x - model_options["sampler_cfg_function"](args)
     elif empty_pred is not None:
         # TraSCE: Direction = Empty + CFG*(Positive - Perp Negative)
@@ -396,9 +423,12 @@ def sampling_function(self, denoiser_params, cond_scale, cond_composition, extra
 
     # TraSCE: compile the per-step reconstructed empty conditioning tensor
     # into the model_conds dict format that calc_cond_uncond_batch expects.
-    if "cond_empty" in model_options:
+    if "cond_empty" in model_options or "cond_base" in model_options:
         model_options = model_options.copy()
-        model_options["cond_empty"] = compile_conditions(model_options["cond_empty"])
+        if "cond_empty" in model_options:
+            model_options["cond_empty"] = compile_conditions(model_options["cond_empty"])
+        if "cond_base" in model_options:
+            model_options["cond_base"] = compile_conditions(model_options["cond_base"])
 
     if extra_concat_condition is not None:
         image_cond_in = extra_concat_condition

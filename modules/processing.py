@@ -123,6 +123,13 @@ class StableDiffusionProcessing:
     prompt: str = ""
     prompt_for_display: str = None
     negative_prompt: str = ""
+    tmg_base_prompt: str = ""
+    tmg_min_guidance: float = 1.0
+    tmg_base_c: object = None
+    tmg_clean_prompt: str = None
+    tmg_clean_negative_prompt: str = None
+    tmg_clean_hr_prompt: str = None
+    tmg_clean_hr_negative_prompt: str = None
     styles: list[str] = None
     seed: int = -1
     subseed: int = -1
@@ -171,6 +178,7 @@ class StableDiffusionProcessing:
     cached_uc = [None, None, None]
     cached_c = [None, None, None]
     cached_empty_c = [None, None]
+    cached_tmg_base_c = [None, None]
 
     comments: dict = None
     sampler: sd_samplers_common.Sampler | None = field(default=None, init=False)
@@ -216,9 +224,11 @@ class StableDiffusionProcessing:
         self.cached_c = [None, None, None]
         self.cached_uc = [None, None, None]
         self.cached_empty_c = [None, None]
+        self.cached_tmg_base_c = [None, None]
         StableDiffusionProcessing.cached_c = [None, None, None]
         StableDiffusionProcessing.cached_uc = [None, None, None]
         StableDiffusionProcessing.cached_empty_c = [None, None]
+        StableDiffusionProcessing.cached_tmg_base_c = [None, None]
 
     def __post_init__(self):
         assert self.sampler_index is None
@@ -245,6 +255,7 @@ class StableDiffusionProcessing:
         self.cached_uc = StableDiffusionProcessing.cached_uc
         self.cached_c = StableDiffusionProcessing.cached_c
         self.cached_empty_c = StableDiffusionProcessing.cached_empty_c
+        self.cached_tmg_base_c = StableDiffusionProcessing.cached_tmg_base_c
 
         self.extra_result_images = []
         self.latents_after_sampling = []
@@ -395,6 +406,28 @@ class StableDiffusionProcessing:
         return self.token_merging_ratio or opts.token_merging_ratio
 
     def setup_prompts(self):
+        if getattr(shared.opts, "tmg_enable", False) and getattr(self, "tmg_base_prompt", ""):
+            self.tmg_clean_prompt = self.prompt
+            self.tmg_clean_negative_prompt = self.negative_prompt
+
+            if isinstance(self.prompt, list):
+                self.prompt = [f"{self.tmg_base_prompt}, {p}" if p.strip() else self.tmg_base_prompt for p in self.prompt]
+            else:
+                self.prompt = f"{self.tmg_base_prompt}, {self.prompt}" if self.prompt.strip() else self.tmg_base_prompt
+
+            if isinstance(self.negative_prompt, list):
+                self.negative_prompt = [f"{self.tmg_base_prompt}, {p}" if p.strip() else self.tmg_base_prompt for p in self.negative_prompt]
+            else:
+                self.negative_prompt = f"{self.tmg_base_prompt}, {self.negative_prompt}" if self.negative_prompt.strip() else self.tmg_base_prompt
+
+            self.extra_generation_params.update({
+                "TMG Enable": True,
+                "TMG Base": self.tmg_base_prompt,
+                "TMG Min Guidance": self.tmg_min_guidance,
+                "TMG Exponent": getattr(shared.opts, "tmg_exponent", 1.0),
+                "TMG Fade Start": getattr(shared.opts, "tmg_fade_start", 0.8),
+            })
+
         if isinstance(self.prompt, list):
             self.all_prompts = self.prompt
         elif isinstance(self.negative_prompt, list):
@@ -415,6 +448,108 @@ class StableDiffusionProcessing:
 
         self.main_prompt = self.all_prompts[0]
         self.main_negative_prompt = self.all_negative_prompts[0]
+
+    def get_tmg_cfg_function(self):
+        @torch.inference_mode()
+        def triad_manifold_cfg(args):
+            cond_pred = args["cond_denoised"]     # Epsilon positive (C_base + C_pos)
+            uncond_pred = args["uncond_raw"]      # Epsilon negative (C_base + C_neg)
+            cond_scale = args["cond_scale"]       # Maximum CFG budget
+            x_orig = args["input"]
+            
+            empty_pred_raw = args["empty_denoised"] # C_empty ("") or C_base (fallback)
+            base_pred_raw = args.get("base_denoised", None) # C_base
+            
+            if empty_pred_raw is None:
+                # 3-conditioning fallback if empty_pred is missing
+                empty_pred_raw = base_pred_raw if base_pred_raw is not None else cond_pred
+                base_pred_raw = None
+                
+            if empty_pred_raw is None:
+                return x_orig - (uncond_pred + cond_scale * (cond_pred - uncond_pred))
+                
+            # Cast inputs to float32
+            cond_pred_f32 = cond_pred.to(torch.float32)
+            uncond_pred_f32 = uncond_pred.to(torch.float32)
+            
+            if base_pred_raw is not None:
+                # 4-conditioning case
+                empty_pred_f32 = empty_pred_raw.to(torch.float32)
+                base_pred_f32 = base_pred_raw.to(torch.float32)
+                
+                v_base = base_pred_f32 - empty_pred_f32
+                v_pos = cond_pred_f32 - base_pred_f32
+                v_neg_raw = uncond_pred_f32 - base_pred_f32
+            else:
+                # 3-conditioning fallback
+                base_pred_f32 = empty_pred_raw.to(torch.float32)
+                v_base = None
+                v_pos = cond_pred_f32 - base_pred_f32
+                v_neg_raw = uncond_pred_f32 - base_pred_f32
+                
+            # 1. Perpendicular Projection (Perp-Neg)
+            dot_pn = torch.sum(v_pos * v_neg_raw, dim=(1, 2, 3), keepdim=True)
+            dot_pp = torch.sum(v_pos * v_pos, dim=(1, 2, 3), keepdim=True)
+            dot_nn = torch.sum(v_neg_raw * v_neg_raw, dim=(1, 2, 3), keepdim=True)
+            
+            v_pos_perp = v_pos - (torch.clamp(dot_pn, min=0.0) / torch.clamp(dot_nn, min=1e-8)) * v_neg_raw
+            v_neg_perp = v_neg_raw - (torch.clamp(dot_pn, min=0.0) / torch.clamp(dot_pp, min=1e-8)) * v_pos
+            
+            # 2. Magnitude Preservation
+            norm_pos_raw = torch.linalg.vector_norm(v_pos, ord=2, dim=(1, 2, 3), keepdim=True)
+            norm_pos_perp = torch.linalg.vector_norm(v_pos_perp, ord=2, dim=(1, 2, 3), keepdim=True)
+            v_pos_aligned = v_pos_perp * (norm_pos_raw / torch.clamp(norm_pos_perp, min=1e-8))
+            
+            norm_neg_raw = torch.linalg.vector_norm(v_neg_raw, ord=2, dim=(1, 2, 3), keepdim=True)
+            norm_neg_perp = torch.linalg.vector_norm(v_neg_perp, ord=2, dim=(1, 2, 3), keepdim=True)
+            v_neg_aligned = v_neg_perp * (norm_neg_raw / torch.clamp(norm_neg_perp, min=1e-8))
+            
+            # 3. Concept Presence Cosine Metrics (The Sensors)
+            norm_base = torch.linalg.vector_norm(base_pred_f32, ord=2, dim=(1, 2, 3), keepdim=True)
+            p_pos = torch.sum(base_pred_f32 * v_pos_aligned, dim=(1, 2, 3), keepdim=True) / torch.clamp(norm_base * torch.linalg.vector_norm(v_pos_aligned, ord=2, dim=(1, 2, 3), keepdim=True), min=1e-8)
+            p_neg = torch.sum(base_pred_f32 * v_neg_aligned, dim=(1, 2, 3), keepdim=True) / torch.clamp(norm_base * torch.linalg.vector_norm(v_neg_aligned, ord=2, dim=(1, 2, 3), keepdim=True), min=1e-8)
+            
+            # 4. Independent Scaling (Option A) with Clamping
+            max_g = cond_scale
+            min_g = getattr(self, "tmg_min_guidance", 1.0)
+            tmg_exponent = getattr(shared.opts, "tmg_exponent", 1.0)
+            
+            p_pos_clamped = torch.clamp(p_pos, min=0.0, max=1.0)
+            p_neg_clamped = torch.clamp(p_neg, min=0.0, max=1.0)
+            
+            if tmg_exponent != 1.0:
+                w_pos = torch.clamp(max_g * (1.0 - torch.pow(p_pos_clamped, tmg_exponent)), min=min_g, max=max_g)
+                w_neg = torch.clamp(max_g * torch.pow(p_neg_clamped, tmg_exponent), min=min_g, max=max_g)
+            else:
+                w_pos = torch.clamp(max_g * (1.0 - p_pos_clamped), min=min_g, max=max_g)
+                w_neg = torch.clamp(max_g * p_neg_clamped, min=min_g, max=max_g)
+            
+            # 5. Assembly
+            if v_base is not None:
+                s_base = cond_scale
+                epsilon_guided_tmg = empty_pred_f32 + s_base * v_base + w_pos * v_pos_aligned - w_neg * v_neg_aligned
+            else:
+                epsilon_guided_tmg = base_pred_f32 + w_pos * v_pos_aligned - w_neg * v_neg_aligned
+                
+            tmg_fade_start = getattr(shared.opts, "tmg_fade_start", 0.8)
+            fade_tmg = 1.0
+            if tmg_fade_start < 1.0:
+                current_step = getattr(shared.state, "sampling_step", 0)
+                total_steps = getattr(shared.state, "sampling_steps", 0)
+                if total_steps > 0:
+                    progress = float(current_step) / float(total_steps)
+                    if progress > tmg_fade_start:
+                        fade_tmg = 1.0 - min(max((progress - tmg_fade_start) / (1.0 - tmg_fade_start), 0.0), 1.0)
+                        
+            if fade_tmg < 1.0 and uncond_pred is not None:
+                epsilon_standard = uncond_pred_f32 + cond_scale * (cond_pred_f32 - uncond_pred_f32)
+                epsilon_guided = torch.lerp(epsilon_standard, epsilon_guided_tmg, fade_tmg)
+            else:
+                epsilon_guided = epsilon_guided_tmg
+                
+            return x_orig - epsilon_guided.to(x_orig.dtype)
+            
+        return triad_manifold_cfg
 
     def cached_params(self, required_prompts, steps, extra_network_data, hires_steps, use_old_scheduling):
         """Returns parameters that invalidate the cond cache if changed"""
@@ -506,9 +641,16 @@ class StableDiffusionProcessing:
             # Negative + CFG*(Positive - Negative) formula common UIs use.
             if self.override_settings.get('use_legacy_cfg', getattr(shared.opts, 'use_legacy_cfg', False)):
                 self.empty_c = None
+                self.tmg_base_c = None
             else:
                 empty_prompts = prompt_parser.SdConditioning([""] * len(self.prompts), width=self.width, height=self.height, is_negative_prompt=True, distilled_cfg_scale=self.distilled_cfg_scale)
                 self.empty_c = self.get_conds_with_caching(prompt_parser.get_learned_conditioning, empty_prompts, total_steps, [self.cached_empty_c], self.extra_network_data)
+                
+                if getattr(shared.opts, "tmg_enable", False) and getattr(self, "tmg_base_prompt", ""):
+                    base_prompts = prompt_parser.SdConditioning([self.tmg_base_prompt] * len(self.prompts), width=self.width, height=self.height, is_negative_prompt=True, distilled_cfg_scale=self.distilled_cfg_scale)
+                    self.tmg_base_c = self.get_conds_with_caching(prompt_parser.get_learned_conditioning, base_prompts, total_steps, [getattr(self, "cached_tmg_base_c", None)], self.extra_network_data)
+                else:
+                    self.tmg_base_c = None
 
         self.c = self.get_conds_with_caching(prompt_parser.get_multicond_learned_conditioning, prompts, total_steps, [self.cached_c], self.extra_network_data)
 
@@ -736,6 +878,20 @@ def create_infotext(p, all_prompts, all_seeds, all_subseeds, comments=None, iter
     prompt_text = p.main_prompt if use_main_prompt else all_prompts[index]
     negative_prompt = p.main_negative_prompt if use_main_prompt else all_negative_prompts[index]
 
+    if getattr(p, "tmg_clean_prompt", None) is not None:
+        clean_p = p.tmg_clean_prompt
+        if isinstance(clean_p, list):
+            prompt_text = clean_p[index] if index < len(clean_p) else clean_p[0]
+        else:
+            prompt_text = clean_p
+
+    if getattr(p, "tmg_clean_negative_prompt", None) is not None:
+        clean_n = p.tmg_clean_negative_prompt
+        if isinstance(clean_n, list):
+            negative_prompt = clean_n[index] if index < len(clean_n) else clean_n[0]
+        else:
+            negative_prompt = clean_n
+
     uses_ensd = opts.eta_noise_seed_delta != 0
     if uses_ensd:
         uses_ensd = sd_samplers_common.is_sampler_using_eta_noise_seed_delta(p)
@@ -749,7 +905,9 @@ def create_infotext(p, all_prompts, all_seeds, all_subseeds, comments=None, iter
 
     if p.sd_model.use_distilled_cfg_scale:
         generation_params["Distilled CFG Scale"] = p.distilled_cfg_scale
-    if p.sd_model.use_shift:
+    # Log the resolved shift whenever the engine actually applies one to the predictor
+    # (use_shift on the engine, or _RF in sampling_settings for plain SDXL with rectified flow).
+    if getattr(p.sd_model, "use_shift", False) or getattr(p.sd_model, "_RF", False):
         generation_params["Shift"] = p.distilled_cfg_scale
 
     noise_source_type = get_noise_source_type()
@@ -1250,6 +1408,7 @@ class StableDiffusionProcessingTxt2Img(StableDiffusionProcessing):
     cached_hr_uc = [None, None, None]
     cached_hr_c = [None, None, None]
     cached_hr_empty_c = [None, None]
+    cached_hr_tmg_base_c = [None, None]
 
     hr_checkpoint_info: dict = field(default=None, init=False)
     hr_upscale_to_x: int = field(default=0, init=False)
@@ -1279,6 +1438,7 @@ class StableDiffusionProcessingTxt2Img(StableDiffusionProcessing):
         self.cached_hr_uc = StableDiffusionProcessingTxt2Img.cached_hr_uc
         self.cached_hr_c = StableDiffusionProcessingTxt2Img.cached_hr_c
         self.cached_hr_empty_c = StableDiffusionProcessingTxt2Img.cached_hr_empty_c
+        self.cached_hr_tmg_base_c = StableDiffusionProcessingTxt2Img.cached_hr_tmg_base_c
 
     def calculate_target_resolution(self):
         if opts.use_old_hires_fix_width_height and self.applied_old_hires_behavior_to != (self.width, self.height):
@@ -1423,6 +1583,10 @@ class StableDiffusionProcessingTxt2Img(StableDiffusionProcessing):
 
             self.sd_model.forge_objects = self.sd_model.forge_objects_after_applying_lora.shallow_copy()
             apply_token_merging(self.sd_model, self.get_token_merging_ratio())
+            if getattr(shared.opts, "tmg_enable", False) and getattr(self, "tmg_base_prompt", ""):
+                unet = self.sd_model.forge_objects.unet.clone()
+                unet.set_model_sampler_cfg_function(self.get_tmg_cfg_function())
+                self.sd_model.forge_objects.unet = unet
 
             if self.scripts is not None:
                 self.scripts.process_before_every_sampling(self, x=x, noise=x, c=conditioning, uc=unconditional_conditioning)
@@ -1576,6 +1740,10 @@ class StableDiffusionProcessingTxt2Img(StableDiffusionProcessing):
 
         self.sd_model.forge_objects = self.sd_model.forge_objects_after_applying_lora.shallow_copy()
         apply_token_merging(self.sd_model, self.get_token_merging_ratio(for_hr=True))
+        if getattr(shared.opts, "tmg_enable", False) and getattr(self, "tmg_base_prompt", ""):
+            unet = self.sd_model.forge_objects.unet.clone()
+            unet.set_model_sampler_cfg_function(self.get_tmg_cfg_function())
+            self.sd_model.forge_objects.unet = unet
 
         if self.scripts is not None:
             self.scripts.process_before_every_sampling(self, x=samples, noise=noise, c=self.hr_c, uc=self.hr_uc)
@@ -1599,12 +1767,30 @@ class StableDiffusionProcessingTxt2Img(StableDiffusionProcessing):
         self.hr_c = None
         self.hr_uc = None
         self.hr_empty_c = None
+        self.hr_tmg_base_c = None
         if not opts.persistent_cond_cache:
             StableDiffusionProcessingTxt2Img.cached_hr_uc = [None, None]
             StableDiffusionProcessingTxt2Img.cached_hr_c = [None, None]
             StableDiffusionProcessingTxt2Img.cached_hr_empty_c = [None, None]
+            StableDiffusionProcessingTxt2Img.cached_hr_tmg_base_c = [None, None]
 
     def setup_prompts(self):
+        if getattr(shared.opts, "tmg_enable", False) and getattr(self, "tmg_base_prompt", ""):
+            self.tmg_clean_hr_prompt = self.hr_prompt if self.hr_prompt != "" else getattr(self, "tmg_clean_prompt", "")
+            self.tmg_clean_hr_negative_prompt = self.hr_negative_prompt if self.hr_negative_prompt != "" else getattr(self, "tmg_clean_negative_prompt", "")
+
+            # Combine custom hr prompts with baseline if they are non-empty
+            if self.hr_prompt != "":
+                if isinstance(self.hr_prompt, list):
+                    self.hr_prompt = [f"{self.tmg_base_prompt}, {p}" if p.strip() else self.tmg_base_prompt for p in self.hr_prompt]
+                else:
+                    self.hr_prompt = f"{self.tmg_base_prompt}, {self.hr_prompt}" if self.hr_prompt.strip() else self.tmg_base_prompt
+            if self.hr_negative_prompt != "":
+                if isinstance(self.hr_negative_prompt, list):
+                    self.hr_negative_prompt = [f"{self.tmg_base_prompt}, {p}" if p.strip() else self.tmg_base_prompt for p in self.hr_negative_prompt]
+                else:
+                    self.hr_negative_prompt = f"{self.tmg_base_prompt}, {self.hr_negative_prompt}" if self.hr_negative_prompt.strip() else self.tmg_base_prompt
+
         super().setup_prompts()
 
         if not self.enable_hr:
@@ -1650,8 +1836,15 @@ class StableDiffusionProcessingTxt2Img(StableDiffusionProcessing):
             if not self.override_settings.get('use_legacy_cfg', getattr(shared.opts, 'use_legacy_cfg', False)):
                 hr_empty_prompts = prompt_parser.SdConditioning([""] * len(self.hr_prompts), width=self.hr_upscale_to_x, height=self.hr_upscale_to_y, is_negative_prompt=True, distilled_cfg_scale=self.hr_distilled_cfg)
                 self.hr_empty_c = self.get_conds_with_caching(prompt_parser.get_learned_conditioning, hr_empty_prompts, self.firstpass_steps, [self.cached_hr_empty_c, self.cached_empty_c], self.hr_extra_network_data, total_steps)
+                
+                if getattr(shared.opts, "tmg_enable", False) and getattr(self, "tmg_base_prompt", ""):
+                    hr_base_prompts = prompt_parser.SdConditioning([self.tmg_base_prompt] * len(self.hr_prompts), width=self.hr_upscale_to_x, height=self.hr_upscale_to_y, is_negative_prompt=True, distilled_cfg_scale=self.hr_distilled_cfg)
+                    self.hr_tmg_base_c = self.get_conds_with_caching(prompt_parser.get_learned_conditioning, hr_base_prompts, self.firstpass_steps, [getattr(self, "cached_hr_tmg_base_c", None), getattr(self, "cached_tmg_base_c", None)], self.hr_extra_network_data, total_steps)
+                else:
+                    self.hr_tmg_base_c = None
             else:
                 self.hr_empty_c = None
+                self.hr_tmg_base_c = None
 
         self.hr_c = self.get_conds_with_caching(prompt_parser.get_multicond_learned_conditioning, hr_prompts, self.firstpass_steps, [self.cached_hr_c, self.cached_c], self.hr_extra_network_data, total_steps)
 
@@ -1949,6 +2142,10 @@ class StableDiffusionProcessingImg2Img(StableDiffusionProcessing):
 
         self.sd_model.forge_objects = self.sd_model.forge_objects_after_applying_lora.shallow_copy()
         apply_token_merging(self.sd_model, self.get_token_merging_ratio())
+        if getattr(shared.opts, "tmg_enable", False) and getattr(self, "tmg_base_prompt", ""):
+            unet = self.sd_model.forge_objects.unet.clone()
+            unet.set_model_sampler_cfg_function(self.get_tmg_cfg_function())
+            self.sd_model.forge_objects.unet = unet
 
         if self.scripts is not None:
             self.scripts.process_before_every_sampling(self, x=self.init_latent, noise=x, c=conditioning, uc=unconditional_conditioning)

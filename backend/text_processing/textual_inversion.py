@@ -152,6 +152,11 @@ class EmbeddingDatabase:
         name, ext = os.path.splitext(filename)
         ext = ext.upper()
 
+        # Blacklist Anima 2B massive embedding dictionaries from global loading.
+        # These are specific to Anima and will be loaded natively by its engine.
+        if "artist_embeddings_06b" in name or "meta_embeddings_06b" in name:
+            return
+
         if ext in [".PNG", ".WEBP", ".JXL", ".AVIF"]:
             _, second_ext = os.path.splitext(name)
             if second_ext.upper() == ".PREVIEW":
@@ -175,12 +180,13 @@ class EmbeddingDatabase:
             return
 
         if data is not None:
-            embedding = create_embedding_from_data(data, name, filename=filename, filepath=path)
+            embeddings = create_embeddings_from_data(data, name, filename=filename, filepath=path)
 
-            if self.expected_shape == -1 or self.expected_shape == embedding.shape:
-                self.register_embedding(embedding)
-            else:
-                self.skipped_embeddings[name] = embedding
+            for embedding in embeddings:
+                if self.expected_shape == -1 or self.expected_shape == embedding.shape:
+                    self.register_embedding(embedding)
+                else:
+                    self.skipped_embeddings[embedding.name] = embedding
         else:
             print(f"Unable to load Textual inversion embedding due to data issue: '{name}'.")
 
@@ -225,6 +231,63 @@ class EmbeddingDatabase:
 
         return None, None
 
+
+def create_embeddings_from_data(data, name, filename="unknown embedding file", filepath=None):
+    if "string_to_param" in data:  # textual inversion embeddings
+        param_dict = data["string_to_param"]
+        param_dict = getattr(param_dict, "_parameters", param_dict)  # fix for torch 1.12.1 loading saved file from torch 1.11
+        assert len(param_dict) == 1, "embedding file has multiple terms in it"
+        emb = next(iter(param_dict.items()))[1]
+        vec = emb.detach().to(dtype=torch.float32)
+        shape = vec.shape[-1]
+        vectors = vec.shape[0]
+        embedding = Embedding(vec, name)
+        embedding.step = data.get("step", None)
+        embedding.sd_checkpoint = data.get("sd_checkpoint", None)
+        embedding.sd_checkpoint_name = data.get("sd_checkpoint_name", None)
+        embedding.vectors = vectors
+        embedding.shape = shape
+        if filepath:
+            embedding.filename = filepath
+            embedding.set_hash(hashes.sha256(filepath, "textual_inversion/" + name) or "")
+        return [embedding]
+    elif type(data) == dict and "clip_g" in data and "clip_l" in data:  # SDXL embedding
+        vec = {k: v.detach().to(dtype=torch.float32) for k, v in data.items()}
+        shape = data["clip_g"].shape[-1] + data["clip_l"].shape[-1]
+        vectors = data["clip_g"].shape[0]
+        embedding = Embedding(vec, name)
+        embedding.step = data.get("step", None)
+        embedding.sd_checkpoint = data.get("sd_checkpoint", None)
+        embedding.sd_checkpoint_name = data.get("sd_checkpoint_name", None)
+        embedding.vectors = vectors
+        embedding.shape = shape
+        if filepath:
+            embedding.filename = filepath
+            embedding.set_hash(hashes.sha256(filepath, "textual_inversion/" + name) or "")
+        return [embedding]
+    elif type(data) == dict and type(next(iter(data.values()))) == torch.Tensor:  # diffuser concepts or safetensors multiple
+        embeddings = []
+        file_hash = hashes.sha256(filepath, "textual_inversion/" + name) if filepath else ""
+        for term, emb in data.items():
+            if len(emb.shape) == 1:
+                emb = emb.unsqueeze(0)
+            vec = emb.detach().to(dtype=torch.float32)
+            shape = vec.shape[-1]
+            vectors = vec.shape[0]
+            emb_name = term if len(data) > 1 else name
+            embedding = Embedding(vec, emb_name)
+            embedding.step = data.get("step", None)
+            embedding.sd_checkpoint = data.get("sd_checkpoint", None)
+            embedding.sd_checkpoint_name = data.get("sd_checkpoint_name", None)
+            embedding.vectors = vectors
+            embedding.shape = shape
+            if filepath:
+                embedding.filename = filepath
+                embedding.set_hash(file_hash)
+            embeddings.append(embedding)
+        return embeddings
+    else:
+        raise Exception(f"Couldn't identify {filename} as neither textual inversion embedding nor diffuser concept.")
 
 def create_embedding_from_data(data, name, filename="unknown embedding file", filepath=None):
     if "string_to_param" in data:  # textual inversion embeddings

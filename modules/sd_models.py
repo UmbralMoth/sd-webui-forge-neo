@@ -267,7 +267,14 @@ model_data = SdModelData()
 
 
 def unload_model_weights(sd_model=None, info=None):
+    from modules import shared
+    model_data.sd_model = None
+    model_data.forge_hash = ""
+    shared.sd_model = None
+    sd_vae.delete_base_vae()
     memory_management.unload_all_models()
+    gc.collect()
+    memory_management.soft_empty_cache()
     return
 
 

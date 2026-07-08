@@ -32,14 +32,11 @@ class Mugen(ForgeDiffusionEngine):
 
         # Initialize VAE with is_mugen=True for packing/unpacking logic
         vae = VAE(model=huggingface_components["vae"], is_mugen=True)
-        
-        # Apply correct scaling/shift factors to the VAE model itself
-        # SDXLRF latent format uses: scale=0.6043, shift=0.0760
-        lf = estimated_config.latent_format
-        if hasattr(vae.first_stage_model, 'scaling_factor'):
-            vae.first_stage_model.scaling_factor = lf.scale_factor
-            vae.first_stage_model.shift_factor = lf.shift_factor
-            memory_management.logger.info(f"🦋 Actias: Applied Latent Scaling (Scale: {lf.scale_factor}, Shift: {lf.shift_factor})")
+        if hasattr(estimated_config, "packed_vae_latent_channels") and estimated_config.packed_vae_latent_channels is not None:
+            vae.set_packed_latents(
+                packed_channels=estimated_config.packed_vae_latent_channels,
+                spatial_factor=getattr(estimated_config, "packed_vae_spatial_factor", 2),
+            )
 
         # Set up Discrete Flow predictor (SD3-style)
         k_predictor = PredictionDiscreteFlow(estimated_config)
@@ -138,14 +135,16 @@ class Mugen(ForgeDiffusionEngine):
 
     @torch.inference_mode()
     def encode_first_stage(self, x):
+        # Match ComfyUI's behavior: latent format's process_in is identity for
+        # SDXL_Flux2. The model's input distribution is the VAE's natural
+        # output (raw, un-rescaled), which is what the VAE.encode produces.
         sample = self.forge_objects.vae.encode(x.movedim(1, -1) * 0.5 + 0.5)
-        # Apply latent format scaling explicitly
         sample = self.model_config.latent_format.process_in(sample)
         return sample.to(x)
 
     @torch.inference_mode()
     def decode_first_stage(self, x):
-        # Apply latent format scaling explicitly
+        # Match ComfyUI's behavior: latent format's process_out is identity.
         sample = self.model_config.latent_format.process_out(x)
         return self.forge_objects.vae.decode(sample).movedim(-1, 1) * 2.0 - 1.0
 

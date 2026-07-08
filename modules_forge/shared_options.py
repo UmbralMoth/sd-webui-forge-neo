@@ -24,3 +24,17 @@ def register(options_templates, options_section, OptionInfo):
             },
         )
     )
+
+    import gradio as gr
+    options_templates.update(
+        options_section(
+            ("ui_anima_qwen", "Anima Qwen 3.5 Options", "ui"),
+            {
+                "anima_qwen35_use_calibration": OptionInfo(False, "Anima Qwen 3.5: Use Calibration").info("Apply per-dimension affine calibration. Recommended: OFF if using Alignment."),
+                "anima_qwen35_use_alignment": OptionInfo(True, "Anima Qwen 3.5: Use Concept Alignment").info("Apply Procrustes rotation to align 4B spatial/pose concept directions with 0.6B."),
+                "anima_qwen35_alignment_strength": OptionInfo(0.5, "Anima Qwen 3.5: Alignment Strength", gr.Slider, {"minimum": 0.0, "maximum": 1.0, "step": 0.05}).info("Blend distribution center: 0=keep 4B's own scale, 1=shift to 0.6B's scale. 0.5 is recommended."),
+                "anima_qwen35_output_scale": OptionInfo(1.0, "Anima Qwen 3.5: Output Scale", gr.Slider, {"minimum": 0.1, "maximum": 10.0, "step": 0.1}).info("Additional uniform scaling factor applied at the end."),
+            },
+        )
+    )
+

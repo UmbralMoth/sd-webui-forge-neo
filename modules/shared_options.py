@@ -251,6 +251,7 @@ options_templates.update(
             "divmisc": OptionDiv(),
             "qwen_vae_resize": OptionInfo(False, "[Qwen-Image-Edit] Resize input image to 1 megapixel for ref_latent"),
             "klein_no_reference": OptionInfo(False, "[Klein] Disable Reference").info("disable Edit ; enable img2img").info("pin to <b>Quicksettings</b> is recommended if changed often"),
+            "anima_edit_mode": OptionInfo(False, "[Anima] Enable Edit LoRA Mode").info("Enable Anima 2B Edit LoRA compatibility. Sends the img2img input image (and any ImageStitch reference images) as extra temporal frames to the model. Required when using the Anima Edit LoRA. pin to <b>Quicksettings</b> is recommended"),
         },
     )
 )
@@ -329,6 +330,9 @@ options_templates.update(
             "token_merging_downsample": OptionInfo(1, "Token Merging - Max Downsample", gr.Slider, {"minimum": 1, "maximum": 4, "step": 1}).info("higher = faster"),
             "token_merging_no_rand": OptionInfo(False, "Token Merging - No Random").info("reduce randomness by always fusing the same regions"),
             "forge_strict_phase_isolation": OptionInfo(False, "Strict Phase-Based VRAM Isolation", gr.Checkbox).info("Force-offload all models from VRAM immediately when their phase ends. When disabled, only massive models (> 3.0 GB) are offloaded aggressively, leaving standard models (SDXL, SD 1.5) cached in VRAM for maximum speed."),
+            "tmg_enable": OptionInfo(False, "Enable Triad Manifold Guidance (TMG)").needs_reload_ui(),
+            "tmg_exponent": OptionInfo(1.0, "TMG Guidance Exponent", gr.Slider, {"minimum": 1.0, "maximum": 4.0, "step": 0.1}).info("Controls non-linear decay/activation threshold curve for dynamic guidance (1.0 = linear)."),
+            "tmg_fade_start": OptionInfo(0.8, "TMG Denoise Fade-out Step", gr.Slider, {"minimum": 0.0, "maximum": 1.0, "step": 0.05}).info("Step progress at which TMG begins fading out to standard CFG to prevent late-step / SDE sampler artifacting (1.0 = disabled)."),
         },
     )
 )

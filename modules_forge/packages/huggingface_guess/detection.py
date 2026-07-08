@@ -246,19 +246,44 @@ def detect_unet_config(state_dict: dict, key_prefix: str) -> dict:
         dit_config["num_layers"] = count_blocks(state_dict_keys, "{}transformer_blocks.".format(key_prefix) + "{}.")
         return dit_config
 
-    if "{}net.blocks.0.mlp.layer1.weight".format(key_prefix) in state_dict_keys:  # Anima / Cosmos Predict2
+    # Anima / Cosmos Predict2
+    is_cosmos = False
+    if "{}blocks.0.mlp.layer1.weight".format(key_prefix) in state_dict_keys:
+        is_cosmos = True
+    elif "{}net.blocks.0.mlp.layer1.weight".format(key_prefix) in state_dict_keys:
+        is_cosmos = True
+    elif any("blocks.0.mlp.layer1.weight" in k for k in state_dict_keys):
+        is_cosmos = True
+
+    if is_cosmos:
         dit_config = {}
-        dit_config["image_model"] = "anima" if "{}net.llm_adapter.blocks.0.cross_attn.q_proj.weight".format(key_prefix) in state_dict_keys else "cosmos_predict2"
+        dit_config["image_model"] = "anima"
         dit_config["max_img_h"] = 240
         dit_config["max_img_w"] = 240
         dit_config["max_frames"] = 128
         concat_padding_mask = True
-        x_embed_key = "{}net.x_embedder.proj.1.weight".format(key_prefix)
-        dit_config["in_channels"] = (state_dict[x_embed_key].shape[1] // 4) - int(concat_padding_mask)
+        
+        x_embed_key = None
+        for k in state_dict_keys:
+            if "x_embedder.proj.1.weight" in k:
+                x_embed_key = k
+                break
+        
+        if x_embed_key is None:
+             x_embed_key = "{}x_embedder.proj.1.weight".format(key_prefix)
+
+        try:
+            dit_config["in_channels"] = (state_dict[x_embed_key].shape[1] // 4) - int(concat_padding_mask)
+        except Exception:
+            dit_config["in_channels"] = 16 # Fallback to standard Anima 2B
+            
         dit_config["out_channels"] = 16
         dit_config["patch_spatial"] = 2
         dit_config["patch_temporal"] = 1
-        dit_config["model_channels"] = int(state_dict[x_embed_key].shape[0])
+        try:
+            dit_config["model_channels"] = int(state_dict[x_embed_key].shape[0])
+        except Exception:
+            dit_config["model_channels"] = 2048 # Fallback to standard Anima 2B
         dit_config["concat_padding_mask"] = concat_padding_mask
         dit_config["crossattn_emb_channels"] = 1024
         dit_config["pos_emb_cls"] = "rope3d"
@@ -295,6 +320,12 @@ def detect_unet_config(state_dict: dict, key_prefix: str) -> dict:
         dit_config["extra_w_extrapolation_ratio"] = 1.0
         dit_config["extra_t_extrapolation_ratio"] = 1.0
         dit_config["rope_enable_fps_modulation"] = False
+
+        if any("llm_adapter" in k for k in state_dict_keys) or any("qwen3_5_4b" in k for k in state_dict_keys):
+            dit_config["image_model"] = "anima"
+        else:
+            dit_config["image_model"] = "cosmos_predict2"
+            
         return dit_config
 
     if "{}input_blocks.0.0.weight".format(key_prefix) not in state_dict_keys:

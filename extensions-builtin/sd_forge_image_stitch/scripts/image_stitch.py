@@ -12,15 +12,15 @@ from modules.shared import device, opts
 from modules.ui_components import FormRow, InputAccordion
 
 t2i_info = """
-For <b>Flux-Kontext</b> / <b>Flux.2-Klein</b> / <b>Qwen-Image-Edit</b><br>
+For <b>Flux-Kontext</b> / <b>Flux.2-Klein</b> / <b>Qwen-Image-Edit</b> / <b>Anima Edit</b><br>
 Use in <b>txt2img</b> to achieve the effect of empty latent with custom resolution<br>
 <b>NOTE:</b> This doesn't actually stitch the images
 """
 
 i2i_info = """
-For <b>Flux-Kontext</b> / <b>Flux.2-Klein</b> / <b>Qwen-Image-Edit</b><br>
+For <b>Flux-Kontext</b> / <b>Flux.2-Klein</b> / <b>Qwen-Image-Edit</b> / <b>Anima Edit</b><br>
 Use in <b>img2img</b> to achieve the effect of multiple input images<br>
-<b>NOTE:</b> This doesn't actually stitch the images
+<b>NOTE:</b> For <b>Anima Edit</b> you must also enable the <b>[Anima] Enable Edit LoRA Mode</b> option (pin to Quicksettings)
 """
 
 
@@ -100,7 +100,7 @@ class ImageStitch(scripts.Script):
         p.sd_model.clear_references()
 
     def process(self, p: StableDiffusionProcessing, enable: bool, references: list[str | tuple[Image.Image, str]], max_dim: int):
-        if not (enable and references and any(getattr(dynamic_args, key) for key in ("kontext", "edit", "klein"))):
+        if not (enable and references and any(getattr(dynamic_args, key) for key in ("kontext", "edit", "klein", "anima_edit"))):
             if self.cached_parameters is None:
                 return
 

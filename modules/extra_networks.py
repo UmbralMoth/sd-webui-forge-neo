@@ -175,13 +175,13 @@ def parse_prompt(prompt):
 
 def parse_prompts(prompts):
     res = []
-    extra_data = None
+    extra_data = defaultdict(list)
 
     for prompt in prompts:
         updated_prompt, parsed_extra_data = parse_prompt(prompt)
 
-        if extra_data is None:
-            extra_data = parsed_extra_data
+        for name, params in parsed_extra_data.items():
+            extra_data[name].extend(params)
 
         res.append(updated_prompt)
 

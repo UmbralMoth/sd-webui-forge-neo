@@ -106,14 +106,20 @@ class Wan21(LatentFormat):
         self.latents_std = torch.tensor([2.8184, 1.4541, 2.3275, 2.6558, 1.2196, 1.7708, 2.6052, 2.0743, 3.2687, 2.1526, 2.8652, 1.5579, 1.6382, 1.1253, 2.8251, 1.9160]).view(1, self.latent_channels, 1, 1, 1)
 
     def process_in(self, latent):
-        latents_mean = self.latents_mean.to(latent.device, latent.dtype)
-        latents_std = self.latents_std.to(latent.device, latent.dtype)
-        return (latent - latents_mean) * self.scale_factor / latents_std
+        mean = self.latents_mean.to(latent.device, latent.dtype)
+        std = self.latents_std.to(latent.device, latent.dtype)
+        if latent.ndim == 4:
+            mean = mean.squeeze(2)
+            std = std.squeeze(2)
+        return (latent - mean) * self.scale_factor / std
 
     def process_out(self, latent):
-        latents_mean = self.latents_mean.to(latent.device, latent.dtype)
-        latents_std = self.latents_std.to(latent.device, latent.dtype)
-        return latent * latents_std / self.scale_factor + latents_mean
+        mean = self.latents_mean.to(latent.device, latent.dtype)
+        std = self.latents_std.to(latent.device, latent.dtype)
+        if latent.ndim == 4:
+            mean = mean.squeeze(2)
+            std = std.squeeze(2)
+        return latent * std / self.scale_factor + mean
 
 
 class QwenImage(LatentFormat):
@@ -145,18 +151,25 @@ class QwenImage(LatentFormat):
         self.latents_std = torch.tensor([2.8184, 1.4541, 2.3275, 2.6558, 1.2196, 1.7708, 2.6052, 2.0743, 3.2687, 2.1526, 2.8652, 1.5579, 1.6382, 1.1253, 2.8251, 1.9160]).view(1, self.latent_channels, 1, 1, 1)
 
     def process_in(self, latent):
-        latents_mean = self.latents_mean.to(latent.device, latent.dtype)
-        latents_std = self.latents_std.to(latent.device, latent.dtype)
-        return (latent - latents_mean) * self.scale_factor / latents_std
+        mean = self.latents_mean.to(latent.device, latent.dtype)
+        std = self.latents_std.to(latent.device, latent.dtype)
+        if latent.ndim == 4:
+            mean = mean.squeeze(2)
+            std = std.squeeze(2)
+        return (latent - mean) * self.scale_factor / std
 
     def process_out(self, latent):
-        latents_mean = self.latents_mean.to(latent.device, latent.dtype)
-        latents_std = self.latents_std.to(latent.device, latent.dtype)
-        return latent * latents_std / self.scale_factor + latents_mean
+        mean = self.latents_mean.to(latent.device, latent.dtype)
+        std = self.latents_std.to(latent.device, latent.dtype)
+        if latent.ndim == 4:
+            mean = mean.squeeze(2)
+            std = std.squeeze(2)
+        return latent * std / self.scale_factor + mean
 
 
 class SDXLRF(LatentFormat):
-    """Latent format for NoobAI Rectified Flow (SDXL UNet + 32-channel Flux2 VAE)."""
+    """DEPRECATED: kept for backwards compatibility. New code should use SDXL_Flux2
+    (a 32-channel Flux2 derivative with identity process_in/process_out)."""
 
     def __init__(self):
         self.latent_channels = 32
@@ -256,7 +269,20 @@ class Flux2(LatentFormat):
 
 
 class SDXL_Flux2(Flux2):
+    """Latent format for SDXL UNet + 32-channel Flux2 VAE hybrid models
+    (NoobAI RF, Wahtastic Flow, etc.).
+
+    Inherits from Flux2: identity process_in/process_out (no scale/shift) and
+    the standard Flux2 latent_rgb_factors. Overrides latent_channels to 32
+    (instead of Flux2's 128) and disables latent_rgb_factors_reshape since
+    32-channel latents don't need spatial-to-channel packing -- the packing
+    is performed by the VAE's _to_vae_latent/_from_vae_latent methods instead."""
+
     def __init__(self):
         super().__init__()
+        # SDXL Flux2 models emit 32-channel latents, reusing the Flux2 VAE scaling.
         self.latent_rgb_factors_reshape = None
         self.latent_channels = 32
+        # taef2_decoder expects 128-channel packed latents; with 32-channel
+        # latents, the live preview falls back to cheap_approximation (RGB).
+        self.taesd_decoder_name = None

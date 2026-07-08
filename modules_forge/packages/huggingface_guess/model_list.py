@@ -248,7 +248,18 @@ class SDXLRF(SDXL):
         "out_channels": 32,
     }
 
-    latent_format = latent.SDXLRF
+    # Use SDXL_Flux2: a Flux2-derived latent format with 32 channels and
+    # identity process_in/process_out. The VAE handles its own scaling
+    # internally (Flux2-style), and the spatial-to-channel packing is
+    # performed by the VAE's _to_vae_latent/_from_vae_latent methods.
+    latent_format = latent.SDXL_Flux2
+    vae_key_prefix = ["vae.", "first_stage_model."]
+    # The SDXL model uses 32 channels at full resolution, but the Flux2 VAE
+    # internally uses 128 channels at half resolution. The VAE class's
+    # _to_vae_latent/_from_vae_latent methods perform this spatial packing
+    # automatically when these attributes are set.
+    packed_vae_latent_channels = 32
+    packed_vae_spatial_factor = 2
 
     sampling_settings = {
         "shift": 1.0,
@@ -273,9 +284,14 @@ class Mugen(SDXL):
         "RF": True,
     }
 
-    latent_format = latent.SDXLRF
-
+    # Use SDXL_Flux2: a Flux2-derived latent format with 32 channels and
+    # identity process_in/process_out. The VAE handles its own scaling
+    # internally (Flux2-style), and the spatial-to-channel packing is
+    # performed by the VAE's _to_vae_latent/_from_vae_latent methods.
+    latent_format = latent.SDXL_Flux2
     vae_key_prefix = ["vae.", "first_stage_model."]
+    packed_vae_latent_channels = 32
+    packed_vae_spatial_factor = 2
 
     def model_type(self, state_dict: dict):
         return ModelType.FLOW
@@ -501,7 +517,7 @@ class Anima(BASE):
     unet_extra_config = {}
     latent_format = latent.QwenImage
 
-    memory_usage_factor = 1.0
+    memory_usage_factor = 2.5
     supported_inference_dtypes = [torch.bfloat16, torch.float16, torch.float32]
 
     vae_key_prefix = ["vae."]
@@ -512,11 +528,37 @@ class Anima(BASE):
     def model_type(self, state_dict):
         return ModelType.FLOW
 
+    @classmethod
+    def matches(cls, unet_config, state_dict=None):
+        if unet_config.get("image_model") not in ("anima", "cosmos_predict2"):
+            return False
+        if state_dict is not None:
+            # If qwen3_5_4b keys are present, this is NOT standard Anima
+            if any("qwen3_5_4b" in k for k in state_dict.keys()):
+                return False
+        return True
+
     def clip_target(self, state_dict: dict):
-        pref = self.text_encoder_key_prefix[0]
-        if "{}qwen3_06b.transformer.model.embed_tokens.weight".format(pref) in state_dict:
-            return {"qwen3_06b.transformer": "text_encoder"}
+        if any(k.startswith("qwen3_5_4b.") for k in state_dict.keys()):
+            return {"qwen3_5_4b": "text_encoder"}
         return {"qwen3_06b": "text_encoder"}
+
+
+class AnimaQwen35(Anima):
+    huggingface_repo = "circlestone-labs/Anima-Qwen3.5"
+
+    @classmethod
+    def matches(cls, unet_config, state_dict=None):
+        if unet_config.get("image_model") not in ("anima", "cosmos_predict2"):
+            return False
+        if state_dict is not None:
+            # Check for qwen3_5_4b keys anywhere in the state dict
+            if any("qwen3_5_4b" in k for k in state_dict.keys()):
+                return True
+        return False
+
+    def clip_target(self, state_dict: dict):
+        return {"qwen3_5_4b": "text_encoder"}
 
 
 class WAN21_T2V(BASE):
@@ -616,6 +658,7 @@ models = [
     Chroma,
     Lumina2,
     ZImage,
+    AnimaQwen35,
     Anima,
     WAN21_T2V,
     WAN21_I2V,
