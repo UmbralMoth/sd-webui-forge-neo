@@ -545,8 +545,6 @@ class StableDiffusionProcessing:
                 # (same math as TraSCE but with base instead of empty).
                 dot_pn_f = torch.sum(v_pos * v_neg_raw, dim=(1, 2, 3), keepdim=True)
                 dot_pp_f = torch.sum(v_pos * v_pos, dim=(1, 2, 3), keepdim=True)
-                if model_options.get("perp_neg_clamp", False):
-                    dot_pn_f = torch.clamp(dot_pn_f, min=0.0)
                 proj_neg_on_pos = (dot_pn_f / torch.clamp(dot_pp_f, min=1e-6)) * v_pos
                 neg_dir_perp = v_neg_raw - proj_neg_on_pos
                 uncond_perp = base_pred_f32 + neg_dir_perp
