@@ -594,14 +594,32 @@ class StableDiffusionProcessing:
             # projection naturally strips the quality-neg overlap (if any).
             anima_edit_active = bool(getattr(args_module.dynamic_args, "anima_edit", False))
             if anima_edit_active:
-                # Recompute uncond_perp using base as the uncond baseline
-                # (same math as TraSCE but with base instead of empty).
-                dot_pn_f = torch.sum(v_pos * v_neg_raw, dim=(1, 2, 3), keepdim=True)
-                dot_pp_f = torch.sum(v_pos * v_pos, dim=(1, 2, 3), keepdim=True)
-                proj_neg_on_pos = (dot_pn_f / torch.clamp(dot_pp_f, min=1e-6)) * v_pos
-                neg_dir_perp = v_neg_raw - proj_neg_on_pos
-                uncond_perp = base_pred_f32 + neg_dir_perp
-                epsilon_guided_tmg = base_pred_f32 + (cond_pred_f32 - uncond_perp) * cond_scale
+                # Anima 2B Edit: the LoRA applies the edit to all non-empty
+                # prompts. In TMG that means base, cond, AND uncond all
+                # contain the edit, so the (cond - uncond) difference
+                # cancels the edit out and CFG only amplifies quality vs
+                # neg. The edit ends up at 1x (its natural magnitude) which
+                # is too weak to produce a strong edit.
+                #
+                # The fix: use empty_pred as the uncond baseline
+                # (TraSCE-style). empty has NO edit applied. The cond
+                # has edit + quality. The diff (cond - empty) is
+                # (edit + quality), which CFG then amplifies. Result:
+                #   epsilon = (1-cfg)*empty + cfg*(cond - perp_uncond)
+                #         = (1-cfg)*ref + cfg*(edit + quality) - cfg*neg_perp
+                # For orthogonal pos/neg in empty-relative space:
+                #         = ref + cfg*edit + cfg*quality - cfg*neg
+                # The edit is amplified by cfg (matching standard CFG
+                # behavior), quality is amplified by cfg, neg is
+                # subtracted. This is what the Edit LoRA was trained for.
+                pos_dir_f = cond_pred_f32 - empty_pred_f32  # = edit + quality
+                neg_dir_f = uncond_pred_f32 - empty_pred_f32  # = edit + neg
+                dot_pn_f = torch.sum(pos_dir_f * neg_dir_f, dim=(1, 2, 3), keepdim=True)
+                dot_pp_f = torch.sum(pos_dir_f * pos_dir_f, dim=(1, 2, 3), keepdim=True)
+                proj_neg_on_pos = (dot_pn_f / torch.clamp(dot_pp_f, min=1e-6)) * pos_dir_f
+                neg_dir_perp = neg_dir_f - proj_neg_on_pos
+                uncond_perp = empty_pred_f32 + neg_dir_perp
+                epsilon_guided_tmg = empty_pred_f32 + (cond_pred_f32 - uncond_perp) * cond_scale
                 # DEBUG: print override output magnitude
                 if anima_edit_dbg:
                     print(f"  override abs.mean: {epsilon_guided_tmg.float().abs().mean().item():.4f}")
