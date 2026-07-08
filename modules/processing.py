@@ -450,6 +450,11 @@ class StableDiffusionProcessing:
         self.main_negative_prompt = self.all_negative_prompts[0]
 
     def get_tmg_cfg_function(self):
+        # Capture the module-level backend.args so the nested function can
+        # read global flags (e.g. args.dynamic_args.anima_edit) without
+        # shadowing the per-call `args` dict parameter.
+        args_module = args
+
         @torch.inference_mode()
         def triad_manifold_cfg(args):
             cond_pred = args["cond_denoised"]     # Epsilon positive (C_base + C_pos)
@@ -523,14 +528,42 @@ class StableDiffusionProcessing:
             else:
                 w_pos = torch.clamp(max_g * (1.0 - p_pos_clamped), min=min_g, max=max_g)
                 w_neg = torch.clamp(max_g * p_neg_clamped, min=min_g, max=max_g)
-            
-            # 5. Assembly
-            if v_base is not None:
-                s_base = cond_scale
-                epsilon_guided_tmg = empty_pred_f32 + s_base * v_base + w_pos * v_pos_aligned - w_neg * v_neg_aligned
+
+            # Anima 2B Edit: the Edit LoRA was trained where the CFG
+            # direction is (cond - uncond) with total weight 1 + cfg.
+            # TMG's per-component amplification (1 + s_base + w_pos + w_neg)
+            # blows up the output beyond the LoRA's training range and
+            # causes noise. Match the TraSCE pattern instead: compute
+            # the math between base, pos, neg (perp projection), then
+            # apply a single cfg-scaled CFG direction using base as the
+            # uncond baseline. Result: base + cfg * (cond - perp_uncond),
+            # equivalent to (1-cfg)*base + cfg*cond for orthogonal
+            # concepts.
+            anima_edit_active = bool(getattr(args_module.dynamic_args, "anima_edit", False))
+            if anima_edit_active:
+                # Recompute uncond_perp using base as the uncond baseline
+                # (same math as TraSCE but with base instead of empty).
+                dot_pn_f = torch.sum(v_pos * v_neg_raw, dim=(1, 2, 3), keepdim=True)
+                dot_pp_f = torch.sum(v_pos * v_pos, dim=(1, 2, 3), keepdim=True)
+                if model_options.get("perp_neg_clamp", False):
+                    dot_pn_f = torch.clamp(dot_pn_f, min=0.0)
+                proj_neg_on_pos = (dot_pn_f / torch.clamp(dot_pp_f, min=1e-6)) * v_pos
+                neg_dir_perp = v_neg_raw - proj_neg_on_pos
+                uncond_perp = base_pred_f32 + neg_dir_perp
+                epsilon_guided_tmg = base_pred_f32 + (cond_pred_f32 - uncond_perp) * cond_scale
+                # Skip the normal assembly branch below by jumping to fade.
+                skip_tmg_assembly = True
             else:
-                epsilon_guided_tmg = base_pred_f32 + w_pos * v_pos_aligned - w_neg * v_neg_aligned
-                
+                skip_tmg_assembly = False
+
+            # 5. Assembly
+            if not skip_tmg_assembly:
+                if v_base is not None:
+                    s_base = cond_scale
+                    epsilon_guided_tmg = empty_pred_f32 + s_base * v_base + w_pos * v_pos_aligned - w_neg * v_neg_aligned
+                else:
+                    epsilon_guided_tmg = base_pred_f32 + w_pos * v_pos_aligned - w_neg * v_neg_aligned
+
             tmg_fade_start = getattr(shared.opts, "tmg_fade_start", 0.8)
             fade_tmg = 1.0
             if tmg_fade_start < 1.0:
@@ -540,15 +573,15 @@ class StableDiffusionProcessing:
                     progress = float(current_step) / float(total_steps)
                     if progress > tmg_fade_start:
                         fade_tmg = 1.0 - min(max((progress - tmg_fade_start) / (1.0 - tmg_fade_start), 0.0), 1.0)
-                        
+
             if fade_tmg < 1.0 and uncond_pred is not None:
                 epsilon_standard = uncond_pred_f32 + cond_scale * (cond_pred_f32 - uncond_pred_f32)
                 epsilon_guided = torch.lerp(epsilon_standard, epsilon_guided_tmg, fade_tmg)
             else:
                 epsilon_guided = epsilon_guided_tmg
-                
+
             return x_orig - epsilon_guided.to(x_orig.dtype)
-            
+
         return triad_manifold_cfg
 
     def cached_params(self, required_prompts, steps, extra_network_data, hires_steps, use_old_scheduling):
