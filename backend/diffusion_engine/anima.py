@@ -57,27 +57,14 @@ class Anima(ForgeDiffusionEngine):
         self.forge_objects.unet.model.predictor.set_parameters(shift=shift)
         memory_management.logger.debug(f"Shift: {shift}")
 
-        # Re-read the option at sampling time so toggling [Anima] Enable Edit LoRA Mode
-        # in Quicksettings takes effect without reloading the model.
-        from modules.shared import opts as _opts
-        edit_mode_on = bool(getattr(_opts, "anima_edit_mode", False))
-        dynamic_args.anima_edit = edit_mode_on
-        dynamic_args.anima_edit_debug = bool(getattr(_opts, "anima_edit_debug", False))
-
-        if edit_mode_on and not getattr(prompt, "is_negative_prompt", False):
-            # Build the ref list once per positive prompt conditioning call.
-            # If refs are already populated (from a previous encode_first_stage
-            # or earlier in this session), keep them. Otherwise, build from
-            # ini_latent (img2img) and self.ref_latents (ImageStitch).
-            if not dynamic_args.ref_latents:
-                refs = list(self.ref_latents)
-                if self.ini_latent is not None:
-                    refs.insert(0, self.ini_latent)
-                if refs:
-                    dynamic_args.ref_latents = refs
-        elif not edit_mode_on:
-            # Edit mode disabled - clear stale refs.
-            dynamic_args.ref_latents.clear()
+        # dynamic_args.anima_edit / anima_edit_debug are synced at the very
+        # entry of process_images_inner in modules/processing.py, and
+        # dynamic_args.ref_latents is built from the freshly-encoded
+        # engine-side inputs (self.ini_latent, self.ref_latents) inside
+        # StableDiffusionProcessing.setup_conds. So by the time we reach
+        # here, the ref list already reflects the current generation's
+        # ImageStitch gallery and img2img init image at the current
+        # resolution. Nothing to do in the engine itself; we just encode.
 
         return self.text_processing_engine_anima(prompt)
 

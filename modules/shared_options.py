@@ -252,7 +252,7 @@ options_templates.update(
             "qwen_vae_resize": OptionInfo(False, "[Qwen-Image-Edit] Resize input image to 1 megapixel for ref_latent"),
             "klein_no_reference": OptionInfo(False, "[Klein] Disable Reference").info("disable Edit ; enable img2img").info("pin to <b>Quicksettings</b> is recommended if changed often"),
             "anima_edit_mode": OptionInfo(False, "[Anima] Enable Edit LoRA Mode").info("Enable Anima 2B Edit LoRA compatibility. Sends the img2img input image (and any ImageStitch reference images) as extra temporal frames to the model. Required when using the Anima Edit LoRA. pin to <b>Quicksettings</b> is recommended"),
-            "anima_edit_debug": OptionInfo(False, "[Anima] Edit LoRA Mode: Debug").info("Dump TMG model output magnitudes and override magnitudes to console. Useful for diagnosing Anima Edit + TMG issues. Only takes effect when [Anima] Enable Edit LoRA Mode is also enabled. Recommended to leave off unless debugging"),
+            "anima_edit_debug": OptionInfo(False, "[Anima] Edit LoRA Mode: Debug").info("Reserved for future Anima Edit diagnostics. Currently has no effect (TMG is fully bypassed when [Anima] Enable Edit LoRA Mode is on, so there is no override to inspect). Recommended to leave off."),
 
         },
     )

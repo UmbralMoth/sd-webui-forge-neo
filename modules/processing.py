@@ -450,11 +450,6 @@ class StableDiffusionProcessing:
         self.main_negative_prompt = self.all_negative_prompts[0]
 
     def get_tmg_cfg_function(self):
-        # Capture the module-level backend.args so the nested function can
-        # read global flags (e.g. args.dynamic_args.anima_edit) without
-        # shadowing the per-call `args` dict parameter.
-        args_module = args
-
         @torch.inference_mode()
         def triad_manifold_cfg(args):
             cond_pred = args["cond_denoised"]     # Epsilon positive (C_base + C_pos)
@@ -465,55 +460,23 @@ class StableDiffusionProcessing:
             empty_pred_raw = args["empty_denoised"] # C_empty ("") or C_base (fallback)
             base_pred_raw = args.get("base_denoised", None) # C_base
 
-            # DEBUG: dump model output magnitudes when Anima Edit debug is enabled
-            anima_edit_dbg = bool(getattr(args_module.dynamic_args, "anima_edit_debug", False))
-            if anima_edit_dbg:
-                def _stats(t, name):
-                    if t is None:
-                        return f"{name}: None"
-                    return f"{name}: mean={t.float().abs().mean().item():.4f} max={t.float().abs().max().item():.4f}"
-                print(f"[Anima TMG DEBUG]")
-                print(f"  {_stats(empty_pred_raw, 'empty')}")
-                print(f"  {_stats(base_pred_raw, 'base')}")
-                print(f"  {_stats(cond_pred, 'cond')}")
-                print(f"  {_stats(uncond_pred, 'uncond')}")
-                # For 4-conditioning (TMG with base), show the diffs.
-                # For 3-conditioning (TraSCE no base), show pos_dir/neg_dir
-                # relative to empty.
-                if base_pred_raw is not None and empty_pred_raw is not None:
-                    v_base_dbg = base_pred_raw - empty_pred_raw
-                    v_pos_dbg = cond_pred - base_pred_raw
-                    v_neg_dbg = uncond_pred - base_pred_raw
-                    print(f"  v_base (base-empty)  abs.mean: {v_base_dbg.float().abs().mean().item():.4f}")
-                    print(f"  v_pos  (cond-base)  abs.mean: {v_pos_dbg.float().abs().mean().item():.4f}")
-                    print(f"  v_neg  (uncond-base) abs.mean: {v_neg_dbg.float().abs().mean().item():.4f}")
-                    dot_pn = (v_pos_dbg * v_neg_dbg).sum()
-                    print(f"  cos(v_pos, v_neg) = {(dot_pn / (v_pos_dbg.norm() * v_neg_dbg.norm() + 1e-8)).item():.4f}")
-                elif empty_pred_raw is not None:
-                    pos_dir_dbg = cond_pred - empty_pred_raw
-                    neg_dir_dbg = uncond_pred - empty_pred_raw
-                    print(f"  pos_dir (cond-empty)  abs.mean: {pos_dir_dbg.float().abs().mean().item():.4f}")
-                    print(f"  neg_dir (uncond-empty) abs.mean: {neg_dir_dbg.float().abs().mean().item():.4f}")
-                    dot_pn = (pos_dir_dbg * neg_dir_dbg).sum()
-                    print(f"  cos(pos_dir, neg_dir) = {(dot_pn / (pos_dir_dbg.norm() * neg_dir_dbg.norm() + 1e-8)).item():.4f}")
-
             if empty_pred_raw is None:
                 # 3-conditioning fallback if empty_pred is missing
                 empty_pred_raw = base_pred_raw if base_pred_raw is not None else cond_pred
                 base_pred_raw = None
-                
+
             if empty_pred_raw is None:
                 return x_orig - (uncond_pred + cond_scale * (cond_pred - uncond_pred))
-                
+
             # Cast inputs to float32
             cond_pred_f32 = cond_pred.to(torch.float32)
             uncond_pred_f32 = uncond_pred.to(torch.float32)
-            
+
             if base_pred_raw is not None:
                 # 4-conditioning case
                 empty_pred_f32 = empty_pred_raw.to(torch.float32)
                 base_pred_f32 = base_pred_raw.to(torch.float32)
-                
+
                 v_base = base_pred_f32 - empty_pred_f32
                 v_pos = cond_pred_f32 - base_pred_f32
                 v_neg_raw = uncond_pred_f32 - base_pred_f32
@@ -523,37 +486,37 @@ class StableDiffusionProcessing:
                 v_base = None
                 v_pos = cond_pred_f32 - base_pred_f32
                 v_neg_raw = uncond_pred_f32 - base_pred_f32
-                
+
             # 1. Perpendicular Projection (Perp-Neg)
             dot_pn = torch.sum(v_pos * v_neg_raw, dim=(1, 2, 3), keepdim=True)
             dot_pp = torch.sum(v_pos * v_pos, dim=(1, 2, 3), keepdim=True)
             dot_nn = torch.sum(v_neg_raw * v_neg_raw, dim=(1, 2, 3), keepdim=True)
-            
+
             v_pos_perp = v_pos - (torch.clamp(dot_pn, min=0.0) / torch.clamp(dot_nn, min=1e-8)) * v_neg_raw
             v_neg_perp = v_neg_raw - (torch.clamp(dot_pn, min=0.0) / torch.clamp(dot_pp, min=1e-8)) * v_pos
-            
+
             # 2. Magnitude Preservation
             norm_pos_raw = torch.linalg.vector_norm(v_pos, ord=2, dim=(1, 2, 3), keepdim=True)
             norm_pos_perp = torch.linalg.vector_norm(v_pos_perp, ord=2, dim=(1, 2, 3), keepdim=True)
             v_pos_aligned = v_pos_perp * (norm_pos_raw / torch.clamp(norm_pos_perp, min=1e-8))
-            
+
             norm_neg_raw = torch.linalg.vector_norm(v_neg_raw, ord=2, dim=(1, 2, 3), keepdim=True)
             norm_neg_perp = torch.linalg.vector_norm(v_neg_perp, ord=2, dim=(1, 2, 3), keepdim=True)
             v_neg_aligned = v_neg_perp * (norm_neg_raw / torch.clamp(norm_neg_perp, min=1e-8))
-            
+
             # 3. Concept Presence Cosine Metrics (The Sensors)
             norm_base = torch.linalg.vector_norm(base_pred_f32, ord=2, dim=(1, 2, 3), keepdim=True)
             p_pos = torch.sum(base_pred_f32 * v_pos_aligned, dim=(1, 2, 3), keepdim=True) / torch.clamp(norm_base * torch.linalg.vector_norm(v_pos_aligned, ord=2, dim=(1, 2, 3), keepdim=True), min=1e-8)
             p_neg = torch.sum(base_pred_f32 * v_neg_aligned, dim=(1, 2, 3), keepdim=True) / torch.clamp(norm_base * torch.linalg.vector_norm(v_neg_aligned, ord=2, dim=(1, 2, 3), keepdim=True), min=1e-8)
-            
+
             # 4. Independent Scaling (Option A) with Clamping
             max_g = cond_scale
             min_g = getattr(self, "tmg_min_guidance", 1.0)
             tmg_exponent = getattr(shared.opts, "tmg_exponent", 1.0)
-            
+
             p_pos_clamped = torch.clamp(p_pos, min=0.0, max=1.0)
             p_neg_clamped = torch.clamp(p_neg, min=0.0, max=1.0)
-            
+
             if tmg_exponent != 1.0:
                 w_pos = torch.clamp(max_g * (1.0 - torch.pow(p_pos_clamped, tmg_exponent)), min=min_g, max=max_g)
                 w_neg = torch.clamp(max_g * torch.pow(p_neg_clamped, tmg_exponent), min=min_g, max=max_g)
@@ -561,84 +524,12 @@ class StableDiffusionProcessing:
                 w_pos = torch.clamp(max_g * (1.0 - p_pos_clamped), min=min_g, max=max_g)
                 w_neg = torch.clamp(max_g * p_neg_clamped, min=min_g, max=max_g)
 
-            # Anima 2B Edit: the Edit LoRA's edit effect lives in the base
-            # pass output (base = ref + edit). The original TMG formula
-            # amplifies the base separately via s_base = cfg:
-            #   epsilon = empty + s_base * v_base + w_pos * v_pos - w_neg * v_neg
-            # The s_base*v_base term adds cfg*edit ON TOP of the edit
-            # contribution that's already in cond and uncond. Expanding:
-            #   = (1-cfg)*empty + cfg*base + w_pos*(cond-base) - w_neg*(uncond-base)
-            #   = (1-cfg)*ref + cfg*(ref+edit) + w_pos*quality - w_neg*neg
-            # With w_pos = w_neg = cfg, this is:
-            #   = ref + edit + cfg*quality - cfg*neg
-            # But the edit term has been scaled cfg times by s_base*v_base,
-            # not just (1-cfg)/(1) times as in standard CFG. For Anima
-            # Edit this means the edit appears at 1x baseline (natural
-            # from cond/uncond) + 3x extra from s_base = 4x total.
-            #
-            # The perp projection (line 501) operates on v_pos and v_neg
-            # in base-relative space. Since v_pos = cond - base = quality
-            # and v_neg = uncond - base = neg, these don't contain the
-            # edit. The perp can't strip the edit overlap because the
-            # edit is in v_base itself, outside the projection.
-            #
-            # The fix: do the perp projection on the v_pos/v_neg in
-            # base-relative space (as TMG does), but DON'T use s_base
-            # for separate base amplification. Instead, use base as the
-            # uncond baseline and apply a single cfg amplification:
-            #   epsilon = base + cfg * (cond - perp_uncond)
-            #   = (1-cfg)*base + cfg*cond - cfg*v_neg_perp
-            # For orthogonal v_pos/v_neg, this is ref + edit + cfg*quality
-            # - cfg*neg -- matching standard CFG with the edit at its
-            # natural 1x baseline (no extra amplification). The perp
-            # projection naturally strips the quality-neg overlap (if any).
-            anima_edit_active = bool(getattr(args_module.dynamic_args, "anima_edit", False))
-            if anima_edit_active:
-                # Anima 2B Edit: the LoRA applies the edit to all non-empty
-                # prompts. In TMG that means base, cond, AND uncond all
-                # contain the edit, so the (cond - uncond) difference
-                # cancels the edit out and CFG only amplifies quality vs
-                # neg. The edit ends up at 1x (its natural magnitude) which
-                # is too weak to produce a strong edit.
-                #
-                # The fix: use empty_pred as the uncond baseline
-                # (TraSCE-style). empty has NO edit applied. The cond
-                # has edit + quality. The diff (cond - empty) is
-                # (edit + quality), which CFG then amplifies. Result:
-                #   epsilon = (1-cfg)*empty + cfg*(cond - perp_uncond)
-                #         = (1-cfg)*ref + cfg*(edit + quality) - cfg*neg_perp
-                # For orthogonal pos/neg in empty-relative space:
-                #         = ref + cfg*edit + cfg*quality - cfg*neg
-                # The edit is amplified by cfg (matching standard CFG
-                # behavior), quality is amplified by cfg, neg is
-                # subtracted. This is what the Edit LoRA was trained for.
-                pos_dir_f = cond_pred_f32 - empty_pred_f32  # = edit + quality
-                neg_dir_f = uncond_pred_f32 - empty_pred_f32  # = edit + neg
-                dot_pn_f = torch.sum(pos_dir_f * neg_dir_f, dim=(1, 2, 3), keepdim=True)
-                dot_pp_f = torch.sum(pos_dir_f * pos_dir_f, dim=(1, 2, 3), keepdim=True)
-                proj_neg_on_pos = (dot_pn_f / torch.clamp(dot_pp_f, min=1e-6)) * pos_dir_f
-                neg_dir_perp = neg_dir_f - proj_neg_on_pos
-                uncond_perp = empty_pred_f32 + neg_dir_perp
-                epsilon_guided_tmg = empty_pred_f32 + (cond_pred_f32 - uncond_perp) * cond_scale
-                # DEBUG: print override output magnitude
-                if anima_edit_dbg:
-                    print(f"  override abs.mean: {epsilon_guided_tmg.float().abs().mean().item():.4f}")
-                    print(f"  override abs.max:  {epsilon_guided_tmg.float().abs().max().item():.4f}")
-                    # What standard CFG would give (for comparison)
-                    standard = (1 - cond_scale) * uncond_pred + cond_scale * cond_pred
-                    print(f"  standard CFG abs.mean: {standard.float().abs().mean().item():.4f}")
-                # Skip the normal assembly branch below by jumping to fade.
-                skip_tmg_assembly = True
-            else:
-                skip_tmg_assembly = False
-
             # 5. Assembly
-            if not skip_tmg_assembly:
-                if v_base is not None:
-                    s_base = cond_scale
-                    epsilon_guided_tmg = empty_pred_f32 + s_base * v_base + w_pos * v_pos_aligned - w_neg * v_neg_aligned
-                else:
-                    epsilon_guided_tmg = base_pred_f32 + w_pos * v_pos_aligned - w_neg * v_neg_aligned
+            if v_base is not None:
+                s_base = cond_scale
+                epsilon_guided_tmg = empty_pred_f32 + s_base * v_base + w_pos * v_pos_aligned - w_neg * v_neg_aligned
+            else:
+                epsilon_guided_tmg = base_pred_f32 + w_pos * v_pos_aligned - w_neg * v_neg_aligned
 
             tmg_fade_start = getattr(shared.opts, "tmg_fade_start", 0.8)
             fade_tmg = 1.0
@@ -730,6 +621,42 @@ class StableDiffusionProcessing:
         return cache[1]
 
     def setup_conds(self):
+        # Anima Edit maintenance.
+        # 1. dynamic_args.anima_edit / anima_edit_debug were synced in
+        #    process_images_inner so the very first run after a toggle
+        #    sees the current toggle state instead of the previous
+        #    generation's leftover.
+        # 2. dynamic_args.ref_latents was cleared in process_images_inner
+        #    so the previous run's refs (potentially at a different
+        #    resolution) don't leak into the new run and cause a
+        #    `Sizes of tensors must match except in dimension 2`
+        #    RuntimeError in the model forward.
+        # 3. Rebuild dynamic_args.ref_latents here from the freshly-encoded
+        #    engine-side inputs (self.ini_latent from p.init ->
+        #    encode_first_stage, self.ref_latents from ImageStitch via
+        #    scripts.process -> encode_first_stage), so the list is
+        #    correct even when the conds cache returns a hit and skips
+        #    the Anima engine's get_learned_conditioning build path.
+        # 4. Belt-and-suspenders: when Edit is off, also clear the
+        #    engine-local ref_latents / ini_latent here in case any of
+        #    init / scripts.process / encode_first_stage accidentally
+        #    repopulated them on the way through.
+        sd_model = getattr(shared, "sd_model", None)
+        is_anima_engine = sd_model is not None and getattr(sd_model, "is_anima", False)
+        if is_anima_engine:
+            if args.dynamic_args.anima_edit:
+                refs = list(getattr(sd_model, "ref_latents", []) or [])
+                ini_latent = getattr(sd_model, "ini_latent", None)
+                if ini_latent is not None:
+                    refs.insert(0, ini_latent)
+                args.dynamic_args.ref_latents = refs
+            else:
+                ref_latents = getattr(sd_model, "ref_latents", None)
+                if ref_latents:
+                    ref_latents.clear()
+                if getattr(sd_model, "ini_latent", None) is not None:
+                    sd_model.ini_latent = None
+
         prompts = prompt_parser.SdConditioning(self.prompts, width=self.width, height=self.height, distilled_cfg_scale=self.distilled_cfg_scale)
         negative_prompts = prompt_parser.SdConditioning(self.negative_prompts, width=self.width, height=self.height, is_negative_prompt=True, distilled_cfg_scale=self.distilled_cfg_scale)
 
@@ -1136,6 +1063,29 @@ def process_images(p: StableDiffusionProcessing) -> Processed:
 
 def process_images_inner(p: StableDiffusionProcessing) -> Processed:
     """this is the main loop that both txt2img and img2img use; it calls func_init once inside all the scopes and func_sample once per batch"""
+
+    # Sync Anima Edit toggle at the very entry of the pipeline so that
+    # p.scripts.process (ImageStitch), p.init -> encode_first_stage, and
+    # p.setup_conds -> get_learned_conditioning all see the current value
+    # of [Anima] Enable Edit LoRA Mode on the first run after toggling --
+    # not the value left over from the previous generation.
+    #
+    # Also wipe dynamic_args.ref_latents unconditionally every run: if we
+    # left the previous run's refs in place, the Anima engine would skip
+    # rebuilding from the freshly-encoded self.ini_latent / self.ref_latents
+    # (its build site is gated on `if not dynamic_args.ref_latents:`), and
+    # the model forward would then try to concat a stale ref latent at the
+    # previous resolution onto a main latent at the new resolution -- a
+    # shape mismatch that surfaces as
+    # RuntimeError: Sizes of tensors must match except in dimension 2.
+    # The actual build happens in the Anima engine's
+    # get_learned_conditioning on the positive-prompt cache-miss path, so
+    # wiping here is safe even when Edit is off (the engine won't rebuild
+    # and the model forward sees an empty list -> no refs applied).
+    edit_mode_on = bool(getattr(opts, "anima_edit_mode", False))
+    args.dynamic_args.anima_edit = edit_mode_on
+    args.dynamic_args.anima_edit_debug = bool(getattr(opts, "anima_edit_debug", False))
+    args.dynamic_args.ref_latents.clear()
 
     _times = 1
     _is_video = False
@@ -1693,9 +1643,12 @@ class StableDiffusionProcessingTxt2Img(StableDiffusionProcessing):
             self.sd_model.forge_objects = self.sd_model.forge_objects_after_applying_lora.shallow_copy()
             apply_token_merging(self.sd_model, self.get_token_merging_ratio())
             if getattr(shared.opts, "tmg_enable", False) and getattr(self, "tmg_base_prompt", ""):
-                unet = self.sd_model.forge_objects.unet.clone()
-                unet.set_model_sampler_cfg_function(self.get_tmg_cfg_function())
-                self.sd_model.forge_objects.unet = unet
+                if bool(getattr(args.dynamic_args, "anima_edit", False)):
+                    logger.info("[Anima Edit] TMG CFG bypassed; falling back to built-in TraSEC CFG for sampling.")
+                else:
+                    unet = self.sd_model.forge_objects.unet.clone()
+                    unet.set_model_sampler_cfg_function(self.get_tmg_cfg_function())
+                    self.sd_model.forge_objects.unet = unet
 
             if self.scripts is not None:
                 self.scripts.process_before_every_sampling(self, x=x, noise=x, c=conditioning, uc=unconditional_conditioning)
@@ -1850,9 +1803,12 @@ class StableDiffusionProcessingTxt2Img(StableDiffusionProcessing):
         self.sd_model.forge_objects = self.sd_model.forge_objects_after_applying_lora.shallow_copy()
         apply_token_merging(self.sd_model, self.get_token_merging_ratio(for_hr=True))
         if getattr(shared.opts, "tmg_enable", False) and getattr(self, "tmg_base_prompt", ""):
-            unet = self.sd_model.forge_objects.unet.clone()
-            unet.set_model_sampler_cfg_function(self.get_tmg_cfg_function())
-            self.sd_model.forge_objects.unet = unet
+            if bool(getattr(args.dynamic_args, "anima_edit", False)):
+                logger.info("[Anima Edit] TMG CFG bypassed in HR pass; falling back to built-in TraSEC CFG for sampling.")
+            else:
+                unet = self.sd_model.forge_objects.unet.clone()
+                unet.set_model_sampler_cfg_function(self.get_tmg_cfg_function())
+                self.sd_model.forge_objects.unet = unet
 
         if self.scripts is not None:
             self.scripts.process_before_every_sampling(self, x=samples, noise=noise, c=self.hr_c, uc=self.hr_uc)
@@ -2252,9 +2208,12 @@ class StableDiffusionProcessingImg2Img(StableDiffusionProcessing):
         self.sd_model.forge_objects = self.sd_model.forge_objects_after_applying_lora.shallow_copy()
         apply_token_merging(self.sd_model, self.get_token_merging_ratio())
         if getattr(shared.opts, "tmg_enable", False) and getattr(self, "tmg_base_prompt", ""):
-            unet = self.sd_model.forge_objects.unet.clone()
-            unet.set_model_sampler_cfg_function(self.get_tmg_cfg_function())
-            self.sd_model.forge_objects.unet = unet
+            if bool(getattr(args.dynamic_args, "anima_edit", False)):
+                logger.info("[Anima Edit] TMG CFG bypassed in img2img; falling back to built-in TraSEC CFG for sampling.")
+            else:
+                unet = self.sd_model.forge_objects.unet.clone()
+                unet.set_model_sampler_cfg_function(self.get_tmg_cfg_function())
+                self.sd_model.forge_objects.unet = unet
 
         if self.scripts is not None:
             self.scripts.process_before_every_sampling(self, x=self.init_latent, noise=x, c=conditioning, uc=unconditional_conditioning)
