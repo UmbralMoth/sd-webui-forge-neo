@@ -545,8 +545,14 @@ class LoadedModel:
         # Compare underlying nn.Module, not ModelPatcher identity.
         # This ensures cloned patchers (e.g. from LoRA or Semantic Shifting)
         # correctly match existing loaded models.
+        # Also include patches_uuid so that patchers with different LoRA loads
+        # for the same underlying nn.Module are not treated as identical --
+        # otherwise the stale cached LoadedModel is reused and new patches
+        # never reach the in-memory weights.
         try:
-            return self.model.model is other.model.model
+            if self.model.model is not other.model.model:
+                return False
+            return self.model.patches_uuid == other.model.patches_uuid
         except Exception:
             return False
 
@@ -743,9 +749,16 @@ def load_models_gpu(models: list["ModelPatcher"], memory_required: float = 0, fo
         if vram_set_state is VRAMState.NO_VRAM:
             lowvram_model_memory = 0.1
 
-        # Skip expensive model_load if already loaded and no re-patching needed
+        # Re-apply patches / ensure model state matches the patcher.
+        # Skip only if the model's in-memory patches_uuid already matches the patcher's.
+        try:
+            current_patches_uuid = loaded_model.model.current_weight_patches_uuid
+        except Exception:
+            current_patches_uuid = None
+        patches_match = (current_patches_uuid == getattr(loaded_model.model, 'patches_uuid', None))
+        # If cached AND patches_uuid matches, skip the load (just MRU update).
         already_loaded = loaded_model in current_loaded_models
-        if not already_loaded or force_patch_weights or loaded_model.should_reload_model(force_patch_weights):
+        if not (already_loaded and patches_match) or force_patch_weights or loaded_model.should_reload_model(force_patch_weights):
             loaded_model.model_load(lowvram_model_memory, force_patch_weights=force_patch_weights)
 
         # MRU reordering: move to front, avoiding duplicates
