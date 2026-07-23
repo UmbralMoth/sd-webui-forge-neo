@@ -9,6 +9,7 @@ from backend.patcher.clip import CLIP
 from backend.patcher.unet import UnetPatcher
 from backend.patcher.vae import VAE
 from backend.text_processing.anima_engine import AnimaTextProcessingEngine
+from modules.shared import opts
 
 
 class Anima(ForgeDiffusionEngine):
@@ -57,15 +58,6 @@ class Anima(ForgeDiffusionEngine):
         self.forge_objects.unet.model.predictor.set_parameters(shift=shift)
         memory_management.logger.debug(f"Shift: {shift}")
 
-        # dynamic_args.anima_edit / anima_edit_debug are synced at the very
-        # entry of process_images_inner in modules/processing.py, and
-        # dynamic_args.ref_latents is built from the freshly-encoded
-        # engine-side inputs (self.ini_latent, self.ref_latents) inside
-        # StableDiffusionProcessing.setup_conds. So by the time we reach
-        # here, the ref list already reflects the current generation's
-        # ImageStitch gallery and img2img init image at the current
-        # resolution. Nothing to do in the engine itself; we just encode.
-
         return self.text_processing_engine_anima(prompt)
 
     @torch.inference_mode()
@@ -83,15 +75,8 @@ class Anima(ForgeDiffusionEngine):
             sample = self.forge_objects.vae.encode(y.movedim(1, -1) * 0.5 + 0.5)
             sample = self.forge_objects.vae.first_stage_model.process_in(sample)
             samples.append(sample)
-
-        if dynamic_args.anima_edit:
-            if dynamic_args.is_referencing:
-                # ImageStitch ref image: accumulate for later use.
-                for s in samples:
-                    self.ref_latents.append(s.cpu())
-            else:
-                # img2img init image: capture as the primary ref.
-                self.ini_latent = samples[0].cpu()
+            if opts.anima_do_reference:
+                dynamic_args.ref_latents = [sample.cpu()]
 
         return torch.cat(samples).to(x)
 
@@ -106,4 +91,5 @@ class Anima(ForgeDiffusionEngine):
             sample = self.forge_objects.vae.decode(sample).movedim(-1, 2) * 2.0 - 1.0
             samples.append(sample)
 
+        dynamic_args.ref_latents.clear()
         return torch.cat(samples).to(x)

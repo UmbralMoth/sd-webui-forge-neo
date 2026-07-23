@@ -621,42 +621,6 @@ class StableDiffusionProcessing:
         return cache[1]
 
     def setup_conds(self):
-        # Anima Edit maintenance.
-        # 1. dynamic_args.anima_edit / anima_edit_debug were synced in
-        #    process_images_inner so the very first run after a toggle
-        #    sees the current toggle state instead of the previous
-        #    generation's leftover.
-        # 2. dynamic_args.ref_latents was cleared in process_images_inner
-        #    so the previous run's refs (potentially at a different
-        #    resolution) don't leak into the new run and cause a
-        #    `Sizes of tensors must match except in dimension 2`
-        #    RuntimeError in the model forward.
-        # 3. Rebuild dynamic_args.ref_latents here from the freshly-encoded
-        #    engine-side inputs (self.ini_latent from p.init ->
-        #    encode_first_stage, self.ref_latents from ImageStitch via
-        #    scripts.process -> encode_first_stage), so the list is
-        #    correct even when the conds cache returns a hit and skips
-        #    the Anima engine's get_learned_conditioning build path.
-        # 4. Belt-and-suspenders: when Edit is off, also clear the
-        #    engine-local ref_latents / ini_latent here in case any of
-        #    init / scripts.process / encode_first_stage accidentally
-        #    repopulated them on the way through.
-        sd_model = getattr(shared, "sd_model", None)
-        is_anima_engine = sd_model is not None and getattr(sd_model, "is_anima", False)
-        if is_anima_engine:
-            if args.dynamic_args.anima_edit:
-                refs = list(getattr(sd_model, "ref_latents", []) or [])
-                ini_latent = getattr(sd_model, "ini_latent", None)
-                if ini_latent is not None:
-                    refs.insert(0, ini_latent)
-                args.dynamic_args.ref_latents = refs
-            else:
-                ref_latents = getattr(sd_model, "ref_latents", None)
-                if ref_latents:
-                    ref_latents.clear()
-                if getattr(sd_model, "ini_latent", None) is not None:
-                    sd_model.ini_latent = None
-
         prompts = prompt_parser.SdConditioning(self.prompts, width=self.width, height=self.height, distilled_cfg_scale=self.distilled_cfg_scale)
         negative_prompts = prompt_parser.SdConditioning(self.negative_prompts, width=self.width, height=self.height, is_negative_prompt=True, distilled_cfg_scale=self.distilled_cfg_scale)
 
@@ -675,7 +639,11 @@ class StableDiffusionProcessing:
             # TraSCE: encode empty conditioning once. Used as the CFG base instead of negative,
             # giving Direction = Empty + CFG*(Positive - Negative) rather than the approximate
             # Negative + CFG*(Positive - Negative) formula common UIs use.
-            if self.override_settings.get('use_legacy_cfg', getattr(shared.opts, 'use_legacy_cfg', False)):
+            # Anima Edit LoRA: skip empty_c / tmg_base_c entirely so the sampler falls through
+            # to legacy CFG. The perp-projection in TraSCE/TMG doesn't play well with the
+            # edit signal carried by the unconditional pass.
+            use_legacy = self.override_settings.get('use_legacy_cfg', getattr(shared.opts, 'use_legacy_cfg', False)) or bool(getattr(opts, "anima_do_reference", False))
+            if use_legacy:
                 self.empty_c = None
                 self.tmg_base_c = None
             else:
@@ -1063,29 +1031,6 @@ def process_images(p: StableDiffusionProcessing) -> Processed:
 
 def process_images_inner(p: StableDiffusionProcessing) -> Processed:
     """this is the main loop that both txt2img and img2img use; it calls func_init once inside all the scopes and func_sample once per batch"""
-
-    # Sync Anima Edit toggle at the very entry of the pipeline so that
-    # p.scripts.process (ImageStitch), p.init -> encode_first_stage, and
-    # p.setup_conds -> get_learned_conditioning all see the current value
-    # of [Anima] Enable Edit LoRA Mode on the first run after toggling --
-    # not the value left over from the previous generation.
-    #
-    # Also wipe dynamic_args.ref_latents unconditionally every run: if we
-    # left the previous run's refs in place, the Anima engine would skip
-    # rebuilding from the freshly-encoded self.ini_latent / self.ref_latents
-    # (its build site is gated on `if not dynamic_args.ref_latents:`), and
-    # the model forward would then try to concat a stale ref latent at the
-    # previous resolution onto a main latent at the new resolution -- a
-    # shape mismatch that surfaces as
-    # RuntimeError: Sizes of tensors must match except in dimension 2.
-    # The actual build happens in the Anima engine's
-    # get_learned_conditioning on the positive-prompt cache-miss path, so
-    # wiping here is safe even when Edit is off (the engine won't rebuild
-    # and the model forward sees an empty list -> no refs applied).
-    edit_mode_on = bool(getattr(opts, "anima_edit_mode", False))
-    args.dynamic_args.anima_edit = edit_mode_on
-    args.dynamic_args.anima_edit_debug = bool(getattr(opts, "anima_edit_debug", False))
-    args.dynamic_args.ref_latents.clear()
 
     _times = 1
     _is_video = False
@@ -1629,7 +1574,6 @@ class StableDiffusionProcessingTxt2Img(StableDiffusionProcessing):
                     self.extra_generation_params["VAE Encoder"] = opts.sd_vae_encode_method
 
                 samples = images_tensor_to_samples(image, approximation_indexes.get(opts.sd_vae_encode_method), self.sd_model)
-                self.sd_model.ini_latent = None  # Edit Model
                 decoded_samples = None
                 devices.torch_gc()
 
@@ -1642,13 +1586,12 @@ class StableDiffusionProcessingTxt2Img(StableDiffusionProcessing):
 
             self.sd_model.forge_objects = self.sd_model.forge_objects_after_applying_lora.shallow_copy()
             apply_token_merging(self.sd_model, self.get_token_merging_ratio())
-            if getattr(shared.opts, "tmg_enable", False) and getattr(self, "tmg_base_prompt", ""):
-                if bool(getattr(args.dynamic_args, "anima_edit", False)):
-                    logger.info("[Anima Edit] TMG CFG bypassed; falling back to built-in TraSEC CFG for sampling.")
-                else:
-                    unet = self.sd_model.forge_objects.unet.clone()
-                    unet.set_model_sampler_cfg_function(self.get_tmg_cfg_function())
-                    self.sd_model.forge_objects.unet = unet
+            if bool(getattr(opts, "anima_do_reference", False)):
+                logger.info("[Anima Edit] Using legacy CFG for sampling.")
+            elif getattr(shared.opts, "tmg_enable", False) and getattr(self, "tmg_base_prompt", ""):
+                unet = self.sd_model.forge_objects.unet.clone()
+                unet.set_model_sampler_cfg_function(self.get_tmg_cfg_function())
+                self.sd_model.forge_objects.unet = unet
 
             if self.scripts is not None:
                 self.scripts.process_before_every_sampling(self, x=x, noise=x, c=conditioning, uc=unconditional_conditioning)
@@ -1768,7 +1711,6 @@ class StableDiffusionProcessingTxt2Img(StableDiffusionProcessing):
                 self.extra_generation_params["VAE Encoder"] = opts.sd_vae_encode_method
 
             samples = images_tensor_to_samples(decoded_samples, approximation_indexes.get(opts.sd_vae_encode_method))
-            self.sd_model.ini_latent = None  # Edit Model
             devices.torch_gc()
 
             image_conditioning = self.img2img_image_conditioning(decoded_samples, samples)
@@ -1802,13 +1744,12 @@ class StableDiffusionProcessingTxt2Img(StableDiffusionProcessing):
 
         self.sd_model.forge_objects = self.sd_model.forge_objects_after_applying_lora.shallow_copy()
         apply_token_merging(self.sd_model, self.get_token_merging_ratio(for_hr=True))
-        if getattr(shared.opts, "tmg_enable", False) and getattr(self, "tmg_base_prompt", ""):
-            if bool(getattr(args.dynamic_args, "anima_edit", False)):
-                logger.info("[Anima Edit] TMG CFG bypassed in HR pass; falling back to built-in TraSEC CFG for sampling.")
-            else:
-                unet = self.sd_model.forge_objects.unet.clone()
-                unet.set_model_sampler_cfg_function(self.get_tmg_cfg_function())
-                self.sd_model.forge_objects.unet = unet
+        if bool(getattr(opts, "anima_do_reference", False)):
+            logger.info("[Anima Edit] Using legacy CFG for HR pass.")
+        elif getattr(shared.opts, "tmg_enable", False) and getattr(self, "tmg_base_prompt", ""):
+            unet = self.sd_model.forge_objects.unet.clone()
+            unet.set_model_sampler_cfg_function(self.get_tmg_cfg_function())
+            self.sd_model.forge_objects.unet = unet
 
         if self.scripts is not None:
             self.scripts.process_before_every_sampling(self, x=samples, noise=noise, c=self.hr_c, uc=self.hr_uc)
@@ -1898,10 +1839,12 @@ class StableDiffusionProcessingTxt2Img(StableDiffusionProcessing):
         else:
             self.hr_uc = self.get_conds_with_caching(prompt_parser.get_learned_conditioning, hr_negative_prompts, self.firstpass_steps, [self.cached_hr_uc, self.cached_uc], self.hr_extra_network_data, total_steps)
 
-            if not self.override_settings.get('use_legacy_cfg', getattr(shared.opts, 'use_legacy_cfg', False)):
+            # See setup_conds for the rationale on the anima_do_reference override.
+            hr_use_legacy = self.override_settings.get('use_legacy_cfg', getattr(shared.opts, 'use_legacy_cfg', False)) or bool(getattr(opts, "anima_do_reference", False))
+            if not hr_use_legacy:
                 hr_empty_prompts = prompt_parser.SdConditioning([""] * len(self.hr_prompts), width=self.hr_upscale_to_x, height=self.hr_upscale_to_y, is_negative_prompt=True, distilled_cfg_scale=self.hr_distilled_cfg)
                 self.hr_empty_c = self.get_conds_with_caching(prompt_parser.get_learned_conditioning, hr_empty_prompts, self.firstpass_steps, [self.cached_hr_empty_c, self.cached_empty_c], self.hr_extra_network_data, total_steps)
-                
+
                 if getattr(shared.opts, "tmg_enable", False) and getattr(self, "tmg_base_prompt", ""):
                     hr_base_prompts = prompt_parser.SdConditioning([self.tmg_base_prompt] * len(self.hr_prompts), width=self.hr_upscale_to_x, height=self.hr_upscale_to_y, is_negative_prompt=True, distilled_cfg_scale=self.hr_distilled_cfg)
                     self.hr_tmg_base_c = self.get_conds_with_caching(prompt_parser.get_learned_conditioning, hr_base_prompts, self.firstpass_steps, [getattr(self, "cached_hr_tmg_base_c", None), getattr(self, "cached_tmg_base_c", None)], self.hr_extra_network_data, total_steps)
@@ -2207,13 +2150,12 @@ class StableDiffusionProcessingImg2Img(StableDiffusionProcessing):
 
         self.sd_model.forge_objects = self.sd_model.forge_objects_after_applying_lora.shallow_copy()
         apply_token_merging(self.sd_model, self.get_token_merging_ratio())
-        if getattr(shared.opts, "tmg_enable", False) and getattr(self, "tmg_base_prompt", ""):
-            if bool(getattr(args.dynamic_args, "anima_edit", False)):
-                logger.info("[Anima Edit] TMG CFG bypassed in img2img; falling back to built-in TraSEC CFG for sampling.")
-            else:
-                unet = self.sd_model.forge_objects.unet.clone()
-                unet.set_model_sampler_cfg_function(self.get_tmg_cfg_function())
-                self.sd_model.forge_objects.unet = unet
+        if bool(getattr(opts, "anima_do_reference", False)):
+            logger.info("[Anima Edit] Using legacy CFG for img2img.")
+        elif getattr(shared.opts, "tmg_enable", False) and getattr(self, "tmg_base_prompt", ""):
+            unet = self.sd_model.forge_objects.unet.clone()
+            unet.set_model_sampler_cfg_function(self.get_tmg_cfg_function())
+            self.sd_model.forge_objects.unet = unet
 
         if self.scripts is not None:
             self.scripts.process_before_every_sampling(self, x=self.init_latent, noise=x, c=conditioning, uc=unconditional_conditioning)

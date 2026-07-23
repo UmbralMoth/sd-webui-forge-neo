@@ -844,12 +844,6 @@ def forge_loader(sd: os.PathLike, additional_state_dicts: list[os.PathLike] = No
     backend.args.dynamic_args.klein = "klein" in repo_name
     backend.args.dynamic_args.wan = "Wan" in repo_name
 
-    if "Anima" in repo_name:
-        from modules.shared import opts as _opts
-        backend.args.dynamic_args.anima_edit = bool(getattr(_opts, "anima_edit_mode", False))
-    else:
-        backend.args.dynamic_args.anima_edit = False
-
     if getattr(estimated_config, "nunchaku", False):
         estimated_config.unet_config["filename"] = str(sd)
 

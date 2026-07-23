@@ -18,6 +18,7 @@ from torchvision import transforms
 from backend.args import dynamic_args
 from backend.attention import attention_function
 from backend.utils import pad_to_patch_size
+from modules.shared import opts
 
 
 class VideoRopePosition3DEmb(nn.Module):
@@ -592,10 +593,9 @@ class MiniTrainDIT(nn.Module):
     def forward(self, x: torch.Tensor, timesteps: torch.Tensor, context: torch.Tensor, fps: Optional[torch.Tensor] = None, padding_mask: Optional[torch.Tensor] = None, ref_latents=None, **kwargs):
         orig_t = x.shape[2]
         orig_shape = list(x.shape)
-        x = pad_to_patch_size(x, (self.patch_temporal, self.patch_spatial, self.patch_spatial))
 
         if ref_latents is None:
-            ref_latents = dynamic_args.ref_latents
+            ref_latents = dynamic_args.ref_latents if opts.anima_do_reference else []
         if ref_latents:
             for ref in ref_latents:
                 if ref.ndim == 4:
@@ -605,7 +605,9 @@ class MiniTrainDIT(nn.Module):
                 # B=4 with TraSCE+TMG base, etc).
                 if ref.shape[0] == 1 and x.shape[0] != 1:
                     ref = ref.expand(x.shape[0], *ref.shape[1:]).contiguous()
-                x = torch.cat([x, ref.to(dtype=x.dtype, device=x.device)], dim=2)
+                x = torch.cat((x, ref.to(x)), dim=2)
+
+        x = pad_to_patch_size(x, (self.patch_temporal, self.patch_spatial, self.patch_spatial))
 
         x_B_C_T_H_W = x
         timesteps_B_T = timesteps
