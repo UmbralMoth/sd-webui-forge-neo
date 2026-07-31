@@ -301,50 +301,56 @@ def sample_aflops(model, x, sigmas, extra_args=None, callback=None, disable=None
 
         else:
             # Second order A-FloPS for all intermediate steps.
-            h_prev = t - t_prev  # negative
+            h_prev = t - t_prev  # Negative
             
             deltax = x - x_prev
             deltav = v - d_prev
             
-            # Optimized Global Rayleigh quotient calculation
-            # Reshape is safer than view for non-contiguous tensors
-            a_flat = deltax.reshape(deltax.size(0), -1)
-            b_flat = deltav.reshape(deltav.size(0), -1)
+            # UPGRADE 1: Channel-wise Rayleigh Quotient [B, C, 1, 1]
+            # Sum over spatial dimensions (dim 2+), keeping batch and channel distinct
+            a_spatial = deltax.view(deltax.shape[0], deltax.shape[1], -1)
+            b_spatial = deltav.view(deltav.shape[0], deltav.shape[1], -1)
             
-            # Sum with float32 accumulator for overflow protection
-            numerator = torch.sum(b_flat * a_flat, dim=1, dtype=torch.float32)
-            denominator = torch.sum(a_flat ** 2, dim=1, dtype=torch.float32) + 1e-10
-            c = (numerator / denominator).to(x.dtype)
+            numerator = torch.sum(b_spatial * a_spatial, dim=2, dtype=torch.float32)
+            denominator = torch.sum(a_spatial ** 2, dim=2, dtype=torch.float32) + 1e-8
             
-            # Clamp c as per paper to prevent over-correction/instability
-            c = torch.clamp(c, -1.0, 1.0)
-            c_batch = c.reshape(-1, *([1] * (x.ndim - 1)))
+            c_f32 = torch.clamp(numerator / denominator, -1.0, 1.0)
+            c_batch_f32 = c_f32.view(*c_f32.shape, *([1] * (x.ndim - 2)))
+            c_batch = c_batch_f32.to(x.dtype)
             
-            # Predict linear offset and slope in linearized space
+            # Velocity offset prediction
             v1 = v - c_batch * x
             history_record = d_prev - c_batch * x_prev
-            v2 = (v1 - history_record) / (h_prev + 1e-10)
+            v2 = (v1 - history_record) / h_prev
             
-            # Numerical Stability: Clamp exponent to prevent overflow (fp16 limit is ~11.0, but we use safe logic)
-            ch = torch.clamp(c_batch * h, min=-40.0, max=40.0)
-            c_abs = torch.abs(c_batch)
+            # UPGRADE 2: FP32 High-Precision Exponential Integrator
+            h_f32 = torch.tensor(h, dtype=torch.float32, device=x.device)
+            ch_f32 = c_batch_f32 * h_f32
+            
+            # FP16 safety clamping (limits max exp value to ~22026)
+            ch_f32 = torch.clamp(ch_f32, min=-10.0, max=10.0)
+            
+            c_abs = torch.abs(c_batch_f32)
             is_small = c_abs < 1e-4
+            safe_c = torch.where(is_small, torch.ones_like(c_batch_f32), c_batch_f32)
             
-            # Safe division: Replace zeros in denominator branch to avoid NaNs even in unused branches
-            safe_c = torch.where(is_small, torch.ones_like(c_batch), c_batch)
+            exp_ch = torch.exp(ch_f32)
+            expm1_ch = torch.expm1(ch_f32)
             
-            # Use expm1 for high precision at small values and to avoid catastrophic cancellation
-            # x_next = x * exp(ch) + d1 * (exp(ch)-1)/c + d2 * (exp(ch)-1-ch)/c^2
-            exp_ch = torch.exp(ch)
-            expm1_ch = torch.expm1(ch)
+            # Taylor series expansion for small c values
+            term_A = torch.where(is_small, h_f32 + 0.5 * c_batch_f32 * (h_f32 ** 2), expm1_ch / safe_c)
+            term_B = torch.where(is_small, 0.5 * (h_f32 ** 2) + (c_batch_f32 * (h_f32 ** 3)) / 6.0, (expm1_ch - ch_f32) / (safe_c ** 2))
             
-            term_A = torch.where(is_small, h + 0.5 * c_batch * (h ** 2), expm1_ch / safe_c)
-            term_B = torch.where(is_small, 0.5 * (h ** 2) + (c_batch * (h ** 3)) / 6.0, (expm1_ch - ch) / (safe_c ** 2))
+            # Cast coefficients back to latent precision
+            exp_ch = exp_ch.to(x.dtype)
+            term_A = term_A.to(x.dtype)
+            term_B = term_B.to(x.dtype)
             
+            # Final update
             x_next = x * exp_ch + term_A * v1 + term_B * v2
             
-            x_prev = x.detach()
-            d_prev = v.detach()
+            x_prev = x
+            d_prev = v
             t_prev = t
             x = x_next
             

@@ -30,8 +30,6 @@ def build_constructor(sampler_key: str) -> Callable:
 
 def create_cfg_pp_sampler(sampler_name: str, sampler_key: str) -> "sd_samplers_common.SamplerData":
     config = {}
-    if sampler_name.endswith(" Ctrl-Z"):
-        base_name = sampler_name.removesuffix(" Ctrl-Z")
     base_name = sampler_name.removesuffix(" CFG++")
     for name, _, _, params in sd_samplers_kdiffusion.samplers_k_diffusion:
         if name == base_name:

@@ -383,16 +383,62 @@ def calculate_shift(
     return mu
 
 
-def scale_shift_by_resolution(base_shift: float, seq_len: float) -> float:
-    # Scale base_shift dynamically based on sequence length,
-    # following the same ratio as FLUX (0.5 at 256 seq_len, 1.15 at 4096 seq_len)
-    if seq_len <= 256:
-        return base_shift * (0.5 / 1.15)
+def get_dynamic_resolution_shift(
+    width: int, 
+    height: int, 
+    patch_size: int = 16, 
+    inner_model: Optional[object] = None
+) -> float:
+    """
+    Calculates the dynamic time-shift based on sequence length using a continuous
+    power-law scaling formula, eliminating the need for hard ceilings.
+    """
+    # 1. Calculate the token sequence length of the canvas
+    seq_len = (width // patch_size) * (height // patch_size)
     
-    # Linear interpolation between (256, base_shift * (0.5/1.15)) and (4096, base_shift)
-    t = (seq_len - 256) / (4096 - 256)
-    ratio = (0.5 / 1.15) + (1.0 - (0.5 / 1.15)) * t
-    return base_shift * ratio
+    # 2. Auto-detect model architecture
+    try:
+        from modules import shared
+        is_flux = getattr(shared.sd_model, "is_flux", False)
+        is_anima = getattr(shared.sd_model, "is_anima", False)
+        is_sd3 = getattr(shared.sd_model, "is_sd3", False)
+    except (ImportError, NameError, AttributeError):
+        is_flux, is_anima, is_sd3 = False, False, False
+
+    # 3. Route the model-specific base parameters
+    if is_flux:
+        base_seq_len = 256.0
+        base_shift = 0.5
+        # FLUX scales much softer than pure square-root. 
+        # (4096/256)^0.3015 roughly equals 2.3 multiplier -> 1.15 shift
+        exponent = 0.3015 
+    elif is_anima:
+        base_seq_len = 4096.0
+        base_shift = 3.0
+        # Anima adheres perfectly to the theoretical square-root spatial scaling
+        exponent = 0.5 
+    elif is_sd3:
+        base_seq_len = 4096.0
+        base_shift = 3.0
+        # SD3 traditionally does not scale its shift dynamically
+        exponent = 0.0 
+    else:
+        # Fallback for generic Flow models 
+        fallback_shift = 1.0
+        if inner_model is not None:
+            try:
+                unet = inner_model.inner_model.forge_objects.unet
+                predictor = unet.model.predictor
+                fallback_shift = float(getattr(predictor, "shift", getattr(predictor, "mu", 1.0)))
+            except AttributeError:
+                pass
+        return fallback_shift
+
+    # 4. The Continuous Scaling Formula (No ceilings needed)
+    ratio = float(seq_len) / base_seq_len
+    dynamic_shift = base_shift * (ratio ** exponent)
+    
+    return dynamic_shift
 
 
 def flow_match_euler_discrete_scheduler(n, width, height, sigma_min, sigma_max, inner_model, device):
@@ -429,7 +475,7 @@ def flow_match_euler_discrete_scheduler(n, width, height, sigma_min, sigma_max, 
                 use_dynamic_shifting = True
                 seq_len = width * height / (16 * 16)
                 base_shift = 1.15
-                shift = scale_shift_by_resolution(base_shift, seq_len)
+                shift = get_dynamic_resolution_shift(width, height, inner_model=inner_model)
         else:
             # Anima, Wan, Lumina, SDXL RF, etc.
             # Use linear dynamic resolution-dependent shifting by default
@@ -440,7 +486,7 @@ def flow_match_euler_discrete_scheduler(n, width, height, sigma_min, sigma_max, 
             base_shift = getattr(predictor, "shift", getattr(predictor, "mu", 3.0))
             
             seq_len = width * height / (16 * 16)
-            shift = scale_shift_by_resolution(base_shift, seq_len)
+            shift = get_dynamic_resolution_shift(width, height, inner_model=inner_model)
 
         invert_sigmas = False
         use_karras_sigmas = False
@@ -519,6 +565,36 @@ def flux2_scheduler(n: int, width: int, height: int, sigma_min, sigma_max, devic
     sigmas = get_schedule(n, round(seq_len))
     return torch.FloatTensor(sigmas).to(device)
 
+def logit_normal_scheduler(n: int, sigma_min, sigma_max, device, *, loc=0.0, scale=1.0):
+    """
+    Logit-Normal flow scheduler.
+    Focuses step density in the middle of the trajectory (t ~ 0.5) where 
+    network curvature is highest, while smoothly decaying toward the boundaries.
+    """
+    # Create uniform grid, avoiding exact 0 and 1 to prevent infinity in inverse CDF
+    u = torch.linspace(0.001, 0.999, n, device=device)
+    
+    # Inverse CDF of Normal(loc, scale) using torch.erfinv
+    # N(0,1) icdf is sqrt(2) * erfinv(2u - 1)
+    y = loc + scale * (1.41421356 * torch.erfinv(2 * u - 1))
+    
+    # Sigmoid projection back to [0, 1] range
+    t = torch.sigmoid(y)
+    
+    # Flow matches typically step from high noise (1.0) to clean data (0.0)
+    t = torch.flip(t, dims=[0])
+    
+    # Scale to match sigma boundaries (usually 1.0 -> 0.0 for flow)
+    sigmas = t * (sigma_max - sigma_min) + sigma_min
+    
+    # Append terminal zero step
+    sigmas = torch.cat([sigmas, torch.zeros(1, device=device)])
+    
+    # Enforce strict boundaries
+    sigmas[0] = max(sigma_max, 1e-4) # or float(sigma_max)
+    sigmas[-1] = 0.0
+    
+    return sigmas
 
 schedulers = [
     Scheduler("automatic", "Automatic", None),
@@ -527,6 +603,7 @@ schedulers = [
     Scheduler("polyexponential", "Polyexponential", k_diffusion.sampling.get_sigmas_polyexponential, default_rho=1.0),
     Scheduler("phi", "Phi", phi_scheduler),
     Scheduler("normal", "Normal", normal_scheduler, need_inner_model=True),
+    Scheduler("logit_normal", "Logit-Normal", logit_normal_scheduler),
     Scheduler("simple", "Simple", simple_scheduler, need_inner_model=True),
     Scheduler("uniform", "Uniform", uniform, need_inner_model=True),
     Scheduler("sgm_uniform", "SGM Uniform", sgm_uniform, need_inner_model=True, aliases=["SGMUniform"]),

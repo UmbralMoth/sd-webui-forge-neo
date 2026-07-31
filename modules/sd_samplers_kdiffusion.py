@@ -42,7 +42,6 @@ sampler_extra_params = {
     "sample_dpmpp_2m_sde": ["eta", "s_noise", "solver_type"],
     "sample_dpmpp_3m_sde": ["eta", "s_noise"],
     "sample_dpmpp_3m_sde_ctrlz": ["eta", "s_noise", "gamma_scale"],
-    "sample_dpmpp_3m_sde_cfgpp_ctrlz": ["eta", "s_noise"],
     "sample_euler_ancestral": ["eta", "s_noise"],
     "sample_euler_a2": ["eta", "s_noise"],
     "sample_forge_chimera": ["eta", "s_noise"],
