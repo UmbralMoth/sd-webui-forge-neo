@@ -410,15 +410,16 @@ class StableDiffusionProcessing:
             self.tmg_clean_prompt = self.prompt
             self.tmg_clean_negative_prompt = self.negative_prompt
 
-            if isinstance(self.prompt, list):
-                self.prompt = [f"{self.tmg_base_prompt}, {p}" if p.strip() else self.tmg_base_prompt for p in self.prompt]
-            else:
-                self.prompt = f"{self.tmg_base_prompt}, {self.prompt}" if self.prompt.strip() else self.tmg_base_prompt
+            if not getattr(shared.opts, "anima_do_reference", False):
+                if isinstance(self.prompt, list):
+                    self.prompt = [f"{self.tmg_base_prompt}, {p}" if p.strip() else self.tmg_base_prompt for p in self.prompt]
+                else:
+                    self.prompt = f"{self.tmg_base_prompt}, {self.prompt}" if self.prompt.strip() else self.tmg_base_prompt
 
-            if isinstance(self.negative_prompt, list):
-                self.negative_prompt = [f"{self.tmg_base_prompt}, {p}" if p.strip() else self.tmg_base_prompt for p in self.negative_prompt]
-            else:
-                self.negative_prompt = f"{self.tmg_base_prompt}, {self.negative_prompt}" if self.negative_prompt.strip() else self.tmg_base_prompt
+                if isinstance(self.negative_prompt, list):
+                    self.negative_prompt = [f"{self.tmg_base_prompt}, {p}" if p.strip() else self.tmg_base_prompt for p in self.negative_prompt]
+                else:
+                    self.negative_prompt = f"{self.tmg_base_prompt}, {self.negative_prompt}" if self.negative_prompt.strip() else self.tmg_base_prompt
 
             self.extra_generation_params.update({
                 "TMG Enable": True,
@@ -504,10 +505,16 @@ class StableDiffusionProcessing:
             norm_neg_perp = torch.linalg.vector_norm(v_neg_perp, ord=2, dim=(1, 2, 3), keepdim=True)
             v_neg_aligned = v_neg_perp * (norm_neg_raw / torch.clamp(norm_neg_perp, min=1e-8))
 
-            # 3. Concept Presence Cosine Metrics (The Sensors)
-            norm_base = torch.linalg.vector_norm(base_pred_f32, ord=2, dim=(1, 2, 3), keepdim=True)
-            p_pos = torch.sum(base_pred_f32 * v_pos_aligned, dim=(1, 2, 3), keepdim=True) / torch.clamp(norm_base * torch.linalg.vector_norm(v_pos_aligned, ord=2, dim=(1, 2, 3), keepdim=True), min=1e-8)
-            p_neg = torch.sum(base_pred_f32 * v_neg_aligned, dim=(1, 2, 3), keepdim=True) / torch.clamp(norm_base * torch.linalg.vector_norm(v_neg_aligned, ord=2, dim=(1, 2, 3), keepdim=True), min=1e-8)
+            # 3. Concept Presence Cosine Metrics (The Spatial Sensors)
+            # We change dim=(1,2,3) to dim=1. This evaluates the concept per-latent-pixel!
+            # norm_base shape becomes (B, 1, H, W)
+            norm_base = torch.linalg.vector_norm(base_pred_f32, ord=2, dim=1, keepdim=True)
+            norm_v_pos = torch.linalg.vector_norm(v_pos_aligned, ord=2, dim=1, keepdim=True)
+            norm_v_neg = torch.linalg.vector_norm(v_neg_aligned, ord=2, dim=1, keepdim=True)
+
+            # p_pos and p_neg are now spatial heatmaps of shape (B, 1, H, W)
+            p_pos = torch.sum(base_pred_f32 * v_pos_aligned, dim=1, keepdim=True) / torch.clamp(norm_base * norm_v_pos, min=1e-8)
+            p_neg = torch.sum(base_pred_f32 * v_neg_aligned, dim=1, keepdim=True) / torch.clamp(norm_base * norm_v_neg, min=1e-8)
 
             # 4. Independent Scaling (Option A) with Clamping
             max_g = cond_scale
@@ -517,6 +524,8 @@ class StableDiffusionProcessing:
             p_pos_clamped = torch.clamp(p_pos, min=0.0, max=1.0)
             p_neg_clamped = torch.clamp(p_neg, min=0.0, max=1.0)
 
+            # w_pos and w_neg are now spatial masks (B, 1, H, W). 
+            # They will dynamically brake CFG locally where the concept is already finished!
             if tmg_exponent != 1.0:
                 w_pos = torch.clamp(max_g * (1.0 - torch.pow(p_pos_clamped, tmg_exponent)), min=min_g, max=max_g)
                 w_neg = torch.clamp(max_g * torch.pow(p_neg_clamped, tmg_exponent), min=min_g, max=max_g)
@@ -639,10 +648,9 @@ class StableDiffusionProcessing:
             # TraSCE: encode empty conditioning once. Used as the CFG base instead of negative,
             # giving Direction = Empty + CFG*(Positive - Negative) rather than the approximate
             # Negative + CFG*(Positive - Negative) formula common UIs use.
-            # Anima Edit LoRA: skip empty_c / tmg_base_c entirely so the sampler falls through
-            # to legacy CFG. The perp-projection in TraSCE/TMG doesn't play well with the
-            # edit signal carried by the unconditional pass.
-            use_legacy = self.override_settings.get('use_legacy_cfg', getattr(shared.opts, 'use_legacy_cfg', False)) or bool(getattr(opts, "anima_do_reference", False))
+            # If use_legacy_cfg is explicitly set, skip empty_c / tmg_base_c.
+            # Otherwise allow TMG/TraSCE to generate conditioning even when reference injection (Anima Edit) is active.
+            use_legacy = self.override_settings.get('use_legacy_cfg', getattr(shared.opts, 'use_legacy_cfg', False))
             if use_legacy:
                 self.empty_c = None
                 self.tmg_base_c = None
@@ -1586,12 +1594,14 @@ class StableDiffusionProcessingTxt2Img(StableDiffusionProcessing):
 
             self.sd_model.forge_objects = self.sd_model.forge_objects_after_applying_lora.shallow_copy()
             apply_token_merging(self.sd_model, self.get_token_merging_ratio())
-            if bool(getattr(opts, "anima_do_reference", False)):
-                logger.info("[Anima Edit] Using legacy CFG for sampling.")
-            elif getattr(shared.opts, "tmg_enable", False) and getattr(self, "tmg_base_prompt", ""):
+            if getattr(shared.opts, "tmg_enable", False) and getattr(self, "tmg_base_prompt", ""):
+                if bool(getattr(opts, "anima_do_reference", False)):
+                    logger.info("[Anima Edit + TMG] Using TMG CFG with Reference Injection for sampling.")
                 unet = self.sd_model.forge_objects.unet.clone()
                 unet.set_model_sampler_cfg_function(self.get_tmg_cfg_function())
                 self.sd_model.forge_objects.unet = unet
+            elif bool(getattr(opts, "anima_do_reference", False)):
+                logger.info("[Anima Edit] Using legacy CFG for sampling.")
 
             if self.scripts is not None:
                 self.scripts.process_before_every_sampling(self, x=x, noise=x, c=conditioning, uc=unconditional_conditioning)
@@ -1744,12 +1754,14 @@ class StableDiffusionProcessingTxt2Img(StableDiffusionProcessing):
 
         self.sd_model.forge_objects = self.sd_model.forge_objects_after_applying_lora.shallow_copy()
         apply_token_merging(self.sd_model, self.get_token_merging_ratio(for_hr=True))
-        if bool(getattr(opts, "anima_do_reference", False)):
-            logger.info("[Anima Edit] Using legacy CFG for HR pass.")
-        elif getattr(shared.opts, "tmg_enable", False) and getattr(self, "tmg_base_prompt", ""):
+        if getattr(shared.opts, "tmg_enable", False) and getattr(self, "tmg_base_prompt", ""):
+            if bool(getattr(opts, "anima_do_reference", False)):
+                logger.info("[Anima Edit + TMG] Using TMG CFG with Reference Injection for HR pass.")
             unet = self.sd_model.forge_objects.unet.clone()
             unet.set_model_sampler_cfg_function(self.get_tmg_cfg_function())
             self.sd_model.forge_objects.unet = unet
+        elif bool(getattr(opts, "anima_do_reference", False)):
+            logger.info("[Anima Edit] Using legacy CFG for HR pass.")
 
         if self.scripts is not None:
             self.scripts.process_before_every_sampling(self, x=samples, noise=noise, c=self.hr_c, uc=self.hr_uc)
@@ -1785,17 +1797,17 @@ class StableDiffusionProcessingTxt2Img(StableDiffusionProcessing):
             self.tmg_clean_hr_prompt = self.hr_prompt if self.hr_prompt != "" else getattr(self, "tmg_clean_prompt", "")
             self.tmg_clean_hr_negative_prompt = self.hr_negative_prompt if self.hr_negative_prompt != "" else getattr(self, "tmg_clean_negative_prompt", "")
 
-            # Combine custom hr prompts with baseline if they are non-empty
-            if self.hr_prompt != "":
-                if isinstance(self.hr_prompt, list):
-                    self.hr_prompt = [f"{self.tmg_base_prompt}, {p}" if p.strip() else self.tmg_base_prompt for p in self.hr_prompt]
-                else:
-                    self.hr_prompt = f"{self.tmg_base_prompt}, {self.hr_prompt}" if self.hr_prompt.strip() else self.tmg_base_prompt
-            if self.hr_negative_prompt != "":
-                if isinstance(self.hr_negative_prompt, list):
-                    self.hr_negative_prompt = [f"{self.tmg_base_prompt}, {p}" if p.strip() else self.tmg_base_prompt for p in self.hr_negative_prompt]
-                else:
-                    self.hr_negative_prompt = f"{self.tmg_base_prompt}, {self.hr_negative_prompt}" if self.hr_negative_prompt.strip() else self.tmg_base_prompt
+            if not getattr(shared.opts, "anima_do_reference", False):
+                if self.hr_prompt != "":
+                    if isinstance(self.hr_prompt, list):
+                        self.hr_prompt = [f"{self.tmg_base_prompt}, {p}" if p.strip() else self.tmg_base_prompt for p in self.hr_prompt]
+                    else:
+                        self.hr_prompt = f"{self.tmg_base_prompt}, {self.hr_prompt}" if self.hr_prompt.strip() else self.tmg_base_prompt
+                if self.hr_negative_prompt != "":
+                    if isinstance(self.hr_negative_prompt, list):
+                        self.hr_negative_prompt = [f"{self.tmg_base_prompt}, {p}" if p.strip() else self.tmg_base_prompt for p in self.hr_negative_prompt]
+                    else:
+                        self.hr_negative_prompt = f"{self.tmg_base_prompt}, {self.hr_negative_prompt}" if self.hr_negative_prompt.strip() else self.tmg_base_prompt
 
         super().setup_prompts()
 
@@ -1839,8 +1851,7 @@ class StableDiffusionProcessingTxt2Img(StableDiffusionProcessing):
         else:
             self.hr_uc = self.get_conds_with_caching(prompt_parser.get_learned_conditioning, hr_negative_prompts, self.firstpass_steps, [self.cached_hr_uc, self.cached_uc], self.hr_extra_network_data, total_steps)
 
-            # See setup_conds for the rationale on the anima_do_reference override.
-            hr_use_legacy = self.override_settings.get('use_legacy_cfg', getattr(shared.opts, 'use_legacy_cfg', False)) or bool(getattr(opts, "anima_do_reference", False))
+            hr_use_legacy = self.override_settings.get('use_legacy_cfg', getattr(shared.opts, 'use_legacy_cfg', False))
             if not hr_use_legacy:
                 hr_empty_prompts = prompt_parser.SdConditioning([""] * len(self.hr_prompts), width=self.hr_upscale_to_x, height=self.hr_upscale_to_y, is_negative_prompt=True, distilled_cfg_scale=self.hr_distilled_cfg)
                 self.hr_empty_c = self.get_conds_with_caching(prompt_parser.get_learned_conditioning, hr_empty_prompts, self.firstpass_steps, [self.cached_hr_empty_c, self.cached_empty_c], self.hr_extra_network_data, total_steps)
@@ -2150,12 +2161,14 @@ class StableDiffusionProcessingImg2Img(StableDiffusionProcessing):
 
         self.sd_model.forge_objects = self.sd_model.forge_objects_after_applying_lora.shallow_copy()
         apply_token_merging(self.sd_model, self.get_token_merging_ratio())
-        if bool(getattr(opts, "anima_do_reference", False)):
-            logger.info("[Anima Edit] Using legacy CFG for img2img.")
-        elif getattr(shared.opts, "tmg_enable", False) and getattr(self, "tmg_base_prompt", ""):
+        if getattr(shared.opts, "tmg_enable", False) and getattr(self, "tmg_base_prompt", ""):
+            if bool(getattr(opts, "anima_do_reference", False)):
+                logger.info("[Anima Edit + TMG] Using TMG CFG with Reference Injection for img2img.")
             unet = self.sd_model.forge_objects.unet.clone()
             unet.set_model_sampler_cfg_function(self.get_tmg_cfg_function())
             self.sd_model.forge_objects.unet = unet
+        elif bool(getattr(opts, "anima_do_reference", False)):
+            logger.info("[Anima Edit] Using legacy CFG for img2img.")
 
         if self.scripts is not None:
             self.scripts.process_before_every_sampling(self, x=self.init_latent, noise=x, c=conditioning, uc=unconditional_conditioning)
